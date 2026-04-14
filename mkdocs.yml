@@ -7,10 +7,27 @@ strict: true
 theme:
   name: mkdocs
 
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src
+          options:
+            show_root_heading: true
+            show_source: false
+            heading_level: 2
+            members_order: source
+
 nav:
   - Home: index.md
-  - Architecture: architecture.md
-  - Development: development.md
-  - Testing: testing.md
-  - Benchmarking: benchmarking.md
-  - Plan: plan.md
+  - Guides:
+      - API: api.md
+      - Architecture: architecture.md
+      - Development: development.md
+      - Testing: testing.md
+      - Benchmarking: benchmarking.md
+      - Plan: plan.md
+  - Reference:
+      - Gaia API: reference/gaia/api.md

@@ -1,9 +1,9 @@
 """Minimal public package metadata helpers."""
 
 PACKAGE_SUMMARY = (
-    "ao-sky is in its bootstrap stage. The installable package, CLI surface, "
-    "and repo-local docs workflow are in place; Gaia, spatial, and asterism "
-    "implementations are the next planned areas of work."
+    "ao-sky now includes its raw Gaia store boundary alongside the installable "
+    "package, CLI surface, and repo-local docs workflow; spatial, asterism, "
+    "and derived photometric layers remain planned work."
 )
 
 

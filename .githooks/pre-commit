@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "[pre-commit] Running tests..."
+"$repo_root/.conda/bin/python" -m pytest -q
+
+echo "[pre-commit] Building docs..."
+"$repo_root/.conda/bin/mkdocs" build --strict
+
+echo "[pre-commit] OK"

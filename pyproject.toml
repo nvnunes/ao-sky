@@ -20,6 +20,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
+dependencies = [
+    "astropy>=6.0",
+    "astropy-healpix>=1.0",
+    "astroquery>=0.4.7",
+    "h5py>=3.0",
+    "numpy>=1.26",
+    "requests>=2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/nvnunes/ao-sky"
@@ -34,6 +42,7 @@ dev = [
 ]
 docs = [
     "mkdocs>=1.6.0,<2.0",
+    "mkdocstrings[python]>=0.26.0",
 ]
 
 [project.scripts]

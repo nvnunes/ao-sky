@@ -220,14 +220,24 @@ wrapper code.
 ### Phase 1: Lock The Gaia Boundary
 
 - Implement the canonical Gaia schema constants and path contract.
-- Re-implement the HDF5 store and loader behavior using `survey_tools` as the
-  reference.
-- Add request/config objects for:
-  - release
-  - outer level
-  - epoch
-  - required working band
-  - neighbour stitching level
+- Re-implement the HDF5 store and raw per-outer-pixel loader behavior using
+  `survey_tools` as the reference.
+- Keep the Gaia boundary band-agnostic and free of instrument-specific derived
+  photometry.
+- Keep Phase 1 focused on canonical Gaia tables only:
+  - no derived bands or photon-rate proxies
+  - no proper-motion application
+  - no neighbour stitching
+  - no scratch cache tier
+- Add an explicit Gaia store configuration object for:
+  - storage root
+  - Gaia release
+  - outer HEALPix level
+- Do not add implicit Gaia-root discovery or repo-root config-file lookup
+  inside `ao_sky.gaia`.
+- If a supported `aosky.conf` is added later, treat it as a CLI or
+  application-layer convenience that constructs explicit store configuration
+  rather than as hidden package-global behavior.
 - Re-implement and modernize the Gaia store tests first.
 
 ### Phase 2: Re-Implement Spatial And Asterism Core
@@ -235,11 +245,25 @@ wrapper code.
 - Re-implement the non-plotting HEALPix helpers.
 - Re-implement and split the asterism search code.
 - Build a clean star-loading path for asterism construction around the Phase 1
-  Gaia loader.
+  Gaia loader, including proper-motion application and neighbour-aware views as
+  needed there.
 - Define the canonical asterism catalog contract, even if the first persisted
   form remains FITS for compatibility.
 
-### Phase 3: Define The Derived Pass Model
+### Phase 3: Define The WFS Photometric Proxy Layer
+
+- Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
+  AO-system-specific photometric products.
+- Define AO-system-aware derived photometry on top of loaded Gaia stars rather
+  than inside the canonical Gaia store.
+- Support transient sensing-band outputs, including photon-rate proxies and
+  magnitude-like proxies where useful to downstream consumers.
+- Decide how Gaia XP synthetic photometry, empirical Gaia-to-band transforms,
+  and flux-space combinations fit behind one interface.
+- Define uncertainty handling and the downstream contract for asterism-building
+  and AO-simulation consumers.
+
+### Phase 4: Define The Derived Pass Model
 
 - Replace `config.folder` coupling with explicit pass manifests and layouts.
 - Implement pass-aware paths for:
@@ -249,17 +273,20 @@ wrapper code.
   - survey-extent overlays
 - Define pass metadata and restart state.
 
-### Phase 4: Rebuild The Execution Engine
+### Phase 5: Rebuild The Execution Engine
 
 - Implement restart-aware planning over unfinished outer pixels.
 - Replace chunk-barrier scheduling with a more flexible scheduler.
 - Add neighbour-oriented traversal and star-count balancing.
 - Add a pre-warming local-cache scheme that can stage Gaia and inner files into
   local storage in parallel with ongoing processing.
+- If a supported repo-root `aosky.conf` is added, define it here as a CLI or
+  application-layer configuration surface rather than as hidden package-global
+  behavior inside `ao_sky.gaia`.
 - Benchmark against the recorded baseline in `docs/benchmarking.md` and refresh
   it under the current storage setup before considering cache complexity.
 
-### Phase 5: Compatibility Adoption In survey_tools
+### Phase 6: Compatibility Adoption In survey_tools
 
 - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
 - Keep pinned legacy assets readable through explicit compatibility paths.
@@ -267,7 +294,7 @@ wrapper code.
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
 
-### Phase 6: Deduplication And Final Handoff
+### Phase 7: Deduplication And Final Handoff
 
 - Remove the superseded legacy implementation from `survey_tools`.
 - Retain only the compatibility surface that is still worth carrying.
@@ -337,13 +364,11 @@ surface is the compatibility target, not the old implementation shape.
 
 After this planning pass, the best first implementation thread is:
 
-1. complete the public package baseline:
-   - `pyproject.toml`
-   - `LICENSE`
-   - `src/ao_sky`
-   - minimum public repo metadata
-2. re-implement the Gaia schema/store/loader plus the Gaia store tests
-3. re-implement only the non-plotting HEALPix helpers required by those tests
+1. re-implement the non-plotting HEALPix helpers needed beyond the raw Gaia
+   store boundary
+2. build the higher-level star-loading path for asterism construction,
+   including proper-motion application and neighbour-aware views
+3. re-implement and split the asterism search code on top of that loader path
 
-That gives `ao-sky` a real canonical nucleus without prematurely importing the
-rest of the legacy architecture.
+That keeps the raw Gaia nucleus stable while moving the next thread to the
+Phase 2 spatial and asterism core.

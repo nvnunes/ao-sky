@@ -52,6 +52,18 @@ points change:
 ./.conda/bin/python -m pip install -e ".[dev,docs]"
 ```
 
+The repo includes a versioned pre-commit hook at `.githooks/pre-commit`.
+That hook runs:
+
+- `./.conda/bin/python -m pytest -q`
+- `./.conda/bin/mkdocs build --strict`
+
+If the hooks path is not active in your clone, set it with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Completion Expectations
 
 Run the full package-surface verification path before concluding substantial
@@ -83,6 +95,11 @@ Planning, architecture, or benchmark-sensitive doc changes are complete when:
 - the owning document reflects the decision
 - adjacent docs are updated when discovery or ownership changes
 - benchmark-sensitive claims remain consistent with `docs/benchmarking.md`
+
+Gaia store tests should remain offline:
+
+- materialization tests should monkeypatch the archive query seam
+- normal repo verification should not depend on live Gaia archive access
 
 ## Verification Scope Boundaries
 

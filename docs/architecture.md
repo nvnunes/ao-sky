@@ -38,20 +38,20 @@ provenance are part of the domain model.
 The following decisions should be treated as fixed inputs to the design:
 
 - Canonical Gaia storage is raw Gaia DR3, not a working-data product.
-- Derived working-band magnitudes such as `R` are computed in the loader, not
-  persisted.
+- Derived working-band magnitudes, WFS-band proxies, and other AO-system-aware
+  photometric products are not persisted in canonical Gaia files.
 - The locked canonical Gaia schema is:
-  - `gaia_id`
-  - `gaia_ra`
-  - `gaia_dec`
-  - `gaia_G`
-  - `gaia_BP`
-  - `gaia_RP`
-  - `gaia_ref_epoch`
-  - `gaia_pmra`
-  - `gaia_pmdec`
-  - `gaia_non_single_star`
-  - `gaia_ruwe`
+  - `source_id`
+  - `ra`
+  - `dec`
+  - `G`
+  - `BP`
+  - `RP`
+  - `ref_epoch`
+  - `pmra`
+  - `pmdec`
+  - `non_single_star`
+  - `ruwe`
 - Canonical Gaia file format is compressed HDF5.
 - The storage unit remains one file per outer pixel.
 - The hour/declination/pixel directory structure stays in place.
@@ -82,7 +82,7 @@ The canonical package is split by ownership:
   - Gaia schema constants
   - archive querying
   - canonical HDF5 storage
-  - loader-time preparation such as proper motion and derived working bands
+  - raw per-outer-pixel Gaia readers
 - `ao_sky.spatial`
   - HEALPix conversions
   - neighbour traversal primitives
@@ -120,6 +120,8 @@ The architecture uses distinct data layers with explicit ownership.
 - Shared across all derived passes.
 - Stored without derived working bands.
 - Loaded through explicit schema-aware readers.
+- Stored at `<root>/gaia-<release>-hpx<healpix_level>/<hour>h/<sign><deg>/<outer_pix>/gaia.h5`.
+- Stored as one HDF5 dataset named `gaia` using `gzip=9` and `shuffle=True`.
 
 ### Derived Pass Artifacts
 
@@ -211,7 +213,7 @@ repository.
 The documentation surface explains:
 
 - how Gaia storage is laid out
-- how working bands are derived at load time
+- how canonical Gaia inputs differ from later derived photometric layers
 - what a pass is
 - what artifacts a pass produces
 - how restartable build execution works

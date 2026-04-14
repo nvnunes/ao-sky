@@ -5,16 +5,18 @@ guide-star loading, asterism search, and derived all-sky AO products.
 
 ## Current Status
 
-The current repo surface establishes the installable package baseline:
+The current repo surface establishes:
 
 - `src/ao_sky` is the canonical package root
+- `ao_sky.gaia` is the implemented raw Gaia per-pixel store boundary
 - `ao-sky` is the public CLI entrypoint
 - `./.conda` is the canonical local development environment
 - strict docs and packaging checks are part of the repo-local verification path
 
-The scientific core remains in the next planned implementation areas. Use
-[`plan.md`](plan.md) for migration sequencing and
-[`architecture.md`](architecture.md) for the intended package boundary.
+The next planned implementation areas are the higher-level spatial helpers,
+asterism path, and derived photometric layers. Use [`plan.md`](plan.md) for
+migration sequencing and [`architecture.md`](architecture.md) for the package
+boundary.
 
 ## Start Here
 
