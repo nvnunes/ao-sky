@@ -20,6 +20,19 @@ implementation and downstream migration work has been absorbed here or into the
 sibling docs in this repository. `ao-sky` planning should remain readable and
 actionable without depending on planning documents in other repositories.
 
+## Documentation Boundary
+
+- Phase labels and other transitional sequencing language belong in this
+  document.
+- Source-of-truth docs such as `README.md`, `AGENTS.md`,
+  `docs/architecture.md`, `docs/development.md`, `docs/testing.md`,
+  `docs/benchmarking.md`, package metadata, and shipped CLI/API text should
+  describe current state, supported workflows, and stable boundaries without
+  phase language.
+- When another document needs to point at future work, link to
+  `docs/plan.md` rather than importing its phase terminology into that
+  document.
+
 ## Current Situation
 
 `survey_tools` should now be treated as legacy and compatibility

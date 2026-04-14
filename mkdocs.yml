@@ -1,0 +1,16 @@
+site_name: ao-sky
+site_description: Gaia-backed AO-sky mapping and asterism search
+repo_name: ao-sky
+docs_dir: docs
+strict: true
+
+theme:
+  name: mkdocs
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Development: development.md
+  - Testing: testing.md
+  - Benchmarking: benchmarking.md
+  - Plan: plan.md

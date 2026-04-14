@@ -5,8 +5,8 @@ data layers, persisted artifact model, build execution model, and public
 package/documentation shape.
 
 It describes a mix of implemented and intended architecture. Use
-[`docs/plan.md`](docs/plan.md) for the transitional migration context and
-phase-level details around that architecture.
+[`plan.md`](plan.md) for the transitional migration context and implementation
+sequencing around that architecture.
 
 ## Shared Guidance
 

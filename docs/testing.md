@@ -1,76 +1,88 @@
 # Testing
 
-This document is the source of truth for verification commands and completion expectations in `ao-sky`.
-
-`ao-sky` is still in its bootstrap stage. The repo does not yet have a Python
-package, test suite, or docs build command. This document therefore records:
-
-- the current verification expectations for the repo as it exists now
-- the command categories that Phase 0 must establish explicitly
-- the completion expectations that should remain stable as the repo grows
+This document is the source of truth for local verification commands and
+completion expectations in `ao-sky`.
 
 ## Shared Validation
 
 Use the shared base testing guidance in `astro-agents/validation/base-testing.md`.
 
-## Current Repo-Local Verification
+## Environment
 
-At the current stage, repo-local verification is documentation-surface
-verification.
+Use the local `./.conda` environment for Python commands, test runs, packaging
+checks, and docs builds unless a task explicitly requires something else.
 
-For docs-only changes in the current repo state:
+Create the environment and install the package with:
 
-- verify that changed docs remain internally consistent
-- verify that source-of-truth ownership remains clear across `README.md`,
-  `AGENTS.md`, `docs/architecture.md`, `docs/development.md`, `docs/plan.md`,
-  `docs/benchmarking.md`, and `docs/testing.md`
-- verify that cross-links and doc discovery paths remain current
-- verify that commands are not claimed to exist if they do not yet exist
-- verify that benchmark claims distinguish historical baselines from current
-  operating assumptions when that distinction matters
+```bash
+conda create -y -p ./.conda python=3.12
+./.conda/bin/python -m pip install -e ".[dev,docs]"
+```
 
-## Completion Expectations By Change Type
+## Canonical Verification Commands
 
-### Docs-Only Changes
+Run the Python test suite with:
+
+```bash
+./.conda/bin/python -m pytest -q
+```
+
+Build the package artifacts with:
+
+```bash
+./.conda/bin/python -m build --no-isolation
+```
+
+Build the docs site in strict mode with:
+
+```bash
+./.conda/bin/mkdocs build --strict
+```
+
+Smoke-check the installed CLI entrypoint with:
+
+```bash
+./.conda/bin/ao-sky --version
+```
+
+Refresh the editable install whenever package metadata, dependencies, or entry
+points change:
+
+```bash
+./.conda/bin/python -m pip install -e ".[dev,docs]"
+```
+
+## Completion Expectations
+
+Run the full package-surface verification path before concluding substantial
+changes to the public package surface:
+
+- `./.conda/bin/python -m pytest -q`
+- `./.conda/bin/python -m build --no-isolation`
+- `./.conda/bin/mkdocs build --strict`
+- `./.conda/bin/ao-sky --version`
 
 Docs-only work is complete when:
 
-- the changed documents are internally consistent
-- any affected source-of-truth cross-links are updated
-- no stale command, package, or lifecycle claims remain
+- the changed docs remain internally consistent
+- source-of-truth ownership remains clear across `README.md`, `AGENTS.md`, and
+  the docs surface
+- cross-links and package/workflow claims remain current
+- the strict docs build passes
 
-### Planning Or Architecture Changes
+Package, CLI, or packaging changes are complete when:
 
-Planning or architecture work is complete when:
+- the package installs cleanly in editable mode
+- the Python test suite passes
+- the package build succeeds
+- the CLI smoke check succeeds
+- docs are updated when supported usage or workflow changed
 
-- the changed design or planning decision is reflected in the owning document
-- adjacent documents are updated when doc discovery or ownership changes
-- any benchmark-sensitive design claim is consistent with `docs/benchmarking.md`
+Planning, architecture, or benchmark-sensitive doc changes are complete when:
 
-### Development Bootstrap Changes
-
-Environment or toolchain bootstrap work is complete when:
-
-- `docs/development.md` is updated with the exact canonical commands
-- `docs/testing.md` is updated with the exact canonical verification commands
-- the commands recorded here are the ones actually used for the work
-
-### Code Changes
-
-Once code lands in the repo, code changes are not complete until:
-
-- the relevant canonical verification commands from this document have been run
-- docs are updated when supported usage, public imports, or workflow changes
-  changed
-
-## Canonical Verification Commands To Add In Phase 0
-
-Phase 0 should update this document with the exact commands for:
-
-- package installation or packaging smoke verification
-- the canonical test command
-- the canonical docs build command, if docs build tooling exists
-- any stricter release or full-repo verification path
+- the owning document reflects the decision
+- adjacent docs are updated when discovery or ownership changes
+- benchmark-sensitive claims remain consistent with `docs/benchmarking.md`
 
 ## Verification Scope Boundaries
 

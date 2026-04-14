@@ -10,7 +10,7 @@
 - Follow `README.md` for the repo's public summary and starting docs.
 - Follow `docs/architecture.md` for package shape, artifact boundaries, and stable design decisions.
 - Follow `docs/development.md` for local bootstrap, environment, and daily workflow.
-- Follow `docs/plan.md` for transitional migration context and phased planning.
+- Follow `docs/plan.md` for transitional migration context and implementation sequencing.
 - Follow `docs/benchmarking.md` for benchmark evidence that informs storage, scheduling, and cache decisions.
 - Follow `docs/testing.md` for verification expectations.
 
@@ -23,7 +23,7 @@
 - For Python code, follow `astro-agents/authoring/code/python.md`.
 - For repo docs such as `docs/architecture.md`, `docs/testing.md`, `docs/development.md`, and similar long-lived repo documents, follow `astro-agents/authoring/writing/repo-docs.md`.
 - For `README.md`, follow `astro-agents/authoring/writing/readme-md.md` in addition to `astro-agents/authoring/writing/repo-docs.md`.
-- For plan documents or phased execution docs when they are created or revised, follow `astro-agents/authoring/writing/plan.md`.
+- For plan documents or execution-roadmap docs when they are created or revised, follow `astro-agents/authoring/writing/plan.md`.
 
 ## Working Rules
 - For package structure, public API boundaries, persisted contracts, and lifecycle-sensitive changes, consult `docs/architecture.md` before editing.
