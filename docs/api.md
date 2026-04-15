@@ -154,7 +154,7 @@ and create the build artifact layout.
 Behavior:
 
 - load a minimal build-definition YAML with the required build identity fields
-- resolve `gaia_root` and `build_root` from explicit arguments or `aosky.conf`
+- resolve `gaia_root`, `build_root`, and `dust_root` from explicit arguments or `aosky.conf`
 - persist the resolved roots into `build.h5`
 
 ### `run_build(build_path) -> Path`

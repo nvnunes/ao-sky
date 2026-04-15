@@ -28,10 +28,33 @@ LEGACY_CONFIG_FILENAME = REPO_ROOT.parent / "survey_tools" / "aomap" / "config.y
 LEGACY_RUNTIME_ROOT = REPO_ROOT.parent / "survey_tools"
 LEGACY_PYTHON = LEGACY_RUNTIME_ROOT / ".conda" / "bin" / "python"
 GAIA_ROOT = Path("/Volumes/Data/Galaxy/aosky")
+DUST_ROOT = LEGACY_RUNTIME_ROOT / "data" / "dust"
 GAIA_RELEASE = "dr3"
 DEFAULT_AO_SYSTEM = "GNAO"
 FLOAT_ATOL = 1e-6
 FLOAT_RTOL = 1e-10
+SMOKE_SAMPLE_OUTER_PIXS = (
+    1299,
+    1717,
+    4008,
+    6098,
+    8815,
+    10949,
+)
+FULL_SAMPLE_OUTER_PIXS = (
+    1299,
+    1456,
+    1717,
+    4008,
+    5340,
+    6098,
+    6221,
+    6358,
+    7940,
+    8815,
+    10949,
+    11323,
+)
 SPECIAL_HOUR_PIXELS = {
     8960,
     8972,
@@ -68,6 +91,7 @@ COMPARISON_COLUMNS = (
 
 INNER_COMPARISON_COLUMNS = (
     "pix",
+    "gaia_A0",
     "star_count",
     "ngs_count",
     "asterism_count",
@@ -212,6 +236,7 @@ class LegacyAOSystem:
 class LegacyComparisonConfig:
     outer_level: int
     inner_level: int
+    max_data_level: int
     asterism_epoch: float | None
     asterisms_min_galactic_latitude: float
     asterisms_galactic_latitude_bypass_pixs: tuple[int, ...]
@@ -239,15 +264,107 @@ def _get_hour_deg_for_path(outer_pix: int, coord: SkyCoord) -> tuple[int, int]:
     return hour, deg
 
 
+def _load_live_legacy_dust_values(
+    *,
+    config: LegacyComparisonConfig,
+    outer_pix: int,
+    dust_root: Path,
+) -> np.ndarray:
+    with tempfile.TemporaryDirectory(prefix="ao-sky-legacy-dust-") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        output_filename = tmpdir_path / "dust.npy"
+        code = textwrap.dedent(
+            """
+            import os
+            import sys
+            from pathlib import Path
+            import numpy as np
+            import dustmaps.gaia_tge as gaia_tge
+
+            survey_root = Path(sys.argv[1]).resolve()
+            config_filename = Path(sys.argv[2]).resolve()
+            output_filename = Path(sys.argv[3]).resolve()
+            dust_root = Path(sys.argv[4]).resolve()
+            outer_pix = int(sys.argv[5])
+
+            sys.path.insert(0, str(survey_root))
+            import aomap.aomap as aomap
+
+            config = aomap.read_config(str(config_filename))
+            map_filename = dust_root / 'gaia_tge' / 'TotalGalacticExtinctionMap_001.csv.gz'
+            dust = gaia_tge.GaiaTGEQuery(map_fname=str(map_filename), healpix_level='optimum')
+            _, coords = aomap.healpix.get_subpixels_skycoord(config.outer_level, outer_pix, config.max_data_level)
+            values = dust.query(coords)
+            if config.inner_level > config.max_data_level:
+                values = np.repeat(values, 4 ** (config.inner_level - config.max_data_level))
+            np.save(output_filename, np.asarray(values, dtype=np.float64))
+            """
+        )
+        result = subprocess.run(
+            [
+                str(LEGACY_PYTHON),
+                "-c",
+                code,
+                str(LEGACY_RUNTIME_ROOT),
+                str(config.legacy_config_filename),
+                str(output_filename),
+                str(dust_root),
+                str(outer_pix),
+            ],
+            cwd=LEGACY_RUNTIME_ROOT / "aomap",
+            env={**os.environ, "MPLCONFIGDIR": str(tmpdir_path / "mpl")},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or not output_filename.exists():
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            details = stderr or stdout or "no output"
+            raise RuntimeError(f"Legacy dust adapter failed for outer pixel {outer_pix}: {details}")
+        return np.load(output_filename)
+
+
+def _add_live_legacy_dust_field(
+    inner: Table,
+    *,
+    config: LegacyComparisonConfig,
+    outer_pix: int,
+    dust_root: Path,
+) -> Table:
+    result = inner.copy(copy_data=True)
+    values = _load_live_legacy_dust_values(
+        config=config,
+        outer_pix=outer_pix,
+        dust_root=dust_root,
+    )
+    if len(values) != len(result):
+        raise RuntimeError(
+            f"Legacy dust length {len(values)} does not match inner rows {len(result)}"
+        )
+    if "gaia_A0" in result.colnames:
+        result["gaia_A0"] = values
+    else:
+        result.add_column(np.asarray(values, dtype=np.float64), name="gaia_A0", index=1)
+    return result
+
+
 def load_live_legacy_outputs(
     *,
     release: str,
     config: LegacyComparisonConfig,
     outer_pix: int,
+    dust_root: Path,
 ) -> tuple[Table, Table]:
     """Run the live legacy outer-pixel path and return asterism and inner outputs."""
     runtime = _build_runtime(release=release, config=config)
     legacy_asterisms, inner = load_live_legacy_traversal_outputs(runtime, outer_pix)
+    inner = _add_live_legacy_dust_field(
+        inner,
+        config=config,
+        outer_pix=outer_pix,
+        dust_root=dust_root,
+    )
     if legacy_asterisms is None:
         legacy_asterisms = _empty_legacy_asterism_table()
     return legacy_asterisms, inner
@@ -333,6 +450,7 @@ def load_legacy_config(filename: Path, ao_system_name: str) -> LegacyComparisonC
     return LegacyComparisonConfig(
         outer_level=int(raw["outer_level"]),
         inner_level=int(raw["inner_level"]),
+        max_data_level=int(raw["max_data_level"]),
         asterism_epoch=(
             None if raw.get("asterism_epoch") is None else float(raw["asterism_epoch"])
         ),
@@ -681,6 +799,7 @@ def _build_runtime(
         gaia_release=release,
         outer_level=config.outer_level,
         inner_level=config.inner_level,
+        max_data_level=config.max_data_level,
         epoch=config.asterism_epoch if config.asterism_epoch is not None else 2016.0,
         min_galactic_latitude=config.asterisms_min_galactic_latitude,
     )
@@ -690,6 +809,7 @@ def _build_runtime(
 def build_new_outputs(
     *,
     gaia_root: Path,
+    dust_root: Path,
     release: str,
     config: LegacyComparisonConfig,
     outer_pix: int,
@@ -699,7 +819,13 @@ def build_new_outputs(
         GaiaStoreConfig(root=gaia_root, release=release, healpix_level=config.outer_level)
     )
     runtime = _build_runtime(release=release, config=config)
-    asterisms, inner = build_traversal_products(store, runtime, outer_pix)
+    asterisms, inner = build_traversal_products(
+        store,
+        runtime,
+        outer_pix,
+        dust_root=dust_root,
+        max_data_level=config.max_data_level,
+    )
     return asterisms, inner
 
 
@@ -839,13 +965,22 @@ def compare_inner_tables(legacy: Table, new: Table) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare one outer-pixel live legacy asterism result against the new in-memory search path.",
+        description="Compare live legacy outer-pixel results against the new in-memory path.",
     )
     parser.add_argument(
         "outer_pix",
-        nargs="?",
+        nargs="*",
         type=int,
-        help="Outer HEALPix pixel id to compare. If omitted, choose one uniformly at random from the outer HEALPix level.",
+        help="Outer HEALPix pixel id(s) to compare. If omitted, use the selected sample set.",
+    )
+    parser.add_argument(
+        "--sample",
+        choices=("smoke", "full", "random"),
+        default="smoke",
+        help=(
+            "Named sample set to use when no explicit outer_pix values are given. "
+            "'smoke' avoids the slower pathological pixels used only in broader checks."
+        ),
     )
     parser.add_argument("--ao-system", default=DEFAULT_AO_SYSTEM, help="Legacy AO system name.")
     parser.add_argument(
@@ -861,6 +996,12 @@ def parse_args() -> argparse.Namespace:
         help="Canonical ao-sky Gaia root used by the new code path.",
     )
     parser.add_argument(
+        "--dust-root",
+        type=Path,
+        default=DUST_ROOT,
+        help="Dust root containing the Gaia TGE dustmaps data.",
+    )
+    parser.add_argument(
         "--release",
         default=GAIA_RELEASE,
         help="Gaia release identifier for the canonical ao-sky store.",
@@ -868,21 +1009,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    _load_runtime()
-    config = load_legacy_config(args.config, args.ao_system)
-    outer_pix = args.outer_pix
-    if outer_pix is None:
-        outer_pix = select_random_outer_pix(
-            outer_level=config.outer_level,
-        )
+def _select_outer_pixs(
+    *,
+    outer_pixs: list[int],
+    sample: str,
+    outer_level: int,
+) -> list[int]:
+    if outer_pixs:
+        return [int(outer_pix) for outer_pix in outer_pixs]
+    if sample == "random":
+        outer_pix = select_random_outer_pix(outer_level=outer_level)
         print(f"selected random outer pixel: {outer_pix}")
+        return [outer_pix]
+    if sample == "full":
+        print("selected full comparison sample:", " ".join(str(pix) for pix in FULL_SAMPLE_OUTER_PIXS))
+        return list(FULL_SAMPLE_OUTER_PIXS)
+    print("selected smoke comparison sample:", " ".join(str(pix) for pix in SMOKE_SAMPLE_OUTER_PIXS))
+    return list(SMOKE_SAMPLE_OUTER_PIXS)
 
+
+def _compare_outer_pixel(
+    *,
+    outer_pix: int,
+    gaia_root: Path,
+    dust_root: Path,
+    release: str,
+    config: LegacyComparisonConfig,
+) -> int:
+    print(f"outer pixel: {outer_pix}")
     legacy_asterisms, legacy_inner = load_live_legacy_outputs(
-        release=args.release,
+        release=release,
         config=config,
         outer_pix=outer_pix,
+        dust_root=dust_root,
     )
     legacy_table = prepare_legacy_table(legacy_asterisms)
     legacy_inner = prepare_inner_table(legacy_inner)
@@ -892,8 +1051,9 @@ def main() -> int:
     )
 
     new_table, new_inner = build_new_outputs(
-        gaia_root=args.gaia_root,
-        release=args.release,
+        gaia_root=gaia_root,
+        dust_root=dust_root,
+        release=release,
         config=config,
         outer_pix=outer_pix,
     )
@@ -905,7 +1065,34 @@ def main() -> int:
     asterism_status = compare_tables(legacy_table, prepared_new)
     print("inner:")
     inner_status = compare_inner_tables(legacy_inner, prepared_new_inner)
-    return 1 if asterism_status or inner_status else 0
+    status = 1 if asterism_status or inner_status else 0
+    print(f"result: {'FAIL' if status else 'OK'}")
+    return status
+
+
+def main() -> int:
+    args = parse_args()
+    _load_runtime()
+    dust_root = args.dust_root.expanduser().resolve()
+    config = load_legacy_config(args.config, args.ao_system)
+    outer_pixs = _select_outer_pixs(
+        outer_pixs=args.outer_pix,
+        sample=args.sample,
+        outer_level=config.outer_level,
+    )
+
+    failures = 0
+    for index, outer_pix in enumerate(outer_pixs):
+        if index > 0:
+            print()
+        failures += _compare_outer_pixel(
+            outer_pix=outer_pix,
+            gaia_root=args.gaia_root,
+            dust_root=dust_root,
+            release=args.release,
+            config=config,
+        )
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

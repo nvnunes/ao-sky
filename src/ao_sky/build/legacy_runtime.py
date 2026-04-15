@@ -15,6 +15,7 @@ import numpy as np
 import yaml
 
 from ..asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
+from ..dust import add_gaia_a0_to_inner
 from ..gaia import GAIA_SCHEMA_COLUMNS, GaiaHealpixStore, apply_proper_motion, compute_legacy_r_magnitude
 from ..spatial import (
     get_pixel_area,
@@ -720,6 +721,9 @@ def build_traversal_products(
     store: GaiaHealpixStore,
     runtime: LegacyBuildRuntime,
     outer_pix: int,
+    *,
+    dust_root: Path,
+    max_data_level: int,
 ) -> tuple[Table, Table]:
     """Return retained asterisms and the rich inner table for one outer pixel.
 
@@ -733,4 +737,12 @@ def build_traversal_products(
 
     del store  # Phase 5 adapter still uses the legacy runtime's Gaia cache.
     legacy_asterisms, inner = load_live_legacy_traversal_outputs(runtime, outer_pix)
+    inner = add_gaia_a0_to_inner(
+        inner,
+        dust_root=dust_root,
+        outer_level=runtime.outer_level,
+        outer_pix=outer_pix,
+        inner_level=runtime.inner_level,
+        max_data_level=max_data_level,
+    )
     return _to_persisted_asterisms_from_legacy(legacy_asterisms), inner

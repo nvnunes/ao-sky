@@ -29,6 +29,7 @@ def load_build_definition(filename: Path) -> tuple[BuildDefinition, str]:
         "gaia_release",
         "outer_level",
         "inner_level",
+        "max_data_level",
         "epoch",
     )
     missing = [name for name in required if name not in raw]
@@ -43,6 +44,7 @@ def load_build_definition(filename: Path) -> tuple[BuildDefinition, str]:
         gaia_release=str(raw["gaia_release"]).strip().lower(),
         outer_level=int(raw["outer_level"]),
         inner_level=int(raw["inner_level"]),
+        max_data_level=int(raw["max_data_level"]),
         epoch=float(raw["epoch"]),
         min_galactic_latitude=(
             None
@@ -60,6 +62,10 @@ def load_build_definition(filename: Path) -> tuple[BuildDefinition, str]:
         raise BuildError("outer_level must be non-negative")
     if definition.inner_level <= definition.outer_level:
         raise BuildError("inner_level must be larger than outer_level")
+    if definition.max_data_level < definition.outer_level:
+        raise BuildError("max_data_level must be greater than or equal to outer_level")
+    if definition.max_data_level > definition.inner_level:
+        raise BuildError("max_data_level must be less than or equal to inner_level")
     if not math.isfinite(definition.epoch):
         raise BuildError("epoch must be a finite number")
     if definition.min_galactic_latitude is not None and not math.isfinite(
@@ -74,10 +80,11 @@ def resolve_build_roots(
     *,
     gaia_root: Path | None,
     build_root: Path | None,
+    dust_root: Path | None,
     aosky_conf: Path | None = None,
     cwd: Path | None = None,
 ) -> BuildPaths:
-    """Resolve build and Gaia roots from CLI arguments or `aosky.conf`."""
+    """Resolve build, Gaia, and dust roots from CLI arguments or `aosky.conf`."""
 
     conf_path = aosky_conf
     if conf_path is None:
@@ -93,11 +100,14 @@ def resolve_build_roots(
 
     resolved_gaia_root = Path(gaia_root) if gaia_root is not None else None
     resolved_build_root = Path(build_root) if build_root is not None else None
+    resolved_dust_root = Path(dust_root) if dust_root is not None else None
 
     if resolved_gaia_root is None and conf_data.get("gaia_root") is not None:
         resolved_gaia_root = Path(str(conf_data["gaia_root"]))
     if resolved_build_root is None and conf_data.get("build_root") is not None:
         resolved_build_root = Path(str(conf_data["build_root"]))
+    if resolved_dust_root is None and conf_data.get("dust_root") is not None:
+        resolved_dust_root = Path(str(conf_data["dust_root"]))
 
     if resolved_gaia_root is None:
         raise BuildError(
@@ -107,10 +117,15 @@ def resolve_build_roots(
         raise BuildError(
             "build_root must be provided either via CLI or aosky.conf"
         )
+    if resolved_dust_root is None:
+        raise BuildError(
+            "dust_root must be provided either via CLI or aosky.conf"
+        )
 
     return BuildPaths(
         gaia_root=resolved_gaia_root.expanduser().resolve(),
         build_root=resolved_build_root.expanduser().resolve(),
+        dust_root=resolved_dust_root.expanduser().resolve(),
     )
 
 

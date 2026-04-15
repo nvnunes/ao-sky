@@ -171,9 +171,11 @@ def create_build_root(
             "gaia_release": definition.gaia_release,
             "gaia_root": str(roots.gaia_root),
             "build_root": str(roots.build_root),
+            "dust_root": str(roots.dust_root),
             "legacy_config_path": str(legacy_runtime.legacy_config_path),
             "outer_level": definition.outer_level,
             "inner_level": definition.inner_level,
+            "max_data_level": definition.max_data_level,
             "min_galactic_latitude": (
                 "" if definition.min_galactic_latitude is None else definition.min_galactic_latitude
             ),
@@ -200,6 +202,7 @@ def load_build_definition(build_path: Path) -> BuildDefinition:
             gaia_release=str(_decode_bytes(config_group["gaia_release"][()])),
             outer_level=int(config_group["outer_level"][()]),
             inner_level=int(config_group["inner_level"][()]),
+            max_data_level=int(config_group["max_data_level"][()]),
             epoch=float(config_group["epoch"][()]),
             min_galactic_latitude=(
                 None
@@ -217,6 +220,7 @@ def load_build_roots(build_path: Path) -> BuildPaths:
         return BuildPaths(
             gaia_root=Path(str(_decode_bytes(config_group["gaia_root"][()]))),
             build_root=Path(str(_decode_bytes(config_group["build_root"][()]))),
+            dust_root=Path(str(_decode_bytes(config_group["dust_root"][()]))),
         )
 
 

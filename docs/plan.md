@@ -307,13 +307,24 @@ wrapper code.
 
 ### Phase 6: Add Dust-Enriched Derived Products
 
-- Add dust-loading where the richer derived build path depends on it.
-- Continue the Traversal build path by adding dust-derived fields and filters
-  to the relevant per-outer-pixel products.
-- Add `Av` to the dense `inner` product rather than to build `asterisms`.
-- Extend the temporary legacy-comparison harness as needed to validate the
-  dust-enriched products against the live legacy path while this phase is in
-  progress.
+- Implement local dust loading in `ao-sky` rather than extending the temporary
+  legacy Traversal shell-out.
+- Introduce `ao_sky.dust` as the owner for dust loading and sampling, with
+  Gaia TGE as the only backend in this phase.
+- Add `max_data_level` to the build definition and persisted build metadata,
+  and validate `outer_level <= max_data_level <= inner_level`.
+- Extend Traversal with an `Apply Dust Field` step that samples Gaia TGE `A0`
+  on the outer pixel at `max_data_level`, repeats it to `inner_level` as
+  needed, and persists it into dense `inner` as `gaia_A0`.
+- Keep dust data-only in this phase:
+  do not add dust-based Traversal filters and do not let dust alter `best_*`,
+  `winner_*`, or coverage fields.
+- Keep build `asterisms` dust-free in this phase; export-oriented dust fields
+  still belong to the later export phase.
+- Configure the local dust data location through the planned `aosky.conf`
+  surface rather than by copying the legacy relative-path behavior.
+- Extend the temporary legacy-comparison harness to validate the new local
+  `gaia_A0` path against the live legacy coarse-sampling behavior.
 
 ### Phase 7: Add Survey-Scale Derived Products
 
@@ -323,7 +334,18 @@ wrapper code.
 - Extend the temporary legacy-comparison harness as needed to validate these
   survey-scale outputs where useful during migration.
 
-### Phase 8: Audit `survey_tools` `aomap` For Missing Implementation
+### Phase 8: Replace The Temporary Legacy Shell-Out
+
+- Replace the temporary live legacy Traversal shell-out used for richer
+  per-outer-pixel products with native `ao-sky` implementation.
+- Move the remaining AO/winner prediction and selection path out of
+  `ao_sky.build.legacy_runtime` and into the canonical package surface.
+- Keep the Phase 5/6 product contracts stable while removing the live
+  dependency on legacy `survey_tools` execution during builds.
+- Continue using the temporary live legacy-comparison harness to validate the
+  native path while this replacement is in progress.
+
+### Phase 9: Audit `survey_tools` `aomap` For Missing Implementation
 
 - Perform a focused audit of the live `survey_tools` `aomap` implementation
   against the then-current `ao-sky` build surface.
@@ -334,7 +356,7 @@ wrapper code.
 - Use the audit to confirm that the preceding build-product phases are
   sufficient before cache work and compatibility adoption proceed.
 
-### Phase 9: Add Gaia Pre-Download And Summary Support
+### Phase 10: Add Gaia Pre-Download And Summary Support
 
 - Add a CLI command that can pre-download or materialize the canonical Gaia
   store for a full configured outer-pixel range rather than relying only on
@@ -346,7 +368,7 @@ wrapper code.
 - Keep one-off builds viable when the full Gaia store has not been
   pre-downloaded.
 
-### Phase 10: Add Cache-Aware Execution Support
+### Phase 11: Add Cache-Aware Execution Support
 
 - Add parallel worker execution on top of the non-cache single-process
   execution engine from Phase 4.
@@ -360,7 +382,7 @@ wrapper code.
 - Benchmark the cache-aware execution path against the non-cache execution
   engine before treating the added complexity as justified.
 
-### Phase 11: Improve The Winning-Asterism Algorithm
+### Phase 12: Improve The Winning-Asterism Algorithm
 
 - Revisit the interim winning-asterism selection path after the preceding
   build-product and audit phases have exposed the remaining weaknesses.
@@ -377,7 +399,7 @@ wrapper code.
 - Validate the improved winner path against the richer per-outer-pixel and
   survey-scale products before compatibility adoption proceeds.
 
-### Phase 12: Rebuild The Asterism Catalog Export Path
+### Phase 13: Rebuild The Asterism Catalog Export Path
 
 - Rebuild the asterism catalog export workflow on top of the richer `ao-sky`
   build products rather than the legacy `aomap` export path.
@@ -388,12 +410,12 @@ wrapper code.
 - Validate exported catalogs against the intended downstream use cases before
   compatibility adoption proceeds.
 
-### Phase 13: Explore Ways to Handle Higher Stellar Density
+### Phase 14: Explore Ways to Handle Higher Stellar Density
 
 - Currently the asterism code explodes when there are too many stars in an outer pixel
 - Explore ways to improve the algorithm so higher density fields can still be used
 
-### Phase 14: Define The WFS Photometric Proxy Layer
+### Phase 15: Define The WFS Photometric Proxy Layer
 
 - Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
   AO-system-specific photometric products.
@@ -408,7 +430,7 @@ wrapper code.
 - Define uncertainty handling and the downstream contract for asterism-building
   and AO-simulation consumers.
 
-### Phase 15: Compatibility Adoption In `survey_tools` And `girmos-aosims`
+### Phase 16: Compatibility Adoption In `survey_tools` And `girmos-aosims`
 
 - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
 - Add the downstream adoption work needed for `girmos-aosims` to consume the
@@ -419,7 +441,7 @@ wrapper code.
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
 
-### Phase 16: Deduplication And Final Handoff
+### Phase 17: Deduplication And Final Handoff
 
 - Remove the superseded legacy implementation from `survey_tools`.
 - Retain only the compatibility surface that is still worth carrying.

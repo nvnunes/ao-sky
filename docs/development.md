@@ -105,6 +105,7 @@ The current public build surface is centered on:
 - `gaia_release`
 - `outer_level`
 - `inner_level`
+- `max_data_level`
 - `epoch`
 
 Optional fields:
@@ -119,16 +120,18 @@ config_short_name: baseline
 gaia_release: dr3
 outer_level: 6
 inner_level: 14
+max_data_level: 9
 epoch: 2028.0
 min_galactic_latitude: 10.0
 ```
 
-`gaia_root` and `build_root` are not part of the build definition. Resolve them
+`gaia_root`, `build_root`, and `dust_root` are not part of the build definition. Resolve them
 either with CLI options or with a project-root `aosky.conf` file:
 
 ```yaml
 gaia_root: /data/gaia
 build_root: /data/ao-builds
+dust_root: /data/dust
 ```
 
 If `aosky.conf` is present in the working project root, `init` and `restart`
@@ -140,7 +143,8 @@ Example CLI flow with explicit roots:
 ```bash
 ./.conda/bin/ao-sky init build.yaml \
   --gaia-root /data/gaia \
-  --build-root /data/ao-builds
+  --build-root /data/ao-builds \
+  --dust-root /data/dust
 
 ./.conda/bin/ao-sky show /data/ao-builds/GNAO-baseline-v1
 ./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1

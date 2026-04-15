@@ -97,6 +97,10 @@ The canonical package is split by ownership:
   - geometry
   - overlap logic
   - filtering and scoring seams
+- `ao_sky.dust`
+  - Gaia TGE dust loading
+  - local dust-field sampling
+  - build-time dust-field injection helpers
 - `ao_sky.build`
   - build-definition loading
   - build metadata/state contracts
@@ -153,6 +157,7 @@ The architecture uses distinct data layers with explicit ownership.
 `ao-sky` uses an explicit build model for derived artifacts.
 
 - Gaia store has its own root and stable path contract.
+- Dust store has its own root and stable path contract.
 - Derived work happens inside explicit build directories.
 - Every build has:
   - a root `build.h5` control file for metadata and outer-pixel state
@@ -163,6 +168,8 @@ The architecture uses distinct data layers with explicit ownership.
   - the original build-definition YAML
   - normalized build metadata
   - the full-sky outer-pixel state table for the configured outer level
+- normalized build metadata includes the resolved `gaia_root`, `build_root`,
+  and `dust_root`, plus build-definition fields such as `max_data_level`
 - Per-outer-pixel build artifacts live under:
   - `hpx<outer-level>-<inner-level>/<hour>h/<sign><deg>/<outer_pix>/outer.h5`
 - Builds are inspectable and comparable without external context.

@@ -45,6 +45,7 @@ def init_build(
     definition_filename: Path,
     gaia_root: Path | None,
     build_root: Path | None,
+    dust_root: Path | None,
     aosky_conf: Path | None = None,
     legacy_config_path: Path,
 ) -> Path:
@@ -54,6 +55,7 @@ def init_build(
     roots = resolve_build_roots(
         gaia_root=gaia_root,
         build_root=build_root,
+        dust_root=dust_root,
         aosky_conf=aosky_conf,
     )
     legacy_runtime = load_legacy_runtime(definition, legacy_config_path)
@@ -89,7 +91,13 @@ def build_outer_pixel_products(build_path: Path, outer_pix: int) -> None:
     )
 
     try:
-        asterisms, inner = build_traversal_products(store, runtime, outer_pix)
+        asterisms, inner = build_traversal_products(
+            store,
+            runtime,
+            outer_pix,
+            dust_root=roots.dust_root,
+            max_data_level=definition.max_data_level,
+        )
         filename = outer_artifact_filename(build_path, definition, outer_pix)
         write_outer_artifact(filename, inner=inner, asterisms=asterisms)
         update_state_row(

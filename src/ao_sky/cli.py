@@ -38,11 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("definition", type=Path, help="Build-definition YAML filename.")
     init_parser.add_argument("--gaia-root", type=Path, default=None, help="Resolved Gaia root.")
     init_parser.add_argument("--build-root", type=Path, default=None, help="Resolved build root.")
+    init_parser.add_argument("--dust-root", type=Path, default=None, help="Resolved dust root.")
     init_parser.add_argument(
         "--aosky-conf",
         type=Path,
         default=None,
-        help="Optional aosky.conf YAML with gaia_root/build_root defaults.",
+        help="Optional aosky.conf YAML with gaia_root/build_root/dust_root defaults.",
     )
     init_parser.add_argument(
         "--legacy-config",
@@ -96,6 +97,7 @@ def _handle_init(args: argparse.Namespace) -> int:
         definition_filename=args.definition,
         gaia_root=args.gaia_root,
         build_root=args.build_root,
+        dust_root=args.dust_root,
         aosky_conf=args.aosky_conf,
         legacy_config_path=args.legacy_config or DEFAULT_LEGACY_CONFIG,
     )

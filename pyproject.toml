@@ -24,6 +24,7 @@ dependencies = [
     "astropy>=6.0",
     "astropy-healpix>=1.0",
     "astroquery>=0.4.7",
+    "dustmaps>=1.0.13",
     "h5py>=3.0",
     "numpy>=1.26",
     "PyYAML>=6.0",

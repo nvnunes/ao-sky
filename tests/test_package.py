@@ -67,6 +67,7 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
                 "gaia_release: dr3",
                 "outer_level: 0",
                 "inner_level: 1",
+                "max_data_level: 1",
                 "epoch: 2028.0",
             )
         )
@@ -99,6 +100,7 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
     )
     gaia_root = tmp_path / "gaia"
     build_root = tmp_path / "builds"
+    dust_root = tmp_path / "dust"
 
     init_result = subprocess.run(
         [
@@ -111,6 +113,8 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
             str(gaia_root),
             "--build-root",
             str(build_root),
+            "--dust-root",
+            str(dust_root),
             "--legacy-config",
             str(legacy),
         ],

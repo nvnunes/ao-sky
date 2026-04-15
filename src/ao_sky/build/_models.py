@@ -17,6 +17,7 @@ class BuildDefinition:
     gaia_release: str
     outer_level: int
     inner_level: int
+    max_data_level: int
     epoch: float
     min_galactic_latitude: float | None = None
 
@@ -27,6 +28,7 @@ class BuildPaths:
 
     gaia_root: Path
     build_root: Path
+    dust_root: Path
 
 
 @dataclass(frozen=True, slots=True)

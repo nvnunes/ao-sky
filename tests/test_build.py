@@ -33,13 +33,19 @@ from ao_sky.build.control import (
 from ao_sky.build.scheduler import OuterPixelScheduler
 
 
-def _write_build_definition(path: Path, *, min_galactic_latitude: float | None = None) -> Path:
+def _write_build_definition(
+    path: Path,
+    *,
+    min_galactic_latitude: float | None = None,
+    max_data_level: int = 1,
+) -> Path:
     lines = [
         "ao_system_short_name: GNAO",
         "config_short_name: baseline",
         "gaia_release: dr3",
         "outer_level: 0",
         "inner_level: 1",
+        f"max_data_level: {max_data_level}",
         "epoch: 2028.0",
     ]
     if min_galactic_latitude is not None:
@@ -83,6 +89,7 @@ def _make_scheduler_state(statuses: list[int], *, field: str = "traversal_status
 def _make_inner(
     *,
     pixs: list[int] | None = None,
+    gaia_a0: float = np.nan,
     star_count: int = 0,
     ngs_count: int = 0,
     asterism_count: int = 0,
@@ -101,6 +108,7 @@ def _make_inner(
     return Table(
         [
             pix_values,
+            np.full(nrows, gaia_a0, dtype=np.float64),
             np.full(nrows, star_count, dtype=np.int64),
             np.full(nrows, ngs_count, dtype=np.int64),
             np.full(nrows, asterism_count, dtype=np.int64),
@@ -116,6 +124,7 @@ def _make_inner(
         ],
         names=(
             "pix",
+            "gaia_A0",
             "star_count",
             "ngs_count",
             "asterism_count",
@@ -224,6 +233,7 @@ def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
 
@@ -237,6 +247,7 @@ def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
     assert state["outer_pix"].tolist() == list(range(12))
     assert np.all(state["gaia_loading_status"] == WORK_STATUS_DONE)
     assert np.all(state["traversal_status"] == WORK_STATUS_PENDING)
+    assert load_build_definition(build_path).max_data_level == 1
 
     summary = summarize_build(build_path)
     assert summary["build_status"] == "initialized"
@@ -249,7 +260,11 @@ def test_init_build_uses_aosky_conf_roots(tmp_path: Path, monkeypatch: pytest.Mo
     project_root = tmp_path / "project"
     project_root.mkdir()
     (project_root / "aosky.conf").write_text(
-        f"gaia_root: {tmp_path / 'gaia'}\nbuild_root: {tmp_path / 'builds'}\n",
+        (
+            f"gaia_root: {tmp_path / 'gaia'}\n"
+            f"build_root: {tmp_path / 'builds'}\n"
+            f"dust_root: {tmp_path / 'dust'}\n"
+        ),
         encoding="utf-8",
     )
     monkeypatch.chdir(project_root)
@@ -258,6 +273,7 @@ def test_init_build_uses_aosky_conf_roots(tmp_path: Path, monkeypatch: pytest.Mo
         definition_filename=definition,
         gaia_root=None,
         build_root=None,
+        dust_root=None,
         legacy_config_path=legacy,
     )
 
@@ -274,6 +290,7 @@ def test_load_build_definition_rejects_blank_gaia_release(tmp_path: Path) -> Non
                 "gaia_release: '   '",
                 "outer_level: 0",
                 "inner_level: 1",
+                "max_data_level: 1",
                 "epoch: 2028.0",
             )
         )
@@ -295,6 +312,7 @@ def test_load_build_definition_rejects_non_finite_epoch(tmp_path: Path) -> None:
                 "gaia_release: dr3",
                 "outer_level: 0",
                 "inner_level: 1",
+                "max_data_level: 1",
                 "epoch: .nan",
             )
         )
@@ -303,6 +321,13 @@ def test_load_build_definition_rejects_non_finite_epoch(tmp_path: Path) -> None:
     )
 
     with pytest.raises(BuildError, match="epoch must be a finite number"):
+        load_build_definition_yaml(definition)
+
+
+def test_load_build_definition_rejects_max_data_level_above_inner_level(tmp_path: Path) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml", max_data_level=2)
+
+    with pytest.raises(BuildError, match="max_data_level must be less than or equal to inner_level"):
         load_build_definition_yaml(definition)
 
 
@@ -382,14 +407,16 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
 
     monkeypatch.setattr(
         "ao_sky.build.runner.build_traversal_products",
-        lambda store, runtime, outer_pix: (
+        lambda store, runtime, outer_pix, **kwargs: (
             _make_asterisms(),
             _make_inner(
+                gaia_a0=0.12,
                 star_count=3,
                 ngs_count=2,
                 asterism_count=5,
@@ -422,6 +449,7 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
         assert OUTER_DATASET_ASTERISMS in handle
         assert set(handle[OUTER_DATASET_INNER].dtype.names) == {
             "pix",
+            "gaia_A0",
             "star_count",
             "ngs_count",
             "asterism_count",
@@ -447,12 +475,13 @@ def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
 
     monkeypatch.setattr(
         "ao_sky.build.runner.build_traversal_products",
-        lambda store, runtime, outer_pix: (
+        lambda store, runtime, outer_pix, **kwargs: (
             _make_asterisms(empty=True),
             _make_inner(star_count=4, ngs_count=0, asterism_count=0),
         ),
@@ -500,6 +529,7 @@ def test_run_build_repairs_stale_running_rows_and_logs_it(
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
     state = load_state(build_path)
@@ -509,7 +539,7 @@ def test_run_build_repairs_stale_running_rows_and_logs_it(
 
     monkeypatch.setattr(
         "ao_sky.build.runner.build_traversal_products",
-        lambda store, runtime, outer_pix: (_make_asterisms(empty=True), _make_inner()),
+        lambda store, runtime, outer_pix, **kwargs: (_make_asterisms(empty=True), _make_inner()),
     )
 
     run_build(build_path)
@@ -530,6 +560,7 @@ def test_run_build_is_successful_no_op_when_all_rows_done(
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
     state = load_state(build_path)
@@ -559,13 +590,21 @@ def test_run_build_continues_after_failure_and_marks_build_failed(
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
     state = load_state(build_path)
     for outer_pix in range(2, len(state)):
         update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
 
-    def _build_traversal_products(store: object, runtime: object, outer_pix: int) -> tuple[Table, Table]:
+    def _build_traversal_products(
+        store: object,
+        runtime: object,
+        outer_pix: int,
+        **kwargs: object,
+    ) -> tuple[Table, Table]:
+        assert kwargs["dust_root"] == tmp_path / "dust"
+        assert kwargs["max_data_level"] == 1
         if outer_pix == 0:
             raise RuntimeError("boom")
         return _make_asterisms(empty=True), _make_inner()
@@ -591,6 +630,7 @@ def test_show_build_reports_phase_and_phase_counts(tmp_path: Path) -> None:
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
     update_state_row(build_path, 0, traversal_status=WORK_STATUS_DONE)
@@ -611,6 +651,7 @@ def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
 

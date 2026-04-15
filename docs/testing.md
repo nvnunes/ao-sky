@@ -57,6 +57,7 @@ config_short_name: baseline
 gaia_release: dr3
 outer_level: 0
 inner_level: 1
+max_data_level: 1
 epoch: 2028.0
 YAML
 cat >"$tmpdir/legacy.yaml" <<'YAML'
@@ -80,6 +81,7 @@ build_path="$(
   ./.conda/bin/ao-sky init "$tmpdir/build.yaml" \
     --gaia-root "$tmpdir/gaia" \
     --build-root "$tmpdir/builds" \
+    --dust-root "$tmpdir/dust" \
     --legacy-config "$tmpdir/legacy.yaml"
 )"
 ./.conda/bin/ao-sky show "$build_path"
@@ -97,6 +99,20 @@ That hook runs:
 
 - `./.conda/bin/python -m pytest -q`
 - `./.conda/bin/mkdocs build --strict`
+
+For live migration comparisons against `survey_tools`, use the repo helper:
+
+```bash
+./.conda/bin/python scripts/compare_legacy_asterisms.py --sample smoke
+```
+
+The default `smoke` sample intentionally avoids the slower pathological outer
+pixels so routine phase work does not spend most of its time in a few crowded
+regions. Use the broader sample only when you want a heavier check:
+
+```bash
+./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full
+```
 
 If the hooks path is not active in your clone, set it with:
 

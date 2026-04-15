@@ -44,6 +44,7 @@ STATE_DTYPE: Final[np.dtype] = np.dtype(
 INNER_DTYPE: Final[np.dtype] = np.dtype(
     [
         ("pix", "<i8"),
+        ("gaia_A0", "<f8"),
         ("star_count", "<i8"),
         ("ngs_count", "<i8"),
         ("asterism_count", "<i8"),
