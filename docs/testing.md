@@ -87,6 +87,10 @@ build_path="$(
 ./.conda/bin/ao-sky show "$build_path"
 ```
 
+When survey overlays are configured in the build definition, the current build
+surface may also auto-advance from `aggregation` into `augmentation` and add a
+`survey_extent` dataset to each `maps-hpx<level>.h5` file.
+
 Refresh the editable install whenever package metadata, dependencies, or entry
 points change:
 

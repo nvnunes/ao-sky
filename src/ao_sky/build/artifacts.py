@@ -86,6 +86,37 @@ def write_maps_artifact(
     tmp_filename.replace(filename)
 
 
+def write_maps_family_dataset(
+    filename: Path,
+    *,
+    dataset_name: str,
+    data: np.ndarray,
+) -> None:
+    """Atomically add or replace one auxiliary dataset in a maps artifact."""
+
+    if not filename.is_file():
+        raise FileNotFoundError(f"Maps artifact not found: {filename}")
+
+    tmp_filename = filename.with_suffix(filename.suffix + ".tmp")
+    if tmp_filename.exists():
+        tmp_filename.unlink()
+
+    with h5py.File(filename, "r") as source, h5py.File(tmp_filename, "w") as target:
+        for name in source.keys():
+            if name == dataset_name:
+                continue
+            source.copy(name, target)
+        target.create_dataset(
+            dataset_name,
+            data=np.asarray(data),
+            compression=HDF5_COMPRESSION,
+            compression_opts=HDF5_COMPRESSION_OPTS,
+            shuffle=HDF5_SHUFFLE,
+        )
+
+    tmp_filename.replace(filename)
+
+
 def read_outer_dataset(filename: Path, dataset_name: str) -> Table:
     """Read one dataset from a persisted outer artifact."""
 
@@ -93,8 +124,8 @@ def read_outer_dataset(filename: Path, dataset_name: str) -> Table:
         return Table(handle[dataset_name][...])
 
 
-def read_maps_dataset(filename: Path) -> Table:
-    """Read one dense all-sky maps artifact."""
+def read_maps_dataset(filename: Path, dataset_name: str = MAPS_DATASET) -> Table:
+    """Read one dataset from a dense all-sky maps artifact."""
 
     with h5py.File(filename, "r") as handle:
-        return Table(handle[MAPS_DATASET][...])
+        return Table(handle[dataset_name][...])

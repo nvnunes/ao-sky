@@ -113,7 +113,7 @@ The canonical package is split by ownership:
   - build runner orchestration
 - `ao_sky.survey`
   - survey-extent overlays
-  - other survey-scale derived products
+  - other all-sky augmentation layers
 - `ao_sky.cli`
   - thin command-line entrypoints over the Python API
 
@@ -165,6 +165,8 @@ The architecture uses distinct data layers with explicit ownership.
   - one `outer.h5` artifact container per processed outer pixel
   - one `maps-hpx<level>.h5` all-sky map artifact per aggregated level once
     the build reaches `aggregation`
+  - one `survey_extent` dataset inside each `maps-hpx<level>.h5` file once a
+    build reaches `augmentation`, when survey overlays are configured
 - Builds are named `<ao-system-short-name>-<config-short-name>-v<N>`.
 - `build.h5` stores:
   - the original build-definition YAML
@@ -192,6 +194,8 @@ Build execution is organized around restartable outer-pixel work.
 - Aggregation is build-global rather than outer-pixel-local.
 - A normal build run may advance from `traversal` into `aggregation`
   automatically once all outer-pixel Traversal work is complete.
+- When survey overlays are configured, a normal build run may also advance from
+  `aggregation` into `augmentation` automatically.
 - Cache policy should remain simple until neighbour-aware scheduling has been
   benchmarked.
 

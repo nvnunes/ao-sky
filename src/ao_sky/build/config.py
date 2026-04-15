@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 
+from ..survey import SurveyError, normalize_survey_extent_overlays
 from ._exceptions import BuildError
 from ._models import BuildDefinition, BuildPaths
 
@@ -38,6 +39,13 @@ def load_build_definition(filename: Path) -> tuple[BuildDefinition, str]:
             "Build definition is missing required fields: " + ", ".join(missing)
         )
 
+    try:
+        overlays = normalize_survey_extent_overlays(
+            raw.get("survey_extent_overlays"),
+            base_dir=Path(filename).resolve().parent,
+        )
+    except SurveyError as exc:
+        raise BuildError(str(exc)) from exc
     definition = BuildDefinition(
         ao_system_short_name=str(raw["ao_system_short_name"]).strip(),
         config_short_name=str(raw["config_short_name"]).strip(),
@@ -51,6 +59,7 @@ def load_build_definition(filename: Path) -> tuple[BuildDefinition, str]:
             if raw.get("min_galactic_latitude") is None
             else float(raw["min_galactic_latitude"])
         ),
+        survey_extent_overlays=overlays,
     )
     if not definition.ao_system_short_name:
         raise BuildError("ao_system_short_name must be a non-empty string")

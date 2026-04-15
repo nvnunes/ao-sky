@@ -111,6 +111,7 @@ The current public build surface is centered on:
 Optional fields:
 
 - `min_galactic_latitude`
+- `survey_extent_overlays`
 
 Example build definition:
 
@@ -123,6 +124,10 @@ inner_level: 14
 max_data_level: 9
 epoch: 2028.0
 min_galactic_latitude: 10.0
+survey_extent_overlays:
+  - name: ews
+    moc_files:
+      - ../data/euclid/rsd2024a-footprint-equ-13-year1-MOC.fits
 ```
 
 `gaia_root`, `build_root`, and `dust_root` are not part of the build definition. Resolve them

@@ -8,19 +8,24 @@ from gzip import open as gzip_open
 import h5py
 import numpy as np
 import pytest
+import yaml
 from astropy.table import Table
+from mocpy import MOC
 
 from ao_sky.build import init_build, restart_build, run_build, show_build
+from ao_sky.build.augmentation import build_survey_extent_layers
 from ao_sky.build.aggregation import aggregate_maps, build_maps
 from ao_sky.build._constants import (
     BUILD_FILENAME,
     BUILD_PHASE_AGGREGATION,
+    BUILD_PHASE_AUGMENTATION,
     BUILD_PHASE_TRAVERSAL,
     MAPS_DATASET,
     MAPS_DTYPE,
     OUTER_DATASET_ASTERISMS,
     OUTER_DATASET_INNER,
     STATE_DTYPE,
+    SURVEY_EXTENT_DATASET,
     WORK_STATUS_DONE,
     WORK_STATUS_FAILED,
     WORK_STATUS_PENDING,
@@ -48,19 +53,22 @@ def _write_build_definition(
     inner_level: int = 1,
     min_galactic_latitude: float | None = None,
     max_data_level: int = 1,
+    survey_extent_overlays: list[dict[str, object]] | None = None,
 ) -> Path:
-    lines = [
-        "ao_system_short_name: GNAO",
-        "config_short_name: baseline",
-        "gaia_release: dr3",
-        f"outer_level: {outer_level}",
-        f"inner_level: {inner_level}",
-        f"max_data_level: {max_data_level}",
-        "epoch: 2028.0",
-    ]
+    payload: dict[str, object] = {
+        "ao_system_short_name": "GNAO",
+        "config_short_name": "baseline",
+        "gaia_release": "dr3",
+        "outer_level": outer_level,
+        "inner_level": inner_level,
+        "max_data_level": max_data_level,
+        "epoch": 2028.0,
+    }
     if min_galactic_latitude is not None:
-        lines.append(f"min_galactic_latitude: {min_galactic_latitude}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        payload["min_galactic_latitude"] = min_galactic_latitude
+    if survey_extent_overlays is not None:
+        payload["survey_extent_overlays"] = survey_extent_overlays
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return path
 
 
@@ -167,6 +175,17 @@ def _write_gaia_tge_map(
                 f"1,{healpix_id},{healpix_level},{a0},0.1,0.0,1.0,10,\"True\",0\n"
             )
     return filename
+
+
+def _write_moc(path: Path, *, level: int, pixs: list[int]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    moc = MOC.from_healpix_cells(
+        np.asarray(pixs, dtype=np.uint64),
+        level,
+        max_depth=level,
+    )
+    moc.save(str(path), format="fits", overwrite=True)
+    return path
 
 
 def _make_asterisms(*, empty: bool = False) -> Table:
@@ -306,6 +325,53 @@ def test_init_build_uses_aosky_conf_roots(tmp_path: Path, monkeypatch: pytest.Mo
     )
 
     assert build_path.parent == (tmp_path / "builds").resolve()
+
+
+def test_load_build_definition_parses_overlay_specs_and_resolves_relative_paths(
+    tmp_path: Path,
+) -> None:
+    moc = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[
+            {
+                "name": "EWS-Yr1",
+                "moc_files": [str(moc.relative_to(tmp_path))],
+            }
+        ],
+    )
+
+    loaded, _ = load_build_definition_yaml(definition)
+
+    assert len(loaded.survey_extent_overlays) == 1
+    overlay = loaded.survey_extent_overlays[0]
+    assert overlay.name == "ews_yr1"
+    assert overlay.moc_files == (moc.resolve(),)
+
+
+def test_load_build_definition_rejects_duplicate_overlay_names(tmp_path: Path) -> None:
+    moc_a = _write_moc(tmp_path / "mocs" / "a.fits", level=1, pixs=[1])
+    moc_b = _write_moc(tmp_path / "mocs" / "b.fits", level=1, pixs=[2])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[
+            {"name": "EWS-Yr1", "moc_files": [str(moc_a)]},
+            {"name": "ews_yr1", "moc_files": [str(moc_b)]},
+        ],
+    )
+
+    with pytest.raises(BuildError, match="duplicate survey overlay name"):
+        load_build_definition_yaml(definition)
+
+
+def test_load_build_definition_requires_non_empty_overlay_paths(tmp_path: Path) -> None:
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[{"name": "ews", "moc_files": []}],
+    )
+
+    with pytest.raises(BuildError, match="moc_files must not be empty"):
+        load_build_definition_yaml(definition)
 
 
 def test_load_build_definition_rejects_blank_gaia_release(tmp_path: Path) -> None:
@@ -709,6 +775,60 @@ def test_run_build_auto_advances_to_aggregation_and_writes_maps(
         assert len(handle[MAPS_DATASET]) == 48
 
 
+def test_run_build_auto_advances_to_augmentation_when_overlays_exist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1, 3])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    _write_gaia_tge_map(
+        tmp_path / "dust",
+        [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
+    )
+
+    monkeypatch.setattr(
+        "ao_sky.build.runner.build_traversal_products",
+        lambda store, runtime, outer_pix, **kwargs: (
+            _make_asterisms(empty=True),
+            _make_inner(
+                star_count=outer_pix + 1,
+                ngs_count=outer_pix % 2,
+                asterism_count=outer_pix + 2,
+                best_ee=0.5,
+                best_sr=0.4,
+                best_fwhm=0.3,
+                winner_ee_resolved=0.5,
+                winner_ee_averaged=0.45,
+                coverage_resolved=True,
+                coverage_averaged=False,
+            ),
+        ),
+    )
+
+    run_build(build_path)
+
+    summary = summarize_build(build_path)
+    assert summary["current_phase"] == BUILD_PHASE_AUGMENTATION
+    assert summary["build_status"] == "completed"
+    with h5py.File(maps_artifact_filename(build_path, 1), "r") as handle:
+        assert MAPS_DATASET in handle
+        assert SURVEY_EXTENT_DATASET in handle
+        assert handle[SURVEY_EXTENT_DATASET].dtype.names == ("pix", "ews")
+        assert bool(handle[SURVEY_EXTENT_DATASET]["ews"][1])
+        assert bool(handle[SURVEY_EXTENT_DATASET]["ews"][3])
+
+
 def test_run_build_restarts_from_aggregation_and_overwrites_maps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -747,6 +867,46 @@ def test_run_build_restarts_from_aggregation_and_overwrites_maps(
         assert np.all(handle[MAPS_DATASET]["star_count"][:] >= 0)
 
 
+def test_run_build_restarts_from_augmentation_and_overwrites_overlay_dataset(
+    tmp_path: Path,
+) -> None:
+    overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1, 3])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    base_maps = np.zeros(48, dtype=MAPS_DTYPE)
+    base_maps["pix"] = np.arange(48, dtype=np.int64)
+    from ao_sky.build.artifacts import write_maps_artifact, write_maps_family_dataset
+
+    write_maps_artifact(maps_artifact_filename(build_path, 0), maps=np.zeros(12, dtype=MAPS_DTYPE))
+    write_maps_artifact(maps_artifact_filename(build_path, 1), maps=base_maps)
+    stale = np.zeros(48, dtype=[("pix", "<i8"), ("ews", "?")])
+    stale["pix"] = np.arange(48, dtype=np.int64)
+    stale["ews"] = True
+    write_maps_family_dataset(
+        maps_artifact_filename(build_path, 1),
+        dataset_name=SURVEY_EXTENT_DATASET,
+        data=stale,
+    )
+    set_current_phase(build_path, BUILD_PHASE_AUGMENTATION)
+
+    run_build(build_path)
+
+    with h5py.File(maps_artifact_filename(build_path, 1), "r") as handle:
+        assert np.array_equal(handle[MAPS_DATASET]["pix"][:], np.arange(48, dtype=np.int64))
+        assert bool(handle[SURVEY_EXTENT_DATASET]["ews"][1])
+        assert not bool(handle[SURVEY_EXTENT_DATASET]["ews"][0])
+
+
 def test_run_build_marks_build_failed_when_aggregation_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -770,6 +930,37 @@ def test_run_build_marks_build_failed_when_aggregation_fails(
 
     summary = summarize_build(build_path)
     assert summary["current_phase"] == BUILD_PHASE_AGGREGATION
+    assert summary["build_status"] == "failed"
+
+
+def test_run_build_marks_build_failed_when_augmentation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    set_current_phase(build_path, BUILD_PHASE_AUGMENTATION)
+    monkeypatch.setattr(
+        "ao_sky.build.runner.build_survey_extent_layers",
+        lambda build_path: (_ for _ in ()).throw(RuntimeError("aug boom")),
+    )
+
+    with pytest.raises(RuntimeError, match="aug boom"):
+        run_build(build_path)
+
+    summary = summarize_build(build_path)
+    assert summary["current_phase"] == BUILD_PHASE_AUGMENTATION
     assert summary["build_status"] == "failed"
 
 
@@ -809,6 +1000,27 @@ def test_show_build_omits_phase_counts_for_aggregation(tmp_path: Path) -> None:
     text = show_build(build_path)
 
     assert "phase: aggregation" in text
+    assert "phase work:" not in text
+
+
+def test_show_build_omits_phase_counts_for_augmentation(tmp_path: Path) -> None:
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[{"name": "ews", "moc_files": ["/tmp/ews.fits"]}],
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    set_current_phase(build_path, BUILD_PHASE_AUGMENTATION)
+
+    text = show_build(build_path)
+
+    assert "phase: augmentation" in text
     assert "phase work:" not in text
 
 
@@ -962,3 +1174,46 @@ def test_build_maps_writes_dense_maps_artifacts_with_expected_contract(tmp_path:
             dataset = handle[MAPS_DATASET]
             assert dataset.dtype == MAPS_DTYPE
             assert len(dataset) == 12 * (4**level)
+
+
+def test_build_survey_extent_layers_preserves_maps_and_writes_dense_dataset(
+    tmp_path: Path,
+) -> None:
+    overlay_a = _write_moc(tmp_path / "mocs" / "a.fits", level=1, pixs=[1])
+    overlay_b = _write_moc(tmp_path / "mocs" / "b.fits", level=1, pixs=[2])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_extent_overlays=[
+            {"name": "ews", "moc_files": [str(overlay_a), str(overlay_b)]},
+            {"name": "edf-north", "moc_files": [str(overlay_a)]},
+        ],
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+
+    base_maps = np.zeros(48, dtype=MAPS_DTYPE)
+    base_maps["pix"] = np.arange(48, dtype=np.int64)
+    base_maps["star_count"] = np.arange(48, dtype=np.int64)
+    from ao_sky.build.artifacts import write_maps_artifact
+
+    write_maps_artifact(maps_artifact_filename(build_path, 0), maps=np.zeros(12, dtype=MAPS_DTYPE))
+    write_maps_artifact(maps_artifact_filename(build_path, 1), maps=base_maps)
+    layers = build_survey_extent_layers(build_path)
+
+    assert list(layers) == [0, 1]
+    with h5py.File(maps_artifact_filename(build_path, 1), "r") as handle:
+        assert np.array_equal(handle[MAPS_DATASET][...], base_maps)
+        assert SURVEY_EXTENT_DATASET in handle
+        layer = handle[SURVEY_EXTENT_DATASET][...]
+        assert layer.dtype.names == ("pix", "ews", "edf_north")
+        assert np.array_equal(layer["pix"], np.arange(48, dtype=np.int64))
+        assert bool(layer["ews"][1])
+        assert bool(layer["ews"][2])
+        assert bool(layer["edf_north"][1])
+        assert not bool(layer["edf_north"][2])

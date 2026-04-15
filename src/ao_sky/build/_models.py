@@ -7,6 +7,8 @@ from pathlib import Path
 
 import astropy.units as u
 
+from ..survey import SurveyExtentOverlaySpec
+
 
 @dataclass(frozen=True, slots=True)
 class BuildDefinition:
@@ -20,6 +22,7 @@ class BuildDefinition:
     max_data_level: int
     epoch: float
     min_galactic_latitude: float | None = None
+    survey_extent_overlays: tuple[SurveyExtentOverlaySpec, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

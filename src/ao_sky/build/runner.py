@@ -7,9 +7,11 @@ from pathlib import Path
 import numpy as np
 
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig
+from .augmentation import build_survey_extent_layers
 from .aggregation import build_maps
 from ._constants import (
     BUILD_PHASE_AGGREGATION,
+    BUILD_PHASE_AUGMENTATION,
     BUILD_PHASE_TRAVERSAL,
     BUILD_STATUS_COMPLETED,
     BUILD_STATUS_FAILED,
@@ -206,14 +208,44 @@ def _run_aggregation_phase(build_path: Path) -> None:
         append_build_log(build_path, f"phase=aggregation failed: {exc}")
         append_build_log(build_path, "run complete phase=aggregation status=failed")
         raise
+    definition = load_persisted_build_definition(build_path)
+    if definition.survey_extent_overlays:
+        set_build_status(build_path, BUILD_STATUS_RUNNING)
+        status = "running"
+    else:
+        set_build_status(build_path, BUILD_STATUS_COMPLETED)
+        status = "completed"
+    append_build_log(
+        build_path,
+        "run complete "
+        "phase=aggregation "
+        f"status={status} "
+        f"levels={','.join(str(level) for level in sorted(level_maps))}",
+    )
+
+
+def _run_augmentation_phase(build_path: Path) -> None:
+    current_phase = load_current_phase(build_path)
+    if current_phase != BUILD_PHASE_AUGMENTATION:
+        raise BuildError(f"Expected augmentation phase, got {current_phase!r}")
+
+    set_build_status(build_path, BUILD_STATUS_RUNNING)
+    append_build_log(build_path, "run start phase=augmentation")
+    try:
+        level_layers = build_survey_extent_layers(build_path)
+    except Exception as exc:
+        set_build_status(build_path, BUILD_STATUS_FAILED)
+        append_build_log(build_path, f"phase=augmentation failed: {exc}")
+        append_build_log(build_path, "run complete phase=augmentation status=failed")
+        raise
 
     set_build_status(build_path, BUILD_STATUS_COMPLETED)
     append_build_log(
         build_path,
         "run complete "
-        "phase=aggregation "
+        "phase=augmentation "
         "status=completed "
-        f"levels={','.join(str(level) for level in sorted(level_maps))}",
+        f"levels={','.join(str(level) for level in sorted(level_layers))}",
     )
 
 
@@ -224,10 +256,15 @@ def run_build(build_path: Path) -> Path:
         raise BuildError(f"Build path does not exist: {build_path}")
 
     current_phase = load_current_phase(build_path)
-    if current_phase not in (BUILD_PHASE_TRAVERSAL, BUILD_PHASE_AGGREGATION):
+    if current_phase not in (
+        BUILD_PHASE_TRAVERSAL,
+        BUILD_PHASE_AGGREGATION,
+        BUILD_PHASE_AUGMENTATION,
+    ):
         raise BuildError(
             f"Runner implements only {BUILD_PHASE_TRAVERSAL!r} and "
-            f"{BUILD_PHASE_AGGREGATION!r}, but build phase is {current_phase!r}"
+            f"{BUILD_PHASE_AGGREGATION!r}, and {BUILD_PHASE_AUGMENTATION!r}, "
+            f"but build phase is {current_phase!r}"
         )
 
     if current_phase == BUILD_PHASE_TRAVERSAL:
@@ -235,8 +272,16 @@ def run_build(build_path: Path) -> Path:
         if not traversal_complete:
             return build_path
         set_current_phase(build_path, BUILD_PHASE_AGGREGATION)
+        current_phase = BUILD_PHASE_AGGREGATION
 
-    _run_aggregation_phase(build_path)
+    if current_phase == BUILD_PHASE_AGGREGATION:
+        _run_aggregation_phase(build_path)
+        definition = load_persisted_build_definition(build_path)
+        if not definition.survey_extent_overlays:
+            return build_path
+        set_current_phase(build_path, BUILD_PHASE_AUGMENTATION)
+
+    _run_augmentation_phase(build_path)
     return build_path
 
 

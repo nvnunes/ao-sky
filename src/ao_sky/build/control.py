@@ -8,8 +8,10 @@ import re
 
 import h5py
 import numpy as np
+import yaml
 
 from .._paths import get_outer_pixel_bucket_path
+from ..survey import SurveyError, normalize_survey_extent_overlays
 from ._constants import (
     BUILD_FILENAME,
     BUILD_LAYOUT_VERSION,
@@ -68,6 +70,17 @@ def append_build_log(build_path: Path, message: str) -> None:
 
     with (build_path / BUILD_LOG_FILENAME).open("a", encoding="utf-8") as handle:
         handle.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
+
+
+def _serialize_survey_extent_overlays(definition: BuildDefinition) -> str:
+    payload = [
+        {
+            "name": overlay.name,
+            "moc_files": [str(filename) for filename in overlay.moc_files],
+        }
+        for overlay in definition.survey_extent_overlays
+    ]
+    return yaml.safe_dump(payload, sort_keys=False)
 
 
 def build_root_name(definition: BuildDefinition, version: int) -> str:
@@ -186,6 +199,7 @@ def create_build_root(
             "min_galactic_latitude": (
                 "" if definition.min_galactic_latitude is None else definition.min_galactic_latitude
             ),
+            "survey_extent_overlays_yaml": _serialize_survey_extent_overlays(definition),
             "layout_version": BUILD_LAYOUT_VERSION,
             "build_status": BUILD_STATUS_INITIALIZED,
             "current_phase": BUILD_PHASE_TRAVERSAL,
@@ -203,6 +217,14 @@ def load_build_definition(build_path: Path) -> BuildDefinition:
 
     with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
         config_group = handle["metadata"]["config"]
+        overlays_yaml = str(_decode_bytes(config_group["survey_extent_overlays_yaml"][()]))
+        try:
+            overlays = normalize_survey_extent_overlays(
+                yaml.safe_load(overlays_yaml) or [],
+                base_dir=build_path,
+            )
+        except SurveyError as exc:
+            raise BuildError(str(exc)) from exc
         return BuildDefinition(
             ao_system_short_name=str(_decode_bytes(config_group["ao_system_short_name"][()])),
             config_short_name=str(_decode_bytes(config_group["config_short_name"][()])),
@@ -216,6 +238,7 @@ def load_build_definition(build_path: Path) -> BuildDefinition:
                 if str(_decode_bytes(config_group["min_galactic_latitude"][()])) == ""
                 else float(config_group["min_galactic_latitude"][()])
             ),
+            survey_extent_overlays=overlays,
         )
 
 
