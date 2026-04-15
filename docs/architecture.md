@@ -163,6 +163,8 @@ The architecture uses distinct data layers with explicit ownership.
   - a root `build.h5` control file for metadata and outer-pixel state
   - a root `build.log`
   - one `outer.h5` artifact container per processed outer pixel
+  - one `maps-hpx<level>.h5` all-sky map artifact per aggregated level once
+    the build reaches `aggregation`
 - Builds are named `<ao-system-short-name>-<config-short-name>-v<N>`.
 - `build.h5` stores:
   - the original build-definition YAML
@@ -187,6 +189,9 @@ Build execution is organized around restartable outer-pixel work.
   - the current build phase
   - explicit per-phase outer-pixel status for `gaia_loading` and `traversal`
   - per-phase attempt count and last error message
+- Aggregation is build-global rather than outer-pixel-local.
+- A normal build run may advance from `traversal` into `aggregation`
+  automatically once all outer-pixel Traversal work is complete.
 - Cache policy should remain simple until neighbour-aware scheduling has been
   benchmarked.
 

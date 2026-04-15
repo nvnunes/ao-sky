@@ -7,8 +7,11 @@ from pathlib import Path
 import numpy as np
 
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig
+from .aggregation import build_maps
 from ._constants import (
+    BUILD_PHASE_AGGREGATION,
     BUILD_PHASE_TRAVERSAL,
+    BUILD_STATUS_COMPLETED,
     BUILD_STATUS_FAILED,
     BUILD_STATUS_RUNNING,
     WORK_STATUS_DONE,
@@ -31,7 +34,7 @@ from .control import (
     load_state,
     outer_artifact_filename,
     phase_state_fields,
-    refresh_build_status,
+    set_current_phase,
     set_build_status,
     summarize_build,
     update_state_row,
@@ -128,18 +131,10 @@ def _repair_stale_running_rows(build_path: Path, *, status_field: str) -> int:
     return int(len(stale))
 
 
-def run_build(build_path: Path) -> Path:
-    """Run all unfinished Phase 5 Traversal work in one build."""
-
-    if not build_path.is_dir():
-        raise BuildError(f"Build path does not exist: {build_path}")
-
+def _run_traversal_phase(build_path: Path) -> tuple[bool, dict[str, int]]:
     current_phase = load_current_phase(build_path)
     if current_phase != BUILD_PHASE_TRAVERSAL:
-        raise BuildError(
-            f"Phase 5 runner only implements {BUILD_PHASE_TRAVERSAL!r}, "
-            f"but build phase is {current_phase!r}"
-        )
+        raise BuildError(f"Expected traversal phase, got {current_phase!r}")
 
     fields = phase_state_fields(current_phase)
     if fields is None:
@@ -175,15 +170,15 @@ def run_build(build_path: Path) -> Path:
             failed = True
             append_build_log(build_path, f"phase={current_phase} outer_pix={outer_pix} failed: {exc}")
 
-    final_status = refresh_build_status(build_path)
-    if failed and final_status != BUILD_STATUS_FAILED:
-        set_build_status(build_path, BUILD_STATUS_FAILED)
-        final_status = BUILD_STATUS_FAILED
-
-    summary = summarize_build(build_path)
-    phase_counts = summary["phase_counts"]
-    if phase_counts is None:
-        raise BuildError(f"Build summary missing counts for active phase {current_phase!r}")
+    state = load_state(build_path)
+    phase_counts = {
+        "pending": int(np.count_nonzero(state[status_field] == WORK_STATUS_PENDING)),
+        "running": int(np.count_nonzero(state[status_field] == WORK_STATUS_RUNNING)),
+        "done": int(np.count_nonzero(state[status_field] == WORK_STATUS_DONE)),
+        "failed": int(np.count_nonzero(state[status_field] == WORK_STATUS_FAILED)),
+    }
+    final_status = BUILD_STATUS_FAILED if failed or phase_counts["failed"] else BUILD_STATUS_RUNNING
+    set_build_status(build_path, final_status)
     append_build_log(
         build_path,
         "run complete "
@@ -194,6 +189,54 @@ def run_build(build_path: Path) -> Path:
         f"done={phase_counts['done']} "
         f"failed={phase_counts['failed']}",
     )
+    return final_status != BUILD_STATUS_FAILED and phase_counts["pending"] == 0, phase_counts
+
+
+def _run_aggregation_phase(build_path: Path) -> None:
+    current_phase = load_current_phase(build_path)
+    if current_phase != BUILD_PHASE_AGGREGATION:
+        raise BuildError(f"Expected aggregation phase, got {current_phase!r}")
+
+    set_build_status(build_path, BUILD_STATUS_RUNNING)
+    append_build_log(build_path, "run start phase=aggregation")
+    try:
+        level_maps = build_maps(build_path)
+    except Exception as exc:
+        set_build_status(build_path, BUILD_STATUS_FAILED)
+        append_build_log(build_path, f"phase=aggregation failed: {exc}")
+        append_build_log(build_path, "run complete phase=aggregation status=failed")
+        raise
+
+    set_build_status(build_path, BUILD_STATUS_COMPLETED)
+    append_build_log(
+        build_path,
+        "run complete "
+        "phase=aggregation "
+        "status=completed "
+        f"levels={','.join(str(level) for level in sorted(level_maps))}",
+    )
+
+
+def run_build(build_path: Path) -> Path:
+    """Run all unfinished build work through the implemented phases."""
+
+    if not build_path.is_dir():
+        raise BuildError(f"Build path does not exist: {build_path}")
+
+    current_phase = load_current_phase(build_path)
+    if current_phase not in (BUILD_PHASE_TRAVERSAL, BUILD_PHASE_AGGREGATION):
+        raise BuildError(
+            f"Runner implements only {BUILD_PHASE_TRAVERSAL!r} and "
+            f"{BUILD_PHASE_AGGREGATION!r}, but build phase is {current_phase!r}"
+        )
+
+    if current_phase == BUILD_PHASE_TRAVERSAL:
+        traversal_complete, _ = _run_traversal_phase(build_path)
+        if not traversal_complete:
+            return build_path
+        set_current_phase(build_path, BUILD_PHASE_AGGREGATION)
+
+    _run_aggregation_phase(build_path)
     return build_path
 
 

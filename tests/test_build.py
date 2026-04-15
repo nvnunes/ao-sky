@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from gzip import open as gzip_open
 
 import h5py
 import numpy as np
@@ -10,9 +11,13 @@ import pytest
 from astropy.table import Table
 
 from ao_sky.build import init_build, restart_build, run_build, show_build
+from ao_sky.build.aggregation import aggregate_maps, build_maps
 from ao_sky.build._constants import (
     BUILD_FILENAME,
+    BUILD_PHASE_AGGREGATION,
     BUILD_PHASE_TRAVERSAL,
+    MAPS_DATASET,
+    MAPS_DTYPE,
     OUTER_DATASET_ASTERISMS,
     OUTER_DATASET_INNER,
     STATE_DTYPE,
@@ -26,16 +31,21 @@ from ao_sky.build.config import load_build_definition as load_build_definition_y
 from ao_sky.build.control import (
     load_build_definition,
     load_state,
+    maps_artifact_filename,
     outer_artifact_filename,
+    set_current_phase,
     summarize_build,
     update_state_row,
 )
 from ao_sky.build.scheduler import OuterPixelScheduler
+from ao_sky.build.artifacts import write_outer_artifact
 
 
 def _write_build_definition(
     path: Path,
     *,
+    outer_level: int = 0,
+    inner_level: int = 1,
     min_galactic_latitude: float | None = None,
     max_data_level: int = 1,
 ) -> Path:
@@ -43,8 +53,8 @@ def _write_build_definition(
         "ao_system_short_name: GNAO",
         "config_short_name: baseline",
         "gaia_release: dr3",
-        "outer_level: 0",
-        "inner_level: 1",
+        f"outer_level: {outer_level}",
+        f"inner_level: {inner_level}",
         f"max_data_level: {max_data_level}",
         "epoch: 2028.0",
     ]
@@ -139,6 +149,24 @@ def _make_inner(
             "coverage_averaged",
         ),
     )
+
+
+def _write_gaia_tge_map(
+    dust_root: Path,
+    rows: list[tuple[int, int, float]],
+) -> Path:
+    filename = dust_root / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    with gzip_open(filename, "wt", encoding="utf-8") as handle:
+        handle.write(
+            "solution_id,healpix_id,healpix_level,a0,a0_uncertainty,a0_min,a0_max,"
+            "num_tracers_used,optimum_hpx_flag,status\n"
+        )
+        for healpix_id, healpix_level, a0 in rows:
+            handle.write(
+                f"1,{healpix_id},{healpix_level},{a0},0.1,0.0,1.0,10,\"True\",0\n"
+            )
+    return filename
 
 
 def _make_asterisms(*, empty: bool = False) -> Table:
@@ -432,11 +460,15 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
             ),
         ),
     )
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
 
     run_build(build_path)
 
     state = load_state(build_path)
     assert np.all(state["traversal_status"] == WORK_STATUS_DONE)
+    summary = summarize_build(build_path)
+    assert summary["current_phase"] == BUILD_PHASE_AGGREGATION
+    assert summary["build_status"] == "completed"
 
     outer_filename = outer_artifact_filename(
         build_path,
@@ -486,6 +518,7 @@ def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
             _make_inner(star_count=4, ngs_count=0, asterism_count=0),
         ),
     )
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
 
     run_build(build_path)
 
@@ -541,6 +574,7 @@ def test_run_build_repairs_stale_running_rows_and_logs_it(
         "ao_sky.build.runner.build_traversal_products",
         lambda store, runtime, outer_pix, **kwargs: (_make_asterisms(empty=True), _make_inner()),
     )
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
 
     run_build(build_path)
 
@@ -571,13 +605,15 @@ def test_run_build_is_successful_no_op_when_all_rows_done(
         raise AssertionError("run_build should not process completed builds")
 
     monkeypatch.setattr("ao_sky.build.runner.build_traversal_products", _unexpected)
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
 
     run_build(build_path)
 
     summary = summarize_build(build_path)
     assert summary["build_status"] == "completed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "run complete phase=traversal status=completed" in log_text
+    assert "run complete phase=traversal status=running" in log_text
+    assert "run complete phase=aggregation status=completed" in log_text
 
 
 def test_run_build_continues_after_failure_and_marks_build_failed(
@@ -623,6 +659,120 @@ def test_run_build_continues_after_failure_and_marks_build_failed(
     assert "run complete phase=traversal status=failed" in log_text
 
 
+def test_run_build_auto_advances_to_aggregation_and_writes_maps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    _write_gaia_tge_map(
+        tmp_path / "dust",
+        [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
+    )
+
+    monkeypatch.setattr(
+        "ao_sky.build.runner.build_traversal_products",
+        lambda store, runtime, outer_pix, **kwargs: (
+            _make_asterisms(empty=True),
+            _make_inner(
+                star_count=outer_pix + 1,
+                ngs_count=outer_pix % 2,
+                asterism_count=outer_pix + 2,
+                best_ee=0.5,
+                best_sr=0.4,
+                best_fwhm=0.3,
+                winner_ee_resolved=0.5,
+                winner_ee_averaged=0.45,
+                coverage_resolved=True,
+                coverage_averaged=False,
+            ),
+        ),
+    )
+
+    run_build(build_path)
+
+    summary = summarize_build(build_path)
+    assert summary["current_phase"] == BUILD_PHASE_AGGREGATION
+    assert summary["build_status"] == "completed"
+    assert maps_artifact_filename(build_path, 0).is_file()
+    assert maps_artifact_filename(build_path, 1).is_file()
+    with h5py.File(maps_artifact_filename(build_path, 1), "r") as handle:
+        assert MAPS_DATASET in handle
+        assert handle[MAPS_DATASET].dtype == MAPS_DTYPE
+        assert len(handle[MAPS_DATASET]) == 48
+
+
+def test_run_build_restarts_from_aggregation_and_overwrites_maps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    _write_gaia_tge_map(
+        tmp_path / "dust",
+        [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
+    )
+    for outer_pix in range(12):
+        write_outer_artifact(
+            outer_artifact_filename(build_path, load_build_definition(build_path), outer_pix),
+            inner=_make_inner(star_count=1, best_ee=0.5, best_sr=0.4, best_fwhm=0.3),
+            asterisms=_make_asterisms(empty=True),
+        )
+    set_current_phase(build_path, BUILD_PHASE_AGGREGATION)
+    stale = np.zeros(12, dtype=MAPS_DTYPE)
+    stale["pix"] = np.arange(12, dtype=np.int64)
+    stale["star_count"] = -1
+    from ao_sky.build.artifacts import write_maps_artifact
+
+    write_maps_artifact(maps_artifact_filename(build_path, 0), maps=stale)
+    monkeypatch.setattr("ao_sky.build.runner.build_traversal_products", lambda *args, **kwargs: None)
+
+    run_build(build_path)
+
+    with h5py.File(maps_artifact_filename(build_path, 0), "r") as handle:
+        assert np.all(handle[MAPS_DATASET]["star_count"][:] >= 0)
+
+
+def test_run_build_marks_build_failed_when_aggregation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    for outer_pix in range(12):
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
+    set_current_phase(build_path, BUILD_PHASE_AGGREGATION)
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: (_ for _ in ()).throw(RuntimeError("agg boom")))
+
+    with pytest.raises(RuntimeError, match="agg boom"):
+        run_build(build_path)
+
+    summary = summarize_build(build_path)
+    assert summary["current_phase"] == BUILD_PHASE_AGGREGATION
+    assert summary["build_status"] == "failed"
+
+
 def test_show_build_reports_phase_and_phase_counts(tmp_path: Path) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
@@ -644,6 +794,24 @@ def test_show_build_reports_phase_and_phase_counts(tmp_path: Path) -> None:
     assert "failed=1" in text
 
 
+def test_show_build_omits_phase_counts_for_aggregation(tmp_path: Path) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    set_current_phase(build_path, BUILD_PHASE_AGGREGATION)
+
+    text = show_build(build_path)
+
+    assert "phase: aggregation" in text
+    assert "phase work:" not in text
+
+
 def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
@@ -657,3 +825,140 @@ def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None
 
     with pytest.raises(BuildError, match="traversal_last_error_message exceeds persisted limit"):
         update_state_row(build_path, 0, traversal_last_error_message="x" * 1025)
+
+
+def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Path) -> None:
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        outer_level=0,
+        inner_level=1,
+        max_data_level=1,
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    _write_gaia_tge_map(
+        tmp_path / "dust",
+        [
+            (0, 1, 0.5),
+            (1, 1, 1.5),
+            (2, 1, 2.5),
+        ],
+    )
+    inner = Table(
+        [
+            np.arange(4, dtype=np.int64),
+            np.zeros(4, dtype=np.float64),
+            np.array([1, 2, 3, 4], dtype=np.int64),
+            np.array([0, 1, 0, 1], dtype=np.int64),
+            np.array([4, 5, 6, 7], dtype=np.int64),
+            np.array([0.1, 0.2, np.nan, 0.4], dtype=np.float64),
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+            np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float64),
+            np.full(4, -1, dtype=np.int64),
+            np.full(4, np.nan, dtype=np.float64),
+            np.array([0.3, 0.4, 0.5, 0.6], dtype=np.float64),
+            np.array([0.7, 0.8, 0.9, 1.0], dtype=np.float64),
+            np.array([True, False, True, False], dtype=np.bool_),
+            np.array([False, False, True, True], dtype=np.bool_),
+        ],
+        names=(
+            "pix",
+            "gaia_A0",
+            "star_count",
+            "ngs_count",
+            "asterism_count",
+            "best_ee",
+            "best_sr",
+            "best_fwhm",
+            "winner_asterism_id",
+            "winner_distance_arcsec",
+            "winner_ee_resolved",
+            "winner_ee_averaged",
+            "coverage_resolved",
+            "coverage_averaged",
+        ),
+    )
+    write_outer_artifact(
+        outer_artifact_filename(build_path, load_build_definition(build_path), 0),
+        inner=inner,
+        asterisms=_make_asterisms(empty=True),
+    )
+
+    level_maps = aggregate_maps(build_path, outer_pixs=[0])
+
+    assert sorted(level_maps) == [0, 1]
+    level1 = level_maps[1]
+    assert level1["gaia_A0"][:3].tolist() == [0.5, 1.5, 2.5]
+    assert np.isnan(level1["gaia_A0"][3])
+    assert level1["star_count"][:4].tolist() == [1, 2, 3, 4]
+    assert level1["coverage_resolved"][:4].tolist() == [1.0, 0.0, 1.0, 0.0]
+
+    level0 = level_maps[0]
+    assert int(level0["star_count"][0]) == 10
+    assert int(level0["ngs_count"][0]) == 2
+    assert int(level0["asterism_count"][0]) == 22
+    assert np.isnan(level0["gaia_A0"][0])
+    assert np.isnan(level0["best_ee"][0])
+    assert float(level0["best_sr"][0]) == pytest.approx(2.5)
+    assert float(level0["best_fwhm"][0]) == pytest.approx(25.0)
+    assert float(level0["winner_ee_resolved"][0]) == pytest.approx(0.45)
+    assert float(level0["winner_ee_averaged"][0]) == pytest.approx(0.85)
+    assert float(level0["coverage_resolved"][0]) == pytest.approx(0.5)
+    assert float(level0["coverage_averaged"][0]) == pytest.approx(0.5)
+
+
+def test_build_maps_writes_dense_maps_artifacts_with_expected_contract(tmp_path: Path) -> None:
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        outer_level=0,
+        inner_level=1,
+        max_data_level=1,
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    _write_gaia_tge_map(
+        tmp_path / "dust",
+        [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
+    )
+    for outer_pix in range(12):
+        write_outer_artifact(
+            outer_artifact_filename(build_path, load_build_definition(build_path), outer_pix),
+            inner=_make_inner(
+                gaia_a0=-1.0,
+                star_count=1,
+                ngs_count=2,
+                asterism_count=3,
+                best_ee=0.5,
+                best_sr=0.4,
+                best_fwhm=0.3,
+                winner_ee_resolved=0.5,
+                winner_ee_averaged=0.45,
+                coverage_resolved=True,
+                coverage_averaged=False,
+            ),
+            asterisms=_make_asterisms(empty=True),
+        )
+
+    level_maps = build_maps(build_path)
+
+    assert sorted(level_maps) == [0, 1]
+    for level in (0, 1):
+        filename = maps_artifact_filename(build_path, level)
+        assert filename.is_file()
+        with h5py.File(filename, "r") as handle:
+            assert MAPS_DATASET in handle
+            dataset = handle[MAPS_DATASET]
+            assert dataset.dtype == MAPS_DTYPE
+            assert len(dataset) == 12 * (4**level)

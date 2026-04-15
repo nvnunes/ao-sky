@@ -114,6 +114,13 @@ regions. Use the broader sample only when you want a heavier check:
 ./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full
 ```
 
+For sparse all-sky aggregation comparisons against legacy, use the same helper
+with `--maps`:
+
+```bash
+./.conda/bin/python scripts/compare_legacy_asterisms.py --maps --sample smoke
+```
+
 If the hooks path is not active in your clone, set it with:
 
 ```bash

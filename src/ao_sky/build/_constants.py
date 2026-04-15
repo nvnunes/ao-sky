@@ -12,6 +12,8 @@ BUILD_LOG_FILENAME: Final[str] = "build.log"
 OUTER_FILENAME: Final[str] = "outer.h5"
 OUTER_DATASET_ASTERISMS: Final[str] = "asterisms"
 OUTER_DATASET_INNER: Final[str] = "inner"
+MAPS_FILENAME_TEMPLATE: Final[str] = "maps-hpx{level}.h5"
+MAPS_DATASET: Final[str] = "maps"
 BUILD_PHASE_GAIA_LOADING: Final[str] = "gaia_loading"
 BUILD_PHASE_TRAVERSAL: Final[str] = "traversal"
 BUILD_PHASE_AGGREGATION: Final[str] = "aggregation"
@@ -80,4 +82,38 @@ ASTERISMS_DTYPE: Final[np.dtype] = np.dtype(
         ("star3_dec", "<f8"),
         ("star3_mag", "<f8"),
     ]
+)
+
+MAPS_DTYPE: Final[np.dtype] = np.dtype(
+    [
+        ("pix", "<i8"),
+        ("gaia_A0", "<f8"),
+        ("star_count", "<i8"),
+        ("ngs_count", "<i8"),
+        ("asterism_count", "<i8"),
+        ("best_sr", "<f8"),
+        ("best_ee", "<f8"),
+        ("best_fwhm", "<f8"),
+        ("winner_ee_resolved", "<f8"),
+        ("winner_ee_averaged", "<f8"),
+        ("coverage_resolved", "<f8"),
+        ("coverage_averaged", "<f8"),
+    ]
+)
+
+MAPS_SUM_FIELDS: Final[tuple[str, ...]] = (
+    "star_count",
+    "ngs_count",
+    "asterism_count",
+)
+
+MAPS_MEAN_FIELDS: Final[tuple[str, ...]] = (
+    "gaia_A0",
+    "best_sr",
+    "best_ee",
+    "best_fwhm",
+    "winner_ee_resolved",
+    "winner_ee_averaged",
+    "coverage_resolved",
+    "coverage_averaged",
 )

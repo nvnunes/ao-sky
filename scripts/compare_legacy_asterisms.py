@@ -55,6 +55,11 @@ FULL_SAMPLE_OUTER_PIXS = (
     10949,
     11323,
 )
+MAPS_SAMPLE_SEED_OUTER_PIXS = (
+    1456,
+    1717,
+    4008,
+)
 SPECIAL_HOUR_PIXELS = {
     8960,
     8972,
@@ -146,26 +151,49 @@ GaiaStoreConfig = None
 GAIA_SCHEMA_COLUMNS = None
 AsterismSearchOptions = None
 apply_proper_motion = None
+aggregate_maps = None
+init_build = None
 find_asterisms = None
 load_asterism_stars = None
 BuildDefinition = None
 build_traversal_products = None
 load_live_legacy_traversal_outputs = None
 load_legacy_runtime = None
+maps_artifact_filename = None
+outer_artifact_filename = None
+write_outer_artifact = None
+get_parent_pixel = None
 get_pixel_area = None
 get_pixel_from_skycoord = None
 get_pixel_neighbours = None
 get_pixel_resolution = None
 get_pixel_skycoord = None
+get_subpixels = None
+
+MAPS_COMPARISON_COLUMNS = (
+    "gaia_A0",
+    "star_count",
+    "ngs_count",
+    "asterism_count",
+    "best_sr",
+    "best_ee",
+    "best_fwhm",
+    "winner_ee_resolved",
+    "coverage_resolved",
+    "coverage_averaged",
+)
 
 
 def _load_runtime() -> None:
     global GaiaHealpixStore, GaiaStoreConfig, GAIA_SCHEMA_COLUMNS
     global AsterismSearchOptions, BuildDefinition
     global apply_proper_motion, find_asterisms, load_asterism_stars
+    global aggregate_maps, init_build
     global build_traversal_products, load_live_legacy_traversal_outputs, load_legacy_runtime
+    global maps_artifact_filename, outer_artifact_filename, write_outer_artifact
+    global get_parent_pixel
     global get_pixel_area, get_pixel_from_skycoord, get_pixel_neighbours
-    global get_pixel_resolution, get_pixel_skycoord
+    global get_pixel_resolution, get_pixel_skycoord, get_subpixels
 
     if GaiaHealpixStore is not None:
         return
@@ -175,7 +203,14 @@ def _load_runtime() -> None:
         find_asterisms as _find_asterisms,
         load_asterism_stars as _load_asterism_stars,
     )
+    from ao_sky.build import init_build as _init_build
+    from ao_sky.build.aggregation import aggregate_maps as _aggregate_maps
     from ao_sky.build._models import BuildDefinition as _BuildDefinition
+    from ao_sky.build.artifacts import write_outer_artifact as _write_outer_artifact
+    from ao_sky.build.control import (
+        maps_artifact_filename as _maps_artifact_filename,
+        outer_artifact_filename as _outer_artifact_filename,
+    )
     from ao_sky.build.legacy_runtime import (
         build_traversal_products as _build_traversal_products,
         load_live_legacy_traversal_outputs as _load_live_legacy_traversal_outputs,
@@ -188,11 +223,13 @@ def _load_runtime() -> None:
         apply_proper_motion as _apply_proper_motion,
     )
     from ao_sky.spatial import (
+        get_parent_pixel as _get_parent_pixel,
         get_pixel_area as _get_pixel_area,
         get_pixel_from_skycoord as _get_pixel_from_skycoord,
         get_pixel_neighbours as _get_pixel_neighbours,
         get_pixel_resolution as _get_pixel_resolution,
         get_pixel_skycoord as _get_pixel_skycoord,
+        get_subpixels as _get_subpixels,
     )
 
     GaiaHealpixStore = _GaiaHealpixStore
@@ -200,17 +237,24 @@ def _load_runtime() -> None:
     GAIA_SCHEMA_COLUMNS = _GAIA_SCHEMA_COLUMNS
     AsterismSearchOptions = _AsterismSearchOptions
     apply_proper_motion = _apply_proper_motion
+    aggregate_maps = _aggregate_maps
+    init_build = _init_build
     find_asterisms = _find_asterisms
     load_asterism_stars = _load_asterism_stars
     BuildDefinition = _BuildDefinition
     build_traversal_products = _build_traversal_products
     load_live_legacy_traversal_outputs = _load_live_legacy_traversal_outputs
     load_legacy_runtime = _load_legacy_runtime
+    maps_artifact_filename = _maps_artifact_filename
+    outer_artifact_filename = _outer_artifact_filename
+    write_outer_artifact = _write_outer_artifact
+    get_parent_pixel = _get_parent_pixel
     get_pixel_area = _get_pixel_area
     get_pixel_from_skycoord = _get_pixel_from_skycoord
     get_pixel_neighbours = _get_pixel_neighbours
     get_pixel_resolution = _get_pixel_resolution
     get_pixel_skycoord = _get_pixel_skycoord
+    get_subpixels = _get_subpixels
 
 
 @dataclass(frozen=True, slots=True)
@@ -963,6 +1007,254 @@ def compare_inner_tables(legacy: Table, new: Table) -> int:
     return 1
 
 
+def _legacy_field_from_key(key: str) -> str:
+    return key.replace("-", "_").upper()
+
+
+def _legacy_map_column_name(column_name: str, config: LegacyComparisonConfig) -> str:
+    ao_field = _legacy_field_from_key(config.ao_system.name)
+    mapping = {
+        "gaia_A0": "DUST_EXTINCTION",
+        "star_count": "STAR_COUNT",
+        "ngs_count": f"NGS_COUNT_{ao_field}",
+        "asterism_count": f"ASTERISM_COUNT_{ao_field}",
+        "best_sr": f"ASTERISM_SR_MAX_{ao_field}",
+        "best_ee": f"ASTERISM_EE_MAX_{ao_field}",
+        "best_fwhm": f"ASTERISM_FWHM_MIN_{ao_field}",
+        "winner_ee_resolved": f"ASTERISM_EE_MAX_{ao_field}",
+        "coverage_resolved": f"ASTERISM_COVERAGE_{ao_field}_RESOLVED",
+        "coverage_averaged": f"ASTERISM_COVERAGE_{ao_field}_MEAN",
+    }
+    return mapping[column_name]
+
+
+def _select_map_outer_pix_groups(
+    *,
+    outer_pixs: list[int],
+    sample: str,
+    outer_level: int,
+) -> list[list[int]]:
+    _load_runtime()
+    if outer_pixs:
+        return [[int(outer_pix) for outer_pix in outer_pixs]]
+    if outer_level == 0:
+        raise ValueError("Map comparison requires outer_level > 0 to build 4-pixel parent groups")
+
+    target_groups = 1 if sample == "smoke" else 3 if sample == "full" else 1
+    candidate_outer_pixs = (
+        [select_random_outer_pix(outer_level=outer_level)] if sample == "random" else
+        list(MAPS_SAMPLE_SEED_OUTER_PIXS)
+    )
+    groups: list[list[int]] = []
+    seen_parents: set[int] = set()
+    for outer_pix in candidate_outer_pixs:
+        parent_pix = int(get_parent_pixel(outer_level, int(outer_pix), outer_level - 1))
+        if parent_pix in seen_parents:
+            continue
+        seen_parents.add(parent_pix)
+        groups.append([int(pix) for pix in get_subpixels(outer_level - 1, parent_pix, outer_level)])
+        if len(groups) == target_groups:
+            break
+    if not groups:
+        raise ValueError("Could not derive sparse map comparison groups")
+    print(
+        "selected sparse map groups:",
+        " | ".join(" ".join(str(pix) for pix in group) for group in groups),
+    )
+    return groups
+
+
+def _write_temporary_build_definition(
+    filename: Path,
+    *,
+    config: LegacyComparisonConfig,
+    release: str,
+) -> Path:
+    filename.write_text(
+        "\n".join(
+            (
+                f"ao_system_short_name: {config.ao_system.name}",
+                "config_short_name: legacy-maps",
+                f"gaia_release: {release}",
+                f"outer_level: {config.outer_level}",
+                f"inner_level: {config.inner_level}",
+                f"max_data_level: {config.max_data_level}",
+                f"epoch: {config.asterism_epoch if config.asterism_epoch is not None else 2016.0}",
+                (
+                    ""
+                    if config.asterisms_min_galactic_latitude is None
+                    else f"min_galactic_latitude: {config.asterisms_min_galactic_latitude}"
+                ),
+            )
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return filename
+
+
+def _build_sparse_new_maps(
+    *,
+    gaia_root: Path,
+    dust_root: Path,
+    release: str,
+    config: LegacyComparisonConfig,
+    outer_pixs: list[int],
+) -> dict[int, Table]:
+    _load_runtime()
+    with tempfile.TemporaryDirectory(prefix="ao-sky-maps-new-") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        definition_filename = _write_temporary_build_definition(
+            tmpdir_path / "build.yaml",
+            config=config,
+            release=release,
+        )
+        definition = BuildDefinition(
+            ao_system_short_name=config.ao_system.name,
+            config_short_name="legacy-maps",
+            gaia_release=release,
+            outer_level=config.outer_level,
+            inner_level=config.inner_level,
+            max_data_level=config.max_data_level,
+            epoch=config.asterism_epoch if config.asterism_epoch is not None else 2016.0,
+            min_galactic_latitude=config.asterisms_min_galactic_latitude,
+        )
+        build_path = init_build(
+            definition_filename=definition_filename,
+            gaia_root=gaia_root,
+            build_root=tmpdir_path / "builds",
+            dust_root=dust_root,
+            legacy_config_path=config.legacy_config_filename,
+        )
+        for outer_pix in outer_pixs:
+            asterisms, inner = build_new_outputs(
+                gaia_root=gaia_root,
+                dust_root=dust_root,
+                release=release,
+                config=config,
+                outer_pix=outer_pix,
+            )
+            write_outer_artifact(
+                outer_artifact_filename(build_path, definition, outer_pix),
+                inner=inner,
+                asterisms=asterisms,
+            )
+        return {level: Table(values) for level, values in aggregate_maps(build_path, outer_pixs=outer_pixs).items()}
+
+
+def _build_sparse_legacy_maps(
+    *,
+    release: str,
+    config: LegacyComparisonConfig,
+    outer_pixs: list[int],
+    dust_root: Path,
+) -> dict[int, Table]:
+    with tempfile.TemporaryDirectory(prefix="ao-sky-maps-legacy-") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        definition_filename = _write_temporary_build_definition(
+            tmpdir_path / "build.yaml",
+            config=config,
+            release=release,
+        )
+        definition = BuildDefinition(
+            ao_system_short_name=config.ao_system.name,
+            config_short_name="legacy-maps",
+            gaia_release=release,
+            outer_level=config.outer_level,
+            inner_level=config.inner_level,
+            max_data_level=config.max_data_level,
+            epoch=config.asterism_epoch if config.asterism_epoch is not None else 2016.0,
+            min_galactic_latitude=config.asterisms_min_galactic_latitude,
+        )
+        build_path = init_build(
+            definition_filename=definition_filename,
+            gaia_root=GAIA_ROOT,
+            build_root=tmpdir_path / "builds",
+            dust_root=dust_root,
+            legacy_config_path=config.legacy_config_filename,
+        )
+        for outer_pix in outer_pixs:
+            legacy_asterisms, legacy_inner = load_live_legacy_outputs(
+                release=release,
+                config=config,
+                outer_pix=outer_pix,
+                dust_root=dust_root,
+            )
+            del legacy_asterisms
+            write_outer_artifact(
+                outer_artifact_filename(build_path, definition, outer_pix),
+                inner=legacy_inner,
+                asterisms=None,
+            )
+        return {level: Table(values) for level, values in aggregate_maps(build_path, outer_pixs=outer_pixs).items()}
+
+
+def _touched_level_pixs(
+    *,
+    outer_pixs: list[int],
+    outer_level: int,
+    level: int,
+) -> np.ndarray:
+    _load_runtime()
+    if level == outer_level:
+        return np.asarray(sorted(int(pix) for pix in outer_pixs), dtype=np.int64)
+    return np.asarray(get_subpixels(outer_level, outer_pixs, level), dtype=np.int64)
+
+
+def _compare_sparse_maps_for_group(
+    *,
+    outer_pixs: list[int],
+    gaia_root: Path,
+    dust_root: Path,
+    release: str,
+    config: LegacyComparisonConfig,
+) -> int:
+    _load_runtime()
+    print("map outer pixels:", " ".join(str(pix) for pix in outer_pixs))
+    legacy_tables = _build_sparse_legacy_maps(
+        release=release,
+        config=config,
+        outer_pixs=outer_pixs,
+        dust_root=dust_root,
+    )
+    new_tables = _build_sparse_new_maps(
+        gaia_root=gaia_root,
+        dust_root=dust_root,
+        release=release,
+        config=config,
+        outer_pixs=outer_pixs,
+    )
+
+    mismatches = 0
+    for level in range(config.outer_level, config.max_data_level + 1):
+        touched_pixs = _touched_level_pixs(
+            outer_pixs=outer_pixs,
+            outer_level=config.outer_level,
+            level=level,
+        )
+        legacy = legacy_tables[level]
+        new = new_tables[level]
+        print(f"level {level}: touched pixels={len(touched_pixs)}")
+        for column_name in MAPS_COMPARISON_COLUMNS:
+            legacy_name = _legacy_map_column_name(column_name, config)
+            source_name = legacy_name if legacy_name in legacy.colnames else column_name
+            legacy_values = np.asarray(legacy[source_name])[touched_pixs]
+            new_values = np.asarray(new[column_name])[touched_pixs]
+            equal = np.isclose(
+                legacy_values,
+                new_values,
+                atol=FLOAT_ATOL,
+                rtol=FLOAT_RTOL,
+                equal_nan=True,
+            )
+            if np.all(equal):
+                continue
+            mismatches += int(np.count_nonzero(~equal))
+            print(f"map column mismatch: level={level} column={column_name} mismatches={int(np.count_nonzero(~equal))}")
+    print(f"map result: {'FAIL' if mismatches else 'OK'}")
+    return 1 if mismatches else 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare live legacy outer-pixel results against the new in-memory path.",
@@ -1005,6 +1297,11 @@ def parse_args() -> argparse.Namespace:
         "--release",
         default=GAIA_RELEASE,
         help="Gaia release identifier for the canonical ao-sky store.",
+    )
+    parser.add_argument(
+        "--maps",
+        action="store_true",
+        help="Compare sparse all-sky aggregated maps instead of per-outer-pixel traversal outputs.",
     )
     return parser.parse_args()
 
@@ -1075,6 +1372,24 @@ def main() -> int:
     _load_runtime()
     dust_root = args.dust_root.expanduser().resolve()
     config = load_legacy_config(args.config, args.ao_system)
+    if args.maps:
+        groups = _select_map_outer_pix_groups(
+            outer_pixs=args.outer_pix,
+            sample=args.sample,
+            outer_level=config.outer_level,
+        )
+        failures = 0
+        for index, group in enumerate(groups):
+            if index > 0:
+                print()
+            failures += _compare_sparse_maps_for_group(
+                outer_pixs=group,
+                gaia_root=args.gaia_root,
+                dust_root=dust_root,
+                release=args.release,
+                config=config,
+            )
+        return 1 if failures else 0
     outer_pixs = _select_outer_pixs(
         outer_pixs=args.outer_pix,
         sample=args.sample,

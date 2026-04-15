@@ -21,6 +21,7 @@ from ._constants import (
     BUILD_STATUS_COMPLETED,
     BUILD_STATUS_FAILED,
     BUILD_STATUS_INITIALIZED,
+    MAPS_FILENAME_TEMPLATE,
     STATE_DTYPE,
     WORK_STATUS_DONE,
     WORK_STATUS_FAILED,
@@ -128,6 +129,12 @@ def outer_artifact_filename(build_path: Path, definition: BuildDefinition, outer
         / get_outer_pixel_bucket_path(definition.outer_level, outer_pix)
         / "outer.h5"
     )
+
+
+def maps_artifact_filename(build_path: Path, level: int) -> Path:
+    """Return the persisted all-sky maps artifact filename for one level."""
+
+    return build_path / MAPS_FILENAME_TEMPLATE.format(level=int(level))
 
 
 def create_build_root(
@@ -337,14 +344,14 @@ def refresh_build_status(build_path: Path) -> str:
     fields = phase_state_fields(current_phase)
     if fields is None:
         if current_phase in (BUILD_PHASE_AGGREGATION, BUILD_PHASE_AUGMENTATION):
-            return BUILD_STATUS_INITIALIZED
+            with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
+                value = handle["metadata"]["config"]["build_status"][()]
+            return str(_decode_bytes(value))
         raise BuildError(f"Unknown build phase {current_phase!r}")
 
     status_field, _, _ = fields
     if np.any(state[status_field] == WORK_STATUS_FAILED):
         status = BUILD_STATUS_FAILED
-    elif current_phase == BUILD_PHASE_TRAVERSAL and np.all(state[status_field] == WORK_STATUS_DONE):
-        status = BUILD_STATUS_COMPLETED
     else:
         status = BUILD_STATUS_INITIALIZED
     set_build_status(build_path, status)

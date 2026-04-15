@@ -9,7 +9,14 @@ import numpy as np
 from astropy.table import Table
 
 from ..gaia._constants import HDF5_COMPRESSION, HDF5_COMPRESSION_OPTS, HDF5_SHUFFLE
-from ._constants import ASTERISMS_DTYPE, INNER_DTYPE, OUTER_DATASET_ASTERISMS, OUTER_DATASET_INNER
+from ._constants import (
+    ASTERISMS_DTYPE,
+    INNER_DTYPE,
+    MAPS_DATASET,
+    MAPS_DTYPE,
+    OUTER_DATASET_ASTERISMS,
+    OUTER_DATASET_INNER,
+)
 
 
 def _table_to_structured_array(table: Table, dtype: np.dtype) -> np.ndarray:
@@ -55,8 +62,39 @@ def write_outer_artifact(
     tmp_filename.replace(filename)
 
 
+def write_maps_artifact(
+    filename: Path,
+    *,
+    maps: np.ndarray,
+) -> None:
+    """Write one dense all-sky maps artifact."""
+
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    tmp_filename = filename.with_suffix(filename.suffix + ".tmp")
+    if tmp_filename.exists():
+        tmp_filename.unlink()
+
+    with h5py.File(tmp_filename, "w") as handle:
+        handle.create_dataset(
+            MAPS_DATASET,
+            data=np.asarray(maps, dtype=MAPS_DTYPE),
+            compression=HDF5_COMPRESSION,
+            compression_opts=HDF5_COMPRESSION_OPTS,
+            shuffle=HDF5_SHUFFLE,
+        )
+
+    tmp_filename.replace(filename)
+
+
 def read_outer_dataset(filename: Path, dataset_name: str) -> Table:
     """Read one dataset from a persisted outer artifact."""
 
     with h5py.File(filename, "r") as handle:
         return Table(handle[dataset_name][...])
+
+
+def read_maps_dataset(filename: Path) -> Table:
+    """Read one dense all-sky maps artifact."""
+
+    with h5py.File(filename, "r") as handle:
+        return Table(handle[MAPS_DATASET][...])
