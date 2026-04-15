@@ -5,22 +5,24 @@ from __future__ import annotations
 from pathlib import Path
 
 from astropy.table import Table
+import numpy as np
 
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig
 from ._constants import (
     ARTIFACT_STATE_DONE,
     ARTIFACT_STATE_FAILED,
-    ARTIFACT_STATE_PENDING,
     ARTIFACT_STATE_SKIPPED,
     BUILD_STATUS_FAILED,
     BUILD_STATUS_RUNNING,
     WORK_STATUS_DONE,
     WORK_STATUS_FAILED,
+    WORK_STATUS_PENDING,
     WORK_STATUS_RUNNING,
 )
 from .artifacts import write_outer_artifact
 from .config import load_build_definition, resolve_build_root_only, resolve_build_roots
 from .control import (
+    append_build_log,
     build_artifact_root,
     create_build_root,
     latest_build_path,
@@ -36,6 +38,7 @@ from .control import (
 )
 from ._exceptions import BuildError
 from .legacy_runtime import build_inner_table, build_outer_pixel_asterisms, load_legacy_runtime
+from .scheduler import OuterPixelScheduler
 
 
 def init_build(
@@ -144,28 +147,69 @@ def build_outer_pixel_products(build_path: Path, outer_pix: int) -> None:
         raise
 
 
+def _repair_stale_running_rows(build_path: Path) -> int:
+    state = load_state(build_path)
+    stale = np.flatnonzero(state["work_status"] == WORK_STATUS_RUNNING)
+    for outer_pix in stale:
+        update_state_row(
+            build_path,
+            int(outer_pix),
+            work_status=WORK_STATUS_PENDING,
+        )
+    return int(len(stale))
+
+
 def run_build(build_path: Path) -> Path:
     """Run all unfinished work in one build."""
 
     if not build_path.is_dir():
         raise BuildError(f"Build path does not exist: {build_path}")
-    build_artifact_root(build_path, load_persisted_build_definition(build_path)).mkdir(
+    definition = load_persisted_build_definition(build_path)
+    build_artifact_root(build_path, definition).mkdir(
         parents=True,
         exist_ok=True,
     )
+    repaired = _repair_stale_running_rows(build_path)
     set_build_status(build_path, BUILD_STATUS_RUNNING)
-    state = load_state(build_path)
+    append_build_log(
+        build_path,
+        f"run start repaired_stale_running={repaired}",
+    )
+
+    scheduler = OuterPixelScheduler(outer_level=definition.outer_level)
+    last_completed_outer_pix: int | None = None
     failed = False
-    for outer_pix in range(len(state)):
-        if int(state["work_status"][outer_pix]) == WORK_STATUS_DONE:
-            continue
+    while True:
+        state = load_state(build_path)
+        outer_pix = scheduler.select_next_outer_pixel(
+            state,
+            last_completed_outer_pix=last_completed_outer_pix,
+        )
+        if outer_pix is None:
+            break
         try:
             build_outer_pixel_products(build_path, outer_pix)
-        except Exception:
+            last_completed_outer_pix = outer_pix
+        except Exception as exc:
             failed = True
+            append_build_log(
+                build_path,
+                f"outer_pix={outer_pix} failed: {exc}",
+            )
     final_status = refresh_build_status(build_path)
     if failed and final_status != BUILD_STATUS_FAILED:
         set_build_status(build_path, BUILD_STATUS_FAILED)
+        final_status = BUILD_STATUS_FAILED
+    summary = summarize_build(build_path)
+    append_build_log(
+        build_path,
+        "run complete "
+        f"status={final_status} "
+        f"pending={summary['work_counts']['pending']} "
+        f"running={summary['work_counts']['running']} "
+        f"done={summary['work_counts']['done']} "
+        f"failed={summary['work_counts']['failed']}",
+    )
     return build_path
 
 

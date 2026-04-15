@@ -61,6 +61,13 @@ def _encode_fixed_bytes(
     return encoded
 
 
+def append_build_log(build_path: Path, message: str) -> None:
+    """Append one timestamped execution line to the build log."""
+
+    with (build_path / BUILD_LOG_FILENAME).open("a", encoding="utf-8") as handle:
+        handle.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
+
+
 def build_root_name(definition: BuildDefinition, version: int) -> str:
     """Return the canonical folder name for one build version."""
 

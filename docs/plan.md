@@ -269,6 +269,8 @@ wrapper code.
 - Implement restart-aware planning over unfinished outer pixels.
 - Replace chunk-barrier scheduling with a more flexible scheduler.
 - Add neighbour-oriented traversal and star-count balancing.
+- Keep this phase single-process; defer parallel worker execution to the later
+  cache-aware execution phase.
 - If a supported repo-root `aosky.conf` is added, define it here as a CLI or
   application-layer configuration surface rather than as hidden package-global
   behavior inside `ao_sky.gaia`.
@@ -312,8 +314,22 @@ wrapper code.
 - Use the audit to confirm that the preceding build-product phases are
   sufficient before cache work and compatibility adoption proceed.
 
-### Phase 9: Add Cache-Aware Execution Support
+### Phase 9: Add Gaia Pre-Download And Summary Support
 
+- Add a CLI command that can pre-download or materialize the canonical Gaia
+  store for a full configured outer-pixel range rather than relying only on
+  one-off on-demand reads.
+- Build and persist a Gaia summary artifact that includes per-outer-pixel star
+  counts suitable for execution planning.
+- Use that summary to add the star-count scheduling proxy for the execution
+  engine when full Gaia materialization has been prepared ahead of a build.
+- Keep one-off builds viable when the full Gaia store has not been
+  pre-downloaded.
+
+### Phase 10: Add Cache-Aware Execution Support
+
+- Add parallel worker execution on top of the non-cache single-process
+  execution engine from Phase 4.
 - Add a pre-warming local-cache scheme that can stage Gaia and inner files into
   local storage in parallel with ongoing processing.
 - Define the cache lifecycle, ownership, and cleanup behavior relative to the
@@ -324,7 +340,7 @@ wrapper code.
 - Benchmark the cache-aware execution path against the non-cache execution
   engine before treating the added complexity as justified.
 
-### Phase 10: Improve The Winning-Asterism Algorithm
+### Phase 11: Improve The Winning-Asterism Algorithm
 
 - Revisit the interim winning-asterism selection path after the preceding
   build-product and audit phases have exposed the remaining weaknesses.
@@ -333,7 +349,7 @@ wrapper code.
 - Validate the improved winner path against the richer per-outer-pixel and
   survey-scale products before compatibility adoption proceeds.
 
-### Phase 11: Define The WFS Photometric Proxy Layer
+### Phase 12: Define The WFS Photometric Proxy Layer
 
 - Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
   AO-system-specific photometric products.
@@ -348,7 +364,7 @@ wrapper code.
 - Define uncertainty handling and the downstream contract for asterism-building
   and AO-simulation consumers.
 
-### Phase 12: Compatibility Adoption In `survey_tools` And `girmos-aosims`
+### Phase 13: Compatibility Adoption In `survey_tools` And `girmos-aosims`
 
 - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
 - Add the downstream adoption work needed for `girmos-aosims` to consume the
@@ -359,7 +375,7 @@ wrapper code.
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
 
-### Phase 13: Deduplication And Final Handoff
+### Phase 14: Deduplication And Final Handoff
 
 - Remove the superseded legacy implementation from `survey_tools`.
 - Retain only the compatibility surface that is still worth carrying.
