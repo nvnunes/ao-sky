@@ -45,6 +45,46 @@ Smoke-check the installed CLI entrypoint with:
 ./.conda/bin/ao-sky --version
 ```
 
+When the public build surface changes, also smoke-check the build lifecycle.
+The repository test suite covers this contract, and an additional manual CLI
+smoke path is:
+
+```bash
+tmpdir="$(mktemp -d)"
+cat >"$tmpdir/build.yaml" <<'YAML'
+ao_system_short_name: GNAO
+config_short_name: baseline
+gaia_release: dr3
+outer_level: 0
+inner_level: 1
+epoch: 2028.0
+YAML
+cat >"$tmpdir/legacy.yaml" <<'YAML'
+ao_systems:
+  - name: GNAO
+    band: R
+    fov: 120.0
+    fov_1ngs: 60.0
+    min_wfs: 2
+    max_wfs: 3
+    min_mag: 8.0
+    nom_mag: 16.0
+    max_mag: 18.5
+    min_sep: 5.0
+    max_sep: 120.0
+asterisms_max_star_density: 6.0
+asterisms_max_bright_star_mag: 8.0
+asterisms_max_overlap: 0.66
+YAML
+build_path="$(
+  ./.conda/bin/ao-sky init "$tmpdir/build.yaml" \
+    --gaia-root "$tmpdir/gaia" \
+    --build-root "$tmpdir/builds" \
+    --legacy-config "$tmpdir/legacy.yaml"
+)"
+./.conda/bin/ao-sky show "$build_path"
+```
+
 Refresh the editable install whenever package metadata, dependencies, or entry
 points change:
 
@@ -88,6 +128,7 @@ Package, CLI, or packaging changes are complete when:
 - the Python test suite passes
 - the package build succeeds
 - the CLI smoke check succeeds
+- build-surface changes also cover the minimal build CLI smoke path
 - docs are updated when supported usage or workflow changed
 
 Planning, architecture, or benchmark-sensitive doc changes are complete when:

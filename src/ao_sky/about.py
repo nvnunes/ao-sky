@@ -3,7 +3,8 @@
 PACKAGE_SUMMARY = (
     "ao-sky is a public Python package for Gaia-backed AO-sky mapping, with a "
     "canonical raw Gaia store, Gaia-domain proper-motion transforms, reusable "
-    "spatial helpers, and in-memory asterism search APIs."
+    "spatial helpers, in-memory asterism search APIs, and persisted build "
+    "artifacts for derived AO-sky products."
 )
 
 

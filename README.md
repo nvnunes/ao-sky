@@ -10,7 +10,9 @@ The repository currently provides:
 - Gaia-domain proper-motion transforms on canonical Gaia tables
 - reusable `ao_sky.spatial` HEALPix helpers
 - public in-memory `ao_sky.asterisms` star-loading and search APIs
-- a minimal `ao-sky` CLI entrypoint
+- persisted `ao_sky.build` build roots, build state, and per-outer-pixel
+  derived artifact containers
+- a public `ao-sky` CLI with build lifecycle commands
 - a repo-local Conda workflow rooted at `./.conda`
 - strict docs-site and packaging verification commands
 
@@ -23,7 +25,9 @@ conda create -y -p ./.conda python=3.12
 ```
 
 Use [`docs/development.md`](docs/development.md) for the full local workflow
-and [`docs/testing.md`](docs/testing.md) for the canonical verification path.
+including the current build-definition and `ao-sky init|run|restart|show`
+workflow, and use [`docs/testing.md`](docs/testing.md) for the canonical
+verification path.
 
 ## Core Docs
 

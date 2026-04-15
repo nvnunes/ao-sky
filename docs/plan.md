@@ -130,7 +130,7 @@ The larger repository split should keep following the same ownership rule:
 - loader-time star-table preparation
 - HEALPix and neighbour traversal primitives
 - asterism search, geometric filtering, and overlap handling
-- pass manifests and derived-artifact layout
+- build metadata, state, and derived-artifact layout
 - restart-aware build state and scheduling
 - public Python API, CLI, docs, and examples
 
@@ -254,40 +254,86 @@ wrapper code.
   legacy-comparison field set for early validation, even though some of those
   fields are expected to be dropped later.
 
-### Phase 3: Define The Derived Pass Model
+### Phase 3: Define The Derived Build Model
 
-- Replace `config.folder` coupling with explicit pass manifests and layouts.
+- Replace `config.folder` coupling with explicit build metadata and layouts.
 - Select and define the new persisted asterism data format rather than
   assuming legacy FITS compatibility.
-- Implement pass-aware paths for:
+- Implement build-aware paths for:
   - inner products
   - asterism catalogs
-  - aggregate products
-  - survey-extent overlays
-- Define pass metadata and restart state.
+- Define build metadata and restart state.
 
 ### Phase 4: Rebuild The Execution Engine
 
 - Implement restart-aware planning over unfinished outer pixels.
 - Replace chunk-barrier scheduling with a more flexible scheduler.
 - Add neighbour-oriented traversal and star-count balancing.
-- Add a pre-warming local-cache scheme that can stage Gaia and inner files into
-  local storage in parallel with ongoing processing.
 - If a supported repo-root `aosky.conf` is added, define it here as a CLI or
   application-layer configuration surface rather than as hidden package-global
   behavior inside `ao_sky.gaia`.
+
+### Phase 5: Add Asterism And Inner-Product Richness
+
+- Flesh out the derived build products beyond the minimal persisted outer-pixel
+  contract established earlier.
+- Implement the richer overlap-handling and winner-selection path needed for
+  build parity with `survey_tools`.
+- Expand the inner-product model beyond the initial count-oriented surface.
+- Extend the temporary legacy-comparison harness as needed to validate the
+  richer derived products against the live legacy path while this phase is in
+  progress.
+
+### Phase 6: Add Dust-Enriched Derived Products
+
+- Add dust-loading where the richer derived build path depends on it.
+- Add dust-derived fields and filters to the relevant per-outer-pixel derived
+  products.
+- Extend the temporary legacy-comparison harness as needed to validate the
+  dust-enriched products against the live legacy path while this phase is in
+  progress.
+
+### Phase 7: Add Survey-Scale Derived Products
+
+- Rebuild aggregate and map-generation products on top of the new build model.
+- Add survey-extent overlays and other richer survey-scale derived products on
+  top of the new build model.
+- Extend the temporary legacy-comparison harness as needed to validate these
+  survey-scale outputs where useful during migration.
+
+### Phase 8: Audit `survey_tools` `aomap` For Missing Implementation
+
+- Perform a focused audit of the live `survey_tools` `aomap` implementation
+  against the then-current `ao-sky` build surface.
+- Identify any remaining legacy `aomap` capabilities that have not yet been
+  re-implemented or intentionally deferred.
+- Record the remaining gaps clearly enough that the compatibility-adoption work
+  does not discover missing functionality late.
+- Use the audit to confirm that the preceding build-product phases are
+  sufficient before cache work and compatibility adoption proceed.
+
+### Phase 9: Add Cache-Aware Execution Support
+
+- Add a pre-warming local-cache scheme that can stage Gaia and inner files into
+  local storage in parallel with ongoing processing.
+- Define the cache lifecycle, ownership, and cleanup behavior relative to the
+  persisted build model.
 - Benchmark against the recorded baseline in `docs/benchmarking.md` and refresh
-  it under the current storage setup before considering cache complexity.
+  it under the current storage setup before treating the added complexity as
+  justified.
+- Benchmark the cache-aware execution path against the non-cache execution
+  engine before treating the added complexity as justified.
 
-### Phase 5: Compatibility Adoption In survey_tools
+### Phase 10: Improve The Winning-Asterism Algorithm
 
-- Add thin `survey_tools` adapters that call `ao-sky` public APIs.
-- Keep pinned legacy assets readable through explicit compatibility paths.
-- Repoint downstream consumers incrementally.
-- Avoid deleting legacy code until the new path is documented, tested, and used
-  in practice.
+- Revisit the interim winning-asterism selection path after the preceding
+  build-product and audit phases have exposed the remaining weaknesses.
+- Improve the winner-selection algorithm itself rather than just reproducing
+  the current legacy behavior.
+- Validate the improved winner path against the richer per-outer-pixel and
+  survey-scale products before compatibility adoption proceeds.
 
-### Phase 6: Define The WFS Photometric Proxy Layer
+### Phase 11: Define The WFS Photometric Proxy Layer
 
 - Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
   AO-system-specific photometric products.
@@ -302,7 +348,18 @@ wrapper code.
 - Define uncertainty handling and the downstream contract for asterism-building
   and AO-simulation consumers.
 
-### Phase 7: Deduplication And Final Handoff
+### Phase 12: Compatibility Adoption In `survey_tools` And `girmos-aosims`
+
+- Add thin `survey_tools` adapters that call `ao-sky` public APIs.
+- Add the downstream adoption work needed for `girmos-aosims` to consume the
+  new `ao-sky` build and photometric surfaces cleanly.
+- Keep pinned legacy assets readable through explicit compatibility paths.
+- Repoint downstream consumers incrementally across both `survey_tools` and
+  `girmos-aosims`.
+- Avoid deleting legacy code until the new path is documented, tested, and used
+  in practice.
+
+### Phase 13: Deduplication And Final Handoff
 
 - Remove the superseded legacy implementation from `survey_tools`.
 - Retain only the compatibility surface that is still worth carrying.
@@ -359,7 +416,7 @@ surface is the compatibility target, not the old implementation shape.
 `ao-sky` should still differ where its domain requires it:
 
 - it is a spatial data and build-orchestration package first
-- Gaia storage layout and pass layout are domain concepts, not incidental
+- Gaia storage layout and build layout are domain concepts, not incidental
   storage details
 - restartability, scheduling, and provenance are first-class concerns from the
   start

@@ -26,11 +26,11 @@ asterism search, and derived AO-sky products.
 The package is organized around:
 
 - canonical shared Gaia inputs
-- derived pass artifacts
-- a build engine that materializes, resumes, and inspects those passes
+- derived build artifacts
+- a build engine that materializes, resumes, and inspects those builds
 
 `ao-sky` is a spatial data and build-orchestration package. Gaia storage
-layout, pass manifests, restartability, traversal policy, and artifact
+layout, build metadata, restartability, traversal policy, and artifact
 provenance are part of the domain model.
 
 ## Locked Design Constraints
@@ -90,19 +90,18 @@ The canonical package is split by ownership:
 - `ao_sky.spatial`
   - HEALPix conversions
   - neighbour traversal primitives
-  - geometric helpers used across loaders, passes, and build execution
+  - geometric helpers used across loaders, artifacts, and build execution
 - `ao_sky.asterisms`
   - star assembly for asterism search
   - asterism search
   - geometry
   - overlap logic
   - filtering and scoring seams
-- `ao_sky.passes`
-  - pass manifests
-  - persisted artifact contracts
-  - pass layout rules
-  - inner, catalog, and aggregate readers/writers
 - `ao_sky.build`
+  - build-definition loading
+  - build metadata/state contracts
+  - build layout rules
+  - persisted outer-pixel artifact writers/readers
   - planning
   - scheduling
   - traversal
@@ -122,19 +121,19 @@ The architecture uses distinct data layers with explicit ownership.
 
 - Raw Gaia DR3 per-outer-pixel HDF5 files.
 - Versioned by Gaia release and outer HEALPix level.
-- Shared across all derived passes.
+- Shared across all derived builds.
 - Stored without derived working bands.
 - Loaded through explicit schema-aware readers.
 - Stored at `<root>/gaia-<release>-hpx<healpix_level>/<hour>h/<sign><deg>/<outer_pix>/gaia.h5`.
 - Stored as one HDF5 dataset named `gaia` using `gzip=9` and `shuffle=True`.
 
-### Derived Pass Artifacts
+### Derived Build Artifacts
 
 - Inner-pixel products.
 - Asterism catalogs.
 - Aggregate map products.
 - Survey-extent overlays and other derived summaries.
-- Versioned by pass manifest and output layout version, not by ad hoc folder
+- Versioned by build metadata and output layout version, not by ad hoc folder
   naming.
 
 ### Read Models And Contracts
@@ -149,21 +148,24 @@ The architecture uses distinct data layers with explicit ownership.
 - Path layout, schema ownership, and derived-field rules are treated as
   user-facing contracts.
  
-## Pass Model
+## Build Model
 
-`ao-sky` uses an explicit pass model for derived artifacts.
+`ao-sky` uses an explicit build model for derived artifacts.
 
 - Gaia store has its own root and stable path contract.
-- Derived work happens inside explicit pass directories.
-- Every pass has a manifest recording:
-  - algorithm/version identity
-  - config inputs
-  - source Gaia release and level
-  - scoring backend identity
-  - output layout version
-  - creation time and completion state
-
-- Passes are inspectable and comparable without external context.
+- Derived work happens inside explicit build directories.
+- Every build has:
+  - a root `build.h5` control file for metadata and outer-pixel state
+  - a root `build.log`
+  - one `outer.h5` artifact container per processed outer pixel
+- Builds are named `<ao-system-short-name>-<config-short-name>-v<N>`.
+- `build.h5` stores:
+  - the original build-definition YAML
+  - normalized build metadata
+  - the full-sky outer-pixel state table for the configured outer level
+- Per-outer-pixel build artifacts live under:
+  - `hpx<outer-level>-<inner-level>/<hour>h/<sign><deg>/<outer_pix>/outer.h5`
+- Builds are inspectable and comparable without external context.
 
 ## Build And Scheduling Model
 
@@ -174,8 +176,10 @@ Build execution is organized around restartable outer-pixel work.
 - Traversal should prefer neighbouring unfinished outer pixels whenever
   possible.
 - Work balancing should use star count or another practical work proxy.
-- Worker state should record `pending`, `running`, `done`, `excluded`, and
-  `failed` explicitly.
+- Build state should record:
+  - overall outer-pixel work status
+  - artifact states for `outer_file`, `inner`, and `asterisms`
+  - attempt count and last error message
 - Cache policy should remain simple until neighbour-aware scheduling has been
   benchmarked.
 
@@ -188,7 +192,7 @@ AO-system-specific scoring does not define the generic package boundary.
 - Scorer backends are pluggable.
 - Instrument-specific ranking and science policy stay outside the canonical
   package core.
-- Algorithm-specific behavior is reflected in pass identity and explicit scorer
+- Algorithm-specific behavior is reflected in build identity and explicit scorer
   configuration, not in hidden global behavior.
 
 ## Public Surface
@@ -223,7 +227,7 @@ The documentation surface explains:
 
 - how Gaia storage is laid out
 - how canonical Gaia inputs differ from later derived photometric layers
-- what a pass is
-- what artifacts a pass produces
+- what a build is
+- what artifacts a build produces
 - how restartable build execution works
-- how pass inspection and comparison work
+- how build inspection and comparison work

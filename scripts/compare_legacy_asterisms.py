@@ -80,6 +80,12 @@ COMPARISON_COLUMNS = (
     "pix",
 )
 
+INNER_COMPARISON_COLUMNS = (
+    "pix",
+    "ngs_count",
+    "asterism_count",
+)
+
 NEW_TO_LEGACY_COLUMNS = {
     "asterism_id": "id",
     "star1_source_id": "star1_id",
@@ -102,6 +108,10 @@ AsterismSearchOptions = None
 apply_proper_motion = None
 find_asterisms = None
 load_asterism_stars = None
+BuildDefinition = None
+build_inner_table = None
+build_outer_pixel_asterisms = None
+load_legacy_runtime = None
 get_pixel_area = None
 get_pixel_from_skycoord = None
 get_pixel_neighbours = None
@@ -111,8 +121,9 @@ get_pixel_skycoord = None
 
 def _load_runtime() -> None:
     global GaiaHealpixStore, GaiaStoreConfig, GAIA_SCHEMA_COLUMNS
-    global AsterismSearchOptions, find_asterisms, load_asterism_stars
-    global apply_proper_motion
+    global AsterismSearchOptions, BuildDefinition
+    global apply_proper_motion, find_asterisms, load_asterism_stars
+    global build_inner_table, build_outer_pixel_asterisms, load_legacy_runtime
     global get_pixel_area, get_pixel_from_skycoord, get_pixel_neighbours
     global get_pixel_resolution, get_pixel_skycoord
 
@@ -123,6 +134,12 @@ def _load_runtime() -> None:
         AsterismSearchOptions as _AsterismSearchOptions,
         find_asterisms as _find_asterisms,
         load_asterism_stars as _load_asterism_stars,
+    )
+    from ao_sky.build._models import BuildDefinition as _BuildDefinition
+    from ao_sky.build.legacy_runtime import (
+        build_inner_table as _build_inner_table,
+        build_outer_pixel_asterisms as _build_outer_pixel_asterisms,
+        load_legacy_runtime as _load_legacy_runtime,
     )
     from ao_sky.gaia import (
         GaiaHealpixStore as _GaiaHealpixStore,
@@ -145,6 +162,10 @@ def _load_runtime() -> None:
     apply_proper_motion = _apply_proper_motion
     find_asterisms = _find_asterisms
     load_asterism_stars = _load_asterism_stars
+    BuildDefinition = _BuildDefinition
+    build_inner_table = _build_inner_table
+    build_outer_pixel_asterisms = _build_outer_pixel_asterisms
+    load_legacy_runtime = _load_legacy_runtime
     get_pixel_area = _get_pixel_area
     get_pixel_from_skycoord = _get_pixel_from_skycoord
     get_pixel_neighbours = _get_pixel_neighbours
@@ -202,35 +223,65 @@ def _get_hour_deg_for_path(outer_pix: int, coord: SkyCoord) -> tuple[int, int]:
     return hour, deg
 
 
-def load_live_legacy_asterisms(
+def load_live_legacy_outputs(
     *,
     config: LegacyComparisonConfig,
     outer_pix: int,
-) -> Table:
-    """Run the live legacy outer-pixel asterism path and return its table output."""
+) -> tuple[Table, Table]:
+    """Run the live legacy outer-pixel path and return asterism and inner outputs."""
     if not LEGACY_PYTHON.exists():
         raise FileNotFoundError(f"Legacy Python runtime not found: {LEGACY_PYTHON}")
 
     with tempfile.TemporaryDirectory(prefix="ao-sky-live-legacy-") as tmpdir:
         tmpdir_path = Path(tmpdir)
-        output_filename = tmpdir_path / "legacy-asterisms.fits"
+        asterism_filename = tmpdir_path / "legacy-asterisms.fits"
+        inner_filename = tmpdir_path / "legacy-inner.fits"
         code = textwrap.dedent("""
 import os
 import sys
 from pathlib import Path
+import numpy as np
+from astropy.table import Table
 
 survey_root = Path(sys.argv[1]).resolve()
 config_filename = Path(sys.argv[2]).resolve()
-output_filename = Path(sys.argv[3]).resolve()
-outer_pix = int(sys.argv[4])
-ao_system_name = sys.argv[5]
+asterism_filename = Path(sys.argv[3]).resolve()
+inner_filename = Path(sys.argv[4]).resolve()
+outer_pix = int(sys.argv[5])
+ao_system_name = sys.argv[6]
 
 sys.path.insert(0, str(survey_root))
 import aomap.aomap as aomap
 
 config = aomap.read_config(str(config_filename))
+original_folder = Path(config.folder).resolve()
+temp_folder = Path(inner_filename).parent / "legacy-data"
+temp_folder.mkdir(parents=True, exist_ok=True)
+(temp_folder / "gaia").symlink_to(original_folder / "gaia", target_is_directory=True)
+config.folder = str(temp_folder)
+ao_system = aomap.get_ao_system(config, ao_system_name)
+
+inner_hdul = aomap._create_inner(config, outer_pix)
+inner = Table(inner_hdul[1].data)
+
 asterisms = aomap.find_outer_asterisms(config, outer_pix, ao_system_name)
-asterisms.write(output_filename, format="fits", overwrite=True)
+if asterisms is None:
+    asterisms = Table()
+elif len(asterisms) > 0:
+    aomap._save_asterisms(config, outer_pix, ao_system_name, asterisms)
+asterisms.write(asterism_filename, format="fits", overwrite=True)
+
+inner_simple = Table()
+inner_simple["pix"] = np.asarray(inner[aomap.FITS_COLUMN_PIX], dtype=np.int64)
+inner_simple["ngs_count"] = np.asarray(
+    inner[aomap._get_ngs_count_field(ao_system)],
+    dtype=np.int64,
+)
+inner_simple["asterism_count"] = np.asarray(
+    aomap._get_inner_pixel_asterism_count(config, outer_pix, ao_system),
+    dtype=np.int64,
+)
+inner_simple.write(inner_filename, format="fits", overwrite=True)
 """)
         env = os.environ.copy()
         env.setdefault("MPLCONFIGDIR", str(tmpdir_path / "mpl"))
@@ -241,7 +292,8 @@ asterisms.write(output_filename, format="fits", overwrite=True)
                 code,
                 str(LEGACY_RUNTIME_ROOT),
                 str(config.legacy_config_filename),
-                str(output_filename),
+                str(asterism_filename),
+                str(inner_filename),
                 str(outer_pix),
                 config.ao_system.name,
             ],
@@ -256,7 +308,10 @@ asterisms.write(output_filename, format="fits", overwrite=True)
             stdout = result.stdout.strip()
             details = stderr or stdout or "no output"
             raise RuntimeError(f"Legacy live comparison failed: {details}")
-        return Table.read(output_filename, format="fits")
+        return (
+            Table.read(asterism_filename, format="fits"),
+            Table.read(inner_filename, format="fits"),
+        )
 
 
 def select_random_outer_pix(
@@ -668,20 +723,39 @@ def _prepare_new_asterisms(
     return working
 
 
-def build_new_asterisms(
+def _build_runtime(
+    *,
+    release: str,
+    config: LegacyComparisonConfig,
+) -> object:
+    _load_runtime()
+    definition = BuildDefinition(
+        ao_system_short_name=config.ao_system.name,
+        config_short_name="legacy-comparison",
+        gaia_release=release,
+        outer_level=config.outer_level,
+        inner_level=config.inner_level,
+        epoch=config.asterism_epoch if config.asterism_epoch is not None else 2016.0,
+        min_galactic_latitude=config.asterisms_min_galactic_latitude,
+    )
+    return load_legacy_runtime(definition, config.legacy_config_filename)
+
+
+def build_new_outputs(
     *,
     gaia_root: Path,
     release: str,
     config: LegacyComparisonConfig,
     outer_pix: int,
-) -> tuple[Table, Table, Table]:
+) -> tuple[Table, Table, Table, Table]:
     _load_runtime()
     store = GaiaHealpixStore(
         GaiaStoreConfig(root=gaia_root, release=release, healpix_level=config.outer_level)
     )
-    stars, ngs = _prepare_new_star_table(store, config, outer_pix)
-    asterisms = _prepare_new_asterisms(stars, ngs, config, outer_pix)
-    return stars, ngs, asterisms
+    runtime = _build_runtime(release=release, config=config)
+    stars, ngs, asterisms = build_outer_pixel_asterisms(store, runtime, outer_pix)
+    inner = build_inner_table(store, runtime, outer_pix, asterisms=asterisms)
+    return stars, ngs, asterisms, inner
 
 
 def prepare_legacy_table(table: Table) -> Table:
@@ -693,11 +767,26 @@ def prepare_legacy_table(table: Table) -> Table:
 
 
 def prepare_new_table(table: Table) -> Table:
-    missing = [name for name in COMPARISON_COLUMNS if name not in table.colnames]
+    working = table.copy(copy_data=True)
+    for source_name, legacy_name in NEW_TO_LEGACY_COLUMNS.items():
+        if source_name in working.colnames:
+            working.rename_column(source_name, legacy_name)
+    for column_name in ("star1_idx", "star2_idx", "star3_idx"):
+        if column_name in working.colnames:
+            working.remove_column(column_name)
+    missing = [name for name in COMPARISON_COLUMNS if name not in working.colnames]
     if missing:
         missing_text = ", ".join(missing)
         raise ValueError(f"New table is missing required comparison columns: {missing_text}")
-    return table[list(COMPARISON_COLUMNS)].copy(copy_data=True)
+    return working[list(COMPARISON_COLUMNS)].copy(copy_data=True)
+
+
+def prepare_inner_table(table: Table) -> Table:
+    missing = [name for name in INNER_COMPARISON_COLUMNS if name not in table.colnames]
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(f"Inner table is missing required comparison columns: {missing_text}")
+    return table[list(INNER_COMPARISON_COLUMNS)].copy(copy_data=True)
 
 
 def compare_tables(legacy: Table, new: Table) -> int:
@@ -768,6 +857,31 @@ def compare_tables(legacy: Table, new: Table) -> int:
     return 1 if missing_from_new or extra_in_new or mismatch_count else 0
 
 
+def compare_inner_tables(legacy: Table, new: Table) -> int:
+    print(f"legacy inner rows: {len(legacy)}")
+    print(f"new inner rows:    {len(new)}")
+
+    if len(legacy) != len(new):
+        print("inner row count differs")
+        return 1
+
+    mismatch_count = 0
+    for column_name in INNER_COMPARISON_COLUMNS:
+        legacy_values = np.asarray(legacy[column_name])
+        new_values = np.asarray(new[column_name])
+        if np.array_equal(legacy_values, new_values):
+            continue
+        mismatches = int(np.count_nonzero(legacy_values != new_values))
+        mismatch_count += mismatches
+        print(f"inner column mismatch: {column_name} mismatches={mismatches}")
+
+    if mismatch_count == 0:
+        print("inner row ordering: exact match")
+        return 0
+
+    return 1
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare one outer-pixel live legacy asterism result against the new in-memory search path.",
@@ -810,26 +924,34 @@ def main() -> int:
         )
         print(f"selected random outer pixel: {outer_pix}")
 
-    legacy_table = prepare_legacy_table(
-        load_live_legacy_asterisms(config=config, outer_pix=outer_pix)
+    legacy_asterisms, legacy_inner = load_live_legacy_outputs(
+        config=config,
+        outer_pix=outer_pix,
     )
+    legacy_table = prepare_legacy_table(legacy_asterisms)
+    legacy_inner = prepare_inner_table(legacy_inner)
     legacy_label = (
         "live legacy code: "
         f"{LEGACY_RUNTIME_ROOT / 'aomap'} using {config.legacy_config_filename}"
     )
 
-    stars, ngs, new_table = build_new_asterisms(
+    stars, ngs, new_table, new_inner = build_new_outputs(
         gaia_root=args.gaia_root,
         release=args.release,
         config=config,
         outer_pix=outer_pix,
     )
     prepared_new = prepare_new_table(new_table)
+    prepared_new_inner = prepare_inner_table(new_inner)
 
     print(legacy_label)
     print(f"new stars loaded: {len(stars)}")
     print(f"new NGS after policy filters: {len(ngs)}")
-    return compare_tables(legacy_table, prepared_new)
+    print("asterisms:")
+    asterism_status = compare_tables(legacy_table, prepared_new)
+    print("inner:")
+    inner_status = compare_inner_tables(legacy_inner, prepared_new_inner)
+    return 1 if asterism_status or inner_status else 0
 
 
 if __name__ == "__main__":

@@ -33,3 +33,4 @@ nav:
       - Gaia API: reference/gaia/api.md
       - Spatial API: reference/spatial/api.md
       - Asterisms API: reference/asterisms/api.md
+      - Build API: reference/build/api.md

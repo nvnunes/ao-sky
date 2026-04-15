@@ -21,7 +21,6 @@ from ._constants import (
     HDF5_COMPRESSION_OPTS,
     HDF5_DATASET_NAME,
     HDF5_SHUFFLE,
-    HOUR_FOLDER_OVERRIDE_PIXELS,
 )
 from ._exceptions import GaiaError
 from ._schema import (
@@ -30,7 +29,7 @@ from ._schema import (
     table_to_structured_array,
 )
 from ._query import query_healpix_table
-from ..spatial import get_pixel_skycoord
+from .._paths import get_outer_pixel_bucket_path
 
 
 # Config
@@ -111,20 +110,10 @@ class GaiaHealpixStore:
                 configured HEALPix level.
         """
 
-        coord = get_pixel_skycoord(self.config.healpix_level, outer_pix)
-        hour = int(np.floor(coord.ra.degree / 15.0))
-        if outer_pix in HOUR_FOLDER_OVERRIDE_PIXELS:
-            hour = 14
-
-        dec_bucket = int(np.floor(np.abs(coord.dec.degree / 10.0)) * 10)
-        dec_sign = "+" if coord.dec.degree >= 0 else "-"
-
         return (
             self.config.root
             / f"gaia-{self.config.release}-hpx{self.config.healpix_level}"
-            / f"{hour}h"
-            / f"{dec_sign}{dec_bucket:02d}"
-            / str(outer_pix)
+            / get_outer_pixel_bucket_path(self.config.healpix_level, outer_pix)
             / "gaia.h5"
         )
 

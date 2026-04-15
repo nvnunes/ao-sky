@@ -88,3 +88,66 @@ Refresh the editable install whenever package metadata or dependencies change:
 ```bash
 ./.conda/bin/python -m pip install -e ".[dev,docs]"
 ```
+
+## Minimal Build Workflow
+
+The current public build surface is centered on:
+
+- `ao-sky init`
+- `ao-sky run`
+- `ao-sky restart`
+- `ao-sky show`
+
+`init` takes a minimal build-definition YAML file. The required fields are:
+
+- `ao_system_short_name`
+- `config_short_name`
+- `gaia_release`
+- `outer_level`
+- `inner_level`
+- `epoch`
+
+Optional fields:
+
+- `min_galactic_latitude`
+
+Example build definition:
+
+```yaml
+ao_system_short_name: GNAO
+config_short_name: baseline
+gaia_release: dr3
+outer_level: 6
+inner_level: 14
+epoch: 2028.0
+min_galactic_latitude: 10.0
+```
+
+`gaia_root` and `build_root` are not part of the build definition. Resolve them
+either with CLI options or with a project-root `aosky.conf` file:
+
+```yaml
+gaia_root: /data/gaia
+build_root: /data/ao-builds
+```
+
+If `aosky.conf` is present in the working project root, `init` and `restart`
+can use it automatically. Otherwise pass `--gaia-root` and `--build-root`
+explicitly.
+
+Example CLI flow with explicit roots:
+
+```bash
+./.conda/bin/ao-sky init build.yaml \
+  --gaia-root /data/gaia \
+  --build-root /data/ao-builds
+
+./.conda/bin/ao-sky show /data/ao-builds/GNAO-baseline-v1
+./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1
+./.conda/bin/ao-sky restart GNAO baseline --build-root /data/ao-builds
+```
+
+During the current migration phase, `init` also accepts `--legacy-config` to
+override the temporary legacy `survey_tools/aomap/config.yaml` runtime-policy
+source. Normal repo usage should rely on the default unless a task explicitly
+needs a different legacy config.

@@ -11,6 +11,8 @@ The current repo surface establishes:
 - `ao_sky.gaia` owns raw Gaia storage and proper-motion transforms
 - `ao_sky.spatial` owns the reusable non-plotting HEALPix helpers
 - `ao_sky.asterisms` owns in-memory star assembly and search APIs
+- `ao_sky.build` owns persisted build roots, state, and per-outer-pixel
+  derived artifacts
 - `ao-sky` is the public CLI entrypoint
 - `./.conda` is the canonical local development environment
 - strict docs and packaging checks are part of the repo-local verification path

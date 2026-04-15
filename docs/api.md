@@ -7,6 +7,8 @@ The supported public surface currently centers on:
 - `ao_sky.gaia` for canonical Gaia storage and proper-motion transforms
 - `ao_sky.spatial` for reusable non-plotting HEALPix helpers
 - `ao_sky.asterisms` for outer-pixel star assembly and in-memory search
+- `ao_sky.build` for persisted build roots, build state, and per-outer-pixel
+  derived artifacts
 
 ## Current Public Surface
 
@@ -72,6 +74,19 @@ The current package-supported asterism API exposes:
 - `find_asterisms`
 - `ASTERISM_TABLE_COLUMNS`
 
+### `ao_sky.build`
+
+The current package-supported build API exposes:
+
+- `BuildError`
+- `load_build_definition`
+- `resolve_build_roots`
+- `resolve_build_root_only`
+- `init_build`
+- `run_build`
+- `restart_build`
+- `show_build`
+
 ## Core Read And Search Paths
 
 ### `GaiaHealpixStore.healpix_filename(outer_pix: int) -> Path`
@@ -129,6 +144,32 @@ Non-goals of the current Gaia API:
 - instrument-specific photometric proxies
 - repo-root config discovery
 
+## Build Lifecycle
+
+### `init_build(...) -> Path`
+
+Create a new build root, persist `build.h5`, seed full-sky outer-pixel state,
+and create the build artifact layout.
+
+Behavior:
+
+- load a minimal build-definition YAML with the required build identity fields
+- resolve `gaia_root` and `build_root` from explicit arguments or `aosky.conf`
+- persist the resolved roots into `build.h5`
+
+### `run_build(build_path) -> Path`
+
+Run one initialized build through its unfinished outer-pixel work and write
+`outer.h5` artifact containers.
+
+### `restart_build(...) -> Path`
+
+Resume the latest build in one AO-system/config lineage.
+
+### `show_build(build_path) -> str`
+
+Return a human-readable build summary from the persisted `build.h5` state.
+
 ## Working Example
 
 ```python
@@ -161,3 +202,4 @@ Use the generated reference page for the complete public module surface:
 - [Gaia API Reference](reference/gaia/api.md)
 - [Spatial API Reference](reference/spatial/api.md)
 - [Asterisms API Reference](reference/asterisms/api.md)
+- [Build API Reference](reference/build/api.md)
