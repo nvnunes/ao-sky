@@ -15,7 +15,7 @@ import requests
 from astropy.table import Table
 
 from ._exceptions import GaiaError
-from ._healpix import get_pixel_skycoord, get_resolution
+from ..spatial import get_pixel_resolution, get_pixel_skycoord
 
 
 # Query construction
@@ -60,7 +60,7 @@ def build_healpix_query(release: str, healpix_level: int, outer_pix: int) -> str
     """
 
     coord = get_pixel_skycoord(healpix_level, outer_pix)
-    radius = 2.0 * get_resolution(healpix_level).to_value("degree")
+    radius = 2.0 * get_pixel_resolution(healpix_level).to_value("degree")
     table_name = _get_archive_table_name(release)
 
     return f"""

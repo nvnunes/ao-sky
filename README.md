@@ -3,17 +3,16 @@
 `ao-sky` is a public Python package for AO-sky mapping, Gaia-backed
 guide-star loading, asterism search, and derived all-sky AO products.
 
-The repository now includes:
+The repository currently provides:
 
 - an installable `src/ao_sky` package
 - a raw `ao_sky.gaia` store boundary for canonical per-pixel Gaia HDF5 files
+- Gaia-domain proper-motion transforms on canonical Gaia tables
+- reusable `ao_sky.spatial` HEALPix helpers
+- public in-memory `ao_sky.asterisms` star-loading and search APIs
 - a minimal `ao-sky` CLI entrypoint
 - a repo-local Conda workflow rooted at `./.conda`
 - strict docs-site and packaging verification commands
-
-The next planned implementation areas are the higher-level spatial helpers,
-asterism construction path, and derived WFS photometric layers described in
-[`docs/plan.md`](docs/plan.md).
 
 ## Quick Start
 

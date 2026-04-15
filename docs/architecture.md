@@ -40,6 +40,9 @@ The following decisions should be treated as fixed inputs to the design:
 - Canonical Gaia storage is raw Gaia DR3, not a working-data product.
 - Derived working-band magnitudes, WFS-band proxies, and other AO-system-aware
   photometric products are not persisted in canonical Gaia files.
+- Gaia-domain in-memory transforms may derive working quantities such as the
+  current empirical `R` estimate used by asterism search, but those quantities
+  are not part of the canonical persisted schema.
 - The locked canonical Gaia schema is:
   - `source_id`
   - `ra`
@@ -83,11 +86,13 @@ The canonical package is split by ownership:
   - archive querying
   - canonical HDF5 storage
   - raw per-outer-pixel Gaia readers
+  - Gaia-domain in-memory proper-motion transforms
 - `ao_sky.spatial`
   - HEALPix conversions
   - neighbour traversal primitives
   - geometric helpers used across loaders, passes, and build execution
 - `ao_sky.asterisms`
+  - star assembly for asterism search
   - asterism search
   - geometry
   - overlap logic
@@ -136,6 +141,10 @@ The architecture uses distinct data layers with explicit ownership.
 
 - Loaders expose canonical scientific data through explicit APIs rather than ad
   hoc path logic.
+- Gaia proper motion is an in-memory Gaia transform, not part of the persisted
+  raw-store contract.
+- Asterism-side neighbour stitching is an in-memory search-preparation step,
+  not part of canonical Gaia storage.
 - Persisted schema rules and path/version rules live in narrow contract modules.
 - Path layout, schema ownership, and derived-field rules are treated as
   user-facing contracts.

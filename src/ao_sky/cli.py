@@ -26,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser(
         "status",
-        help="Show the current bootstrap-stage package summary.",
+        help="Show the current package summary.",
     )
     status_parser.set_defaults(handler=_handle_status)
     return parser

@@ -1,9 +1,9 @@
 """Minimal public package metadata helpers."""
 
 PACKAGE_SUMMARY = (
-    "ao-sky now includes its raw Gaia store boundary alongside the installable "
-    "package, CLI surface, and repo-local docs workflow; spatial, asterism, "
-    "and derived photometric layers remain planned work."
+    "ao-sky is a public Python package for Gaia-backed AO-sky mapping, with a "
+    "canonical raw Gaia store, Gaia-domain proper-motion transforms, reusable "
+    "spatial helpers, and in-memory asterism search APIs."
 )
 
 

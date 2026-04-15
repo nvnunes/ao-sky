@@ -101,6 +101,13 @@ Gaia store tests should remain offline:
 - materialization tests should monkeypatch the archive query seam
 - normal repo verification should not depend on live Gaia archive access
 
+Phase 2 spatial and asterism tests should also remain repo-native:
+
+- the normal test suite should not import or execute `survey_tools`
+- neighbour-stitching tests should build synthetic Gaia tables locally
+- search tests should verify deterministic output and schema contracts rather
+  than comparing against legacy assets in the default repo test path
+
 ## Verification Scope Boundaries
 
 - Keep environment creation, activation, and daily workflow commands in

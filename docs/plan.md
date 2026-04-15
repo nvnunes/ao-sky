@@ -247,25 +247,18 @@ wrapper code.
 - Build a clean star-loading path for asterism construction around the Phase 1
   Gaia loader, including proper-motion application and neighbour-aware views as
   needed there.
-- Define the canonical asterism catalog contract, even if the first persisted
-  form remains FITS for compatibility.
+- Use the legacy empirical Gaia-derived `R` estimate for the current in-memory
+  asterism search path, implemented as a Gaia-domain in-memory helper rather
+  than as persisted canonical Gaia data.
+- Define the canonical in-memory asterism catalog contract and carry the full
+  legacy-comparison field set for early validation, even though some of those
+  fields are expected to be dropped later.
 
-### Phase 3: Define The WFS Photometric Proxy Layer
-
-- Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
-  AO-system-specific photometric products.
-- Define AO-system-aware derived photometry on top of loaded Gaia stars rather
-  than inside the canonical Gaia store.
-- Support transient sensing-band outputs, including photon-rate proxies and
-  magnitude-like proxies where useful to downstream consumers.
-- Decide how Gaia XP synthetic photometry, empirical Gaia-to-band transforms,
-  and flux-space combinations fit behind one interface.
-- Define uncertainty handling and the downstream contract for asterism-building
-  and AO-simulation consumers.
-
-### Phase 4: Define The Derived Pass Model
+### Phase 3: Define The Derived Pass Model
 
 - Replace `config.folder` coupling with explicit pass manifests and layouts.
+- Select and define the new persisted asterism data format rather than
+  assuming legacy FITS compatibility.
 - Implement pass-aware paths for:
   - inner products
   - asterism catalogs
@@ -273,7 +266,7 @@ wrapper code.
   - survey-extent overlays
 - Define pass metadata and restart state.
 
-### Phase 5: Rebuild The Execution Engine
+### Phase 4: Rebuild The Execution Engine
 
 - Implement restart-aware planning over unfinished outer pixels.
 - Replace chunk-barrier scheduling with a more flexible scheduler.
@@ -286,13 +279,28 @@ wrapper code.
 - Benchmark against the recorded baseline in `docs/benchmarking.md` and refresh
   it under the current storage setup before considering cache complexity.
 
-### Phase 6: Compatibility Adoption In survey_tools
+### Phase 5: Compatibility Adoption In survey_tools
 
 - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
 - Keep pinned legacy assets readable through explicit compatibility paths.
 - Repoint downstream consumers incrementally.
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
+
+### Phase 6: Define The WFS Photometric Proxy Layer
+
+- Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
+  AO-system-specific photometric products.
+- Continue using the current legacy empirical Gaia-derived `R` estimate as the
+  interim asterism-search input until this phase replaces it.
+- Define AO-system-aware derived photometry on top of loaded Gaia stars rather
+  than inside the canonical Gaia store.
+- Support transient sensing-band outputs, including photon-rate proxies and
+  magnitude-like proxies where useful to downstream consumers.
+- Decide how Gaia XP synthetic photometry, empirical Gaia-to-band transforms,
+  and flux-space combinations fit behind one interface.
+- Define uncertainty handling and the downstream contract for asterism-building
+  and AO-simulation consumers.
 
 ### Phase 7: Deduplication And Final Handoff
 

@@ -2,10 +2,11 @@
 
 This document describes the current code-first API exposed by `ao_sky`.
 
-The supported raw Gaia entrypoint is `ao_sky.gaia`. Use
-`GaiaStoreConfig(root, release, healpix_level)` to declare the canonical store
-root and tiling, then use `GaiaHealpixStore(config)` to read or materialize one
-outer-pixel Gaia HDF5 file at a time.
+The supported public surface currently centers on:
+
+- `ao_sky.gaia` for canonical Gaia storage and proper-motion transforms
+- `ao_sky.spatial` for reusable non-plotting HEALPix helpers
+- `ao_sky.asterisms` for outer-pixel star assembly and in-memory search
 
 ## Current Public Surface
 
@@ -16,6 +17,8 @@ The current package-supported Gaia API exposes:
 - `GaiaStoreConfig`
 - `GaiaHealpixStore`
 - `GaiaError`
+- `apply_proper_motion`
+- `compute_legacy_r_magnitude`
 - `GAIA_SCHEMA_COLUMNS`
 - `HDF5_DATASET_NAME`
 - `HDF5_COMPRESSION`
@@ -47,7 +50,29 @@ The canonical stored dataset is:
 - compression options: `9`
 - shuffle: `True`
 
-## Core Read Path
+### `ao_sky.spatial`
+
+The current package-supported spatial API exposes:
+
+- `get_pixel_resolution`
+- `get_pixel_area`
+- `get_pixel_from_skycoord`
+- `get_pixel_skycoord`
+- `get_parent_pixel`
+- `get_pixel_neighbours`
+- `get_subpixels`
+- `get_subpixel_indexes`
+
+### `ao_sky.asterisms`
+
+The current package-supported asterism API exposes:
+
+- `AsterismSearchOptions`
+- `load_asterism_stars`
+- `find_asterisms`
+- `ASTERISM_TABLE_COLUMNS`
+
+## Core Read And Search Paths
 
 ### `GaiaHealpixStore.healpix_filename(outer_pix: int) -> Path`
 
@@ -63,11 +88,44 @@ Behavior:
 - otherwise query the Gaia archive seam, write the canonical file, then return
   the canonical table
 
+### `apply_proper_motion(table, *, epoch=None, dt_years=None) -> Table`
+
+Return a canonical Gaia table with in-memory proper motion applied. The schema
+is preserved exactly, and the returned table updates `ra`, `dec`, and
+`ref_epoch`.
+
+### `compute_legacy_r_magnitude(table) -> ndarray`
+
+Return the empirical Gaia-to-`R` magnitude estimate used by the legacy guide-star
+workflow. This is an in-memory Gaia-domain helper and is not part of the raw
+canonical HDF5 contract.
+
+### `load_asterism_stars(store, outer_pix, *, neighbour_level=None, epoch=None, dt_years=None, include_locality=False) -> Table`
+
+Return the Gaia rows needed to search one outer pixel for asterisms.
+
+Behavior:
+
+- load the local outer pixel fully
+- when `neighbour_level` is set, include only the border-trimmed neighbour rows
+- optionally apply Gaia proper motion in-memory
+- add the legacy empirical `R` magnitude used by the current asterism search
+- return Gaia-schema rows, optionally enriched with locality columns
+
+### `find_asterisms(stars, options) -> Table`
+
+Run the legacy-faithful in-memory asterism search over a prepared Gaia star
+table.
+
+Behavior:
+
+- search brightness is fixed to the legacy empirical Gaia-derived `R`
+- supported star-count range is 1-3
+- output is a clean flat table with fixed `star1_*`/`star2_*`/`star3_*` slots
+- the table carries the temporary full legacy-comparison field set
+
 Non-goals of the current Gaia API:
 
-- proper-motion application
-- neighbour stitching
-- derived working-band magnitudes
 - instrument-specific photometric proxies
 - repo-root config discovery
 
@@ -76,6 +134,7 @@ Non-goals of the current Gaia API:
 ```python
 from pathlib import Path
 
+from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
 from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig
 
 config = GaiaStoreConfig(
@@ -86,11 +145,13 @@ config = GaiaStoreConfig(
 store = GaiaHealpixStore(config)
 
 filename = store.healpix_filename(outer_pix=0)
-table = store.load_healpix(outer_pix=0)
+stars = load_asterism_stars(store, outer_pix=0, neighbour_level=7, epoch=2016.0)
+asterisms = find_asterisms(stars, AsterismSearchOptions(min_stars=1, max_stars=3))
 
 print(filename)
-print(table.colnames)
-print(len(table))
+print(stars.colnames)
+print(asterisms.colnames)
+print(len(asterisms))
 ```
 
 ## Reference
@@ -98,3 +159,5 @@ print(len(table))
 Use the generated reference page for the complete public module surface:
 
 - [Gaia API Reference](reference/gaia/api.md)
+- [Spatial API Reference](reference/spatial/api.md)
+- [Asterisms API Reference](reference/asterisms/api.md)

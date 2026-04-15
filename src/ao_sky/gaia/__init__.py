@@ -9,6 +9,7 @@ from ._constants import (
 )
 from ._exceptions import GaiaError
 from .store import GaiaHealpixStore, GaiaStoreConfig
+from .transform import apply_proper_motion, compute_legacy_r_magnitude
 
 __all__ = [
     "GAIA_SCHEMA_COLUMNS",
@@ -19,4 +20,6 @@ __all__ = [
     "HDF5_COMPRESSION_OPTS",
     "HDF5_DATASET_NAME",
     "HDF5_SHUFFLE",
+    "apply_proper_motion",
+    "compute_legacy_r_magnitude",
 ]

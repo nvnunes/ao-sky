@@ -7,12 +7,13 @@ import sys
 from importlib.metadata import version
 
 from ao_sky import __version__, describe_package
-from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig
+from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
+from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig, apply_proper_motion
 
 
 def test_package_root_exports_version() -> None:
     assert __version__ == "0.1.0"
-    assert "raw Gaia store" in describe_package()
+    assert "proper-motion transforms" in describe_package()
 
 
 def test_installed_metadata_matches_package_version() -> None:
@@ -25,6 +26,10 @@ def test_gaia_surface_is_importable() -> None:
 
     assert config.release == "dr3"
     assert store.config.healpix_level == 6
+    assert apply_proper_motion is not None
+    assert load_asterism_stars is not None
+    assert find_asterisms is not None
+    assert AsterismSearchOptions().max_stars == 1
 
 
 def test_module_cli_reports_version() -> None:

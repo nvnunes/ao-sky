@@ -3,10 +3,8 @@
 This document is the source of truth for local bootstrap, environment setup,
 and daily development workflow in `ao-sky`.
 
-`ao-sky` is still early in its bootstrap stage, but the package and
-verification baseline is now in place. This document records the exact
-repo-local commands for environment creation, editable installs, and daily
-development work.
+This document records the exact repo-local commands for environment creation,
+editable installs, and daily development work.
 
 ## Shared Guidance
 
