@@ -277,8 +277,27 @@ wrapper code.
 
 ### Phase 5: Add Asterism And Inner-Product Richness
 
-- Flesh out the derived build products beyond the minimal persisted outer-pixel
-  contract established earlier.
+- Treat the overall Build as four phases:
+  Gaia Loading, Traversal, Aggregation, and Augmentation.
+- Use this phase to flesh out the Traversal products beyond the minimal
+  persisted outer-pixel contract established earlier.
+- Treat Traversal as one outer-pixel analysis pipeline, not as multiple
+  persisted passes.
+- Structure Traversal around these explicit steps:
+  Load Gaia Neighborhood, Generate Candidate Asterisms, Evaluate Candidate
+  Performance, Select Winning Asterisms, Evaluate Winner Performance, and
+  Persist Outer-Pixel Products.
+- Keep raw candidate asterisms transient and in memory; do not persist the
+  full raw candidate set.
+- Keep the temporary live legacy Traversal shell-out behind one shared adapter
+  in `ao_sky.build.legacy_runtime` so the build path and legacy-comparison
+  harness do not drift through duplicated inline legacy scripts.
+- Do not persist `Av` in build `asterisms` during this phase.
+- Do not use dust-based asterism filtering during Phase 5 Traversal; compare
+  against the legacy path with the asterism dust cut disabled.
+- Put the temporary Phase 5 overlap handling in Select Winning Asterisms
+  rather than in candidate generation so the later winner-map-first algorithm
+  can replace it without changing the earlier candidate-building contract.
 - Implement the richer overlap-handling and winner-selection path needed for
   build parity with `survey_tools`.
 - Expand the inner-product model beyond the initial count-oriented surface.
@@ -289,17 +308,18 @@ wrapper code.
 ### Phase 6: Add Dust-Enriched Derived Products
 
 - Add dust-loading where the richer derived build path depends on it.
-- Add dust-derived fields and filters to the relevant per-outer-pixel derived
-  products.
+- Continue the Traversal build path by adding dust-derived fields and filters
+  to the relevant per-outer-pixel products.
+- Add `Av` to the dense `inner` product rather than to build `asterisms`.
 - Extend the temporary legacy-comparison harness as needed to validate the
   dust-enriched products against the live legacy path while this phase is in
   progress.
 
 ### Phase 7: Add Survey-Scale Derived Products
 
-- Rebuild aggregate and map-generation products on top of the new build model.
-- Add survey-extent overlays and other richer survey-scale derived products on
-  top of the new build model.
+- Rebuild the Aggregation part of the Build on top of the new model.
+- Rebuild the Augmentation part of the Build, including survey-extent overlays
+  and other richer survey-scale derived products.
 - Extend the temporary legacy-comparison harness as needed to validate these
   survey-scale outputs where useful during migration.
 
@@ -344,12 +364,36 @@ wrapper code.
 
 - Revisit the interim winning-asterism selection path after the preceding
   build-product and audit phases have exposed the remaining weaknesses.
+- Replace the legacy-style overlap-plus-winner heuristic with a winner-map-first
+  formulation that solves for the winning asterism at each inner pixel.
+- Add regularization or smoothing to that winner field so the resulting winner
+  map is not dominated by highly pixelated local switches driven by small EE
+  differences.
+- Treat retained asterisms as the unique asterisms that win somewhere in the
+  solved winner field, rather than as the result of a separate heuristic
+  overlap-pruning step.
 - Improve the winner-selection algorithm itself rather than just reproducing
   the current legacy behavior.
 - Validate the improved winner path against the richer per-outer-pixel and
   survey-scale products before compatibility adoption proceeds.
 
-### Phase 12: Define The WFS Photometric Proxy Layer
+### Phase 12: Rebuild The Asterism Catalog Export Path
+
+- Rebuild the asterism catalog export workflow on top of the richer `ao-sky`
+  build products rather than the legacy `aomap` export path.
+- Add export-oriented asterism-side fields such as `Av` there, rather than
+  carrying them in the core build `asterisms` artifact.
+- Define which richer asterism-side fields belong in exported catalogs versus
+  remaining transient model-prediction context.
+- Validate exported catalogs against the intended downstream use cases before
+  compatibility adoption proceeds.
+
+### Phase 13: Explore Ways to Handle Higher Stellar Density
+
+- Currently the asterism code explodes when there are too many stars in an outer pixel
+- Explore ways to improve the algorithm so higher density fields can still be used
+
+### Phase 14: Define The WFS Photometric Proxy Layer
 
 - Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
   AO-system-specific photometric products.
@@ -364,7 +408,7 @@ wrapper code.
 - Define uncertainty handling and the downstream contract for asterism-building
   and AO-simulation consumers.
 
-### Phase 13: Compatibility Adoption In `survey_tools` And `girmos-aosims`
+### Phase 15: Compatibility Adoption In `survey_tools` And `girmos-aosims`
 
 - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
 - Add the downstream adoption work needed for `girmos-aosims` to consume the
@@ -375,7 +419,7 @@ wrapper code.
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
 
-### Phase 14: Deduplication And Final Handoff
+### Phase 16: Deduplication And Final Handoff
 
 - Remove the superseded legacy implementation from `survey_tools`.
 - Retain only the compatibility surface that is still worth carrying.

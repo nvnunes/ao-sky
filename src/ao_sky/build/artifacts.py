@@ -40,14 +40,17 @@ def write_outer_artifact(
             compression_opts=HDF5_COMPRESSION_OPTS,
             shuffle=HDF5_SHUFFLE,
         )
-        if asterisms is not None:
-            handle.create_dataset(
-                OUTER_DATASET_ASTERISMS,
-                data=_table_to_structured_array(asterisms, ASTERISMS_DTYPE),
-                compression=HDF5_COMPRESSION,
-                compression_opts=HDF5_COMPRESSION_OPTS,
-                shuffle=HDF5_SHUFFLE,
-            )
+        handle.create_dataset(
+            OUTER_DATASET_ASTERISMS,
+            data=(
+                np.zeros(0, dtype=ASTERISMS_DTYPE)
+                if asterisms is None
+                else _table_to_structured_array(asterisms, ASTERISMS_DTYPE)
+            ),
+            compression=HDF5_COMPRESSION,
+            compression_opts=HDF5_COMPRESSION_OPTS,
+            shuffle=HDF5_SHUFFLE,
+        )
 
     tmp_filename.replace(filename)
 

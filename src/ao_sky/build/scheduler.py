@@ -24,8 +24,9 @@ class OuterPixelScheduler:
     - each pixel is selected at most once per run
     """
 
-    def __init__(self, *, outer_level: int) -> None:
+    def __init__(self, *, outer_level: int, status_field: str = "traversal_status") -> None:
         self.outer_level = outer_level
+        self.status_field = status_field
         self._frontier: list[int] = []
         self._selected: set[int] = set()
         self._last_completed_seen: int | None = None
@@ -86,5 +87,5 @@ class OuterPixelScheduler:
     def _is_selectable(self, state: np.ndarray, outer_pix: int) -> bool:
         if outer_pix in self._selected:
             return False
-        status = int(state["work_status"][int(outer_pix)])
+        status = int(state[self.status_field][int(outer_pix)])
         return status in (WORK_STATUS_PENDING, WORK_STATUS_FAILED)

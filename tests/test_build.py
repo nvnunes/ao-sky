@@ -5,17 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import h5py
-from astropy.table import Table
 import numpy as np
 import pytest
+from astropy.table import Table
 
-from ao_sky.build import init_build, restart_build, run_build
-from ao_sky.build._exceptions import BuildError
+from ao_sky.build import init_build, restart_build, run_build, show_build
 from ao_sky.build._constants import (
-    ARTIFACT_STATE_DONE,
-    ARTIFACT_STATE_FAILED,
-    ARTIFACT_STATE_SKIPPED,
     BUILD_FILENAME,
+    BUILD_PHASE_TRAVERSAL,
     OUTER_DATASET_ASTERISMS,
     OUTER_DATASET_INNER,
     STATE_DTYPE,
@@ -24,6 +21,7 @@ from ao_sky.build._constants import (
     WORK_STATUS_PENDING,
     WORK_STATUS_RUNNING,
 )
+from ao_sky.build._exceptions import BuildError
 from ao_sky.build.config import load_build_definition as load_build_definition_yaml
 from ao_sky.build.control import (
     load_build_definition,
@@ -75,13 +73,148 @@ asterisms_max_overlap: 0.66
     return path
 
 
-def _make_scheduler_state(
-    statuses: list[int],
-) -> np.ndarray:
+def _make_scheduler_state(statuses: list[int], *, field: str = "traversal_status") -> np.ndarray:
     state = np.zeros(len(statuses), dtype=STATE_DTYPE)
     state["outer_pix"] = np.arange(len(statuses), dtype=np.int64)
-    state["work_status"] = np.asarray(statuses, dtype=np.int16)
+    state[field] = np.asarray(statuses, dtype=np.int16)
     return state
+
+
+def _make_inner(
+    *,
+    pixs: list[int] | None = None,
+    star_count: int = 0,
+    ngs_count: int = 0,
+    asterism_count: int = 0,
+    best_ee: float = np.nan,
+    best_sr: float = np.nan,
+    best_fwhm: float = np.nan,
+    winner_asterism_id: int = -1,
+    winner_distance_arcsec: float = np.nan,
+    winner_ee_resolved: float = np.nan,
+    winner_ee_averaged: float = np.nan,
+    coverage_resolved: bool = False,
+    coverage_averaged: bool = False,
+) -> Table:
+    pix_values = np.asarray([0, 1, 2, 3] if pixs is None else pixs, dtype=np.int64)
+    nrows = len(pix_values)
+    return Table(
+        [
+            pix_values,
+            np.full(nrows, star_count, dtype=np.int64),
+            np.full(nrows, ngs_count, dtype=np.int64),
+            np.full(nrows, asterism_count, dtype=np.int64),
+            np.full(nrows, best_ee, dtype=np.float64),
+            np.full(nrows, best_sr, dtype=np.float64),
+            np.full(nrows, best_fwhm, dtype=np.float64),
+            np.full(nrows, winner_asterism_id, dtype=np.int64),
+            np.full(nrows, winner_distance_arcsec, dtype=np.float64),
+            np.full(nrows, winner_ee_resolved, dtype=np.float64),
+            np.full(nrows, winner_ee_averaged, dtype=np.float64),
+            np.full(nrows, coverage_resolved, dtype=np.bool_),
+            np.full(nrows, coverage_averaged, dtype=np.bool_),
+        ],
+        names=(
+            "pix",
+            "star_count",
+            "ngs_count",
+            "asterism_count",
+            "best_ee",
+            "best_sr",
+            "best_fwhm",
+            "winner_asterism_id",
+            "winner_distance_arcsec",
+            "winner_ee_resolved",
+            "winner_ee_averaged",
+            "coverage_resolved",
+            "coverage_averaged",
+        ),
+    )
+
+
+def _make_asterisms(*, empty: bool = False) -> Table:
+    if empty:
+        return Table(
+            [
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+            ],
+            names=(
+                "asterism_id",
+                "ra",
+                "dec",
+                "num_stars",
+                "pix",
+                "star1_source_id",
+                "star1_ra",
+                "star1_dec",
+                "star1_mag",
+                "star2_source_id",
+                "star2_ra",
+                "star2_dec",
+                "star2_mag",
+                "star3_source_id",
+                "star3_ra",
+                "star3_dec",
+                "star3_mag",
+            ),
+        )
+
+    return Table(
+        [
+            np.array([7], dtype=np.int64),
+            np.array([10.0], dtype=np.float64),
+            np.array([20.0], dtype=np.float64),
+            np.array([2], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            np.array([101], dtype=np.int64),
+            np.array([10.0], dtype=np.float64),
+            np.array([20.0], dtype=np.float64),
+            np.array([12.0], dtype=np.float64),
+            np.array([202], dtype=np.int64),
+            np.array([10.1], dtype=np.float64),
+            np.array([20.1], dtype=np.float64),
+            np.array([13.0], dtype=np.float64),
+            np.array([-1], dtype=np.int64),
+            np.array([-1.0], dtype=np.float64),
+            np.array([-1.0], dtype=np.float64),
+            np.array([-1.0], dtype=np.float64),
+        ],
+        names=(
+            "asterism_id",
+            "ra",
+            "dec",
+            "num_stars",
+            "pix",
+            "star1_source_id",
+            "star1_ra",
+            "star1_dec",
+            "star1_mag",
+            "star2_source_id",
+            "star2_ra",
+            "star2_dec",
+            "star2_mag",
+            "star3_source_id",
+            "star3_ra",
+            "star3_dec",
+            "star3_mag",
+        ),
+    )
 
 
 def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
@@ -102,8 +235,12 @@ def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
     state = load_state(build_path)
     assert len(state) == 12
     assert state["outer_pix"].tolist() == list(range(12))
-    assert np.all(state["asterisms_state"] == ARTIFACT_STATE_SKIPPED)
-    assert np.all(state["work_status"] == 0)
+    assert np.all(state["gaia_loading_status"] == WORK_STATUS_DONE)
+    assert np.all(state["traversal_status"] == WORK_STATUS_PENDING)
+
+    summary = summarize_build(build_path)
+    assert summary["build_status"] == "initialized"
+    assert summary["current_phase"] == BUILD_PHASE_TRAVERSAL
 
 
 def test_init_build_uses_aosky_conf_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,13 +338,13 @@ def test_scheduler_preserves_neighbour_order_and_depth_first_walk(
     state = _make_scheduler_state([WORK_STATUS_PENDING] * 5)
 
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=None) == 0
-    state["work_status"][0] = WORK_STATUS_DONE
+    state["traversal_status"][0] = WORK_STATUS_DONE
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=0) == 1
-    state["work_status"][1] = WORK_STATUS_DONE
+    state["traversal_status"][1] = WORK_STATUS_DONE
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=1) == 3
-    state["work_status"][3] = WORK_STATUS_DONE
+    state["traversal_status"][3] = WORK_STATUS_DONE
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=3) == 4
-    state["work_status"][4] = WORK_STATUS_DONE
+    state["traversal_status"][4] = WORK_STATUS_DONE
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=4) == 2
 
 
@@ -229,13 +366,13 @@ def test_scheduler_does_not_retry_failed_pixel_in_same_run(
     state = _make_scheduler_state([WORK_STATUS_PENDING] * 4)
 
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=None) == 0
-    state["work_status"][0] = WORK_STATUS_DONE
+    state["traversal_status"][0] = WORK_STATUS_DONE
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=0) == 1
-    state["work_status"][1] = WORK_STATUS_FAILED
+    state["traversal_status"][1] = WORK_STATUS_FAILED
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=0) == 2
 
 
-def test_build_outer_artifact_is_written_and_state_updates(
+def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -248,73 +385,31 @@ def test_build_outer_artifact_is_written_and_state_updates(
         legacy_config_path=legacy,
     )
 
-    stars = Table()
-    ngs = Table()
-    asterisms = Table(
-        [
-            np.array([1], dtype=np.int64),
-            np.array([10.0], dtype=np.float64),
-            np.array([20.0], dtype=np.float64),
-            np.array([2], dtype=np.int64),
-            np.array([0], dtype=np.int64),
-            np.array([101], dtype=np.int64),
-            np.array([10.0], dtype=np.float64),
-            np.array([20.0], dtype=np.float64),
-            np.array([12.0], dtype=np.float64),
-            np.array([202], dtype=np.int64),
-            np.array([10.1], dtype=np.float64),
-            np.array([20.1], dtype=np.float64),
-            np.array([13.0], dtype=np.float64),
-            np.array([-1], dtype=np.int64),
-            np.array([-1.0], dtype=np.float64),
-            np.array([-1.0], dtype=np.float64),
-            np.array([-1.0], dtype=np.float64),
-        ],
-        names=(
-            "asterism_id",
-            "ra",
-            "dec",
-            "num_stars",
-            "pix",
-            "star1_source_id",
-            "star1_ra",
-            "star1_dec",
-            "star1_mag",
-            "star2_source_id",
-            "star2_ra",
-            "star2_dec",
-            "star2_mag",
-            "star3_source_id",
-            "star3_ra",
-            "star3_dec",
-            "star3_mag",
+    monkeypatch.setattr(
+        "ao_sky.build.runner.build_traversal_products",
+        lambda store, runtime, outer_pix: (
+            _make_asterisms(),
+            _make_inner(
+                star_count=3,
+                ngs_count=2,
+                asterism_count=5,
+                best_ee=0.5,
+                best_sr=0.4,
+                best_fwhm=0.3,
+                winner_asterism_id=7,
+                winner_distance_arcsec=12.0,
+                winner_ee_resolved=0.5,
+                winner_ee_averaged=0.45,
+                coverage_resolved=True,
+                coverage_averaged=True,
+            ),
         ),
-    )
-    inner = Table(
-        [
-            np.array([0, 1, 2, 3], dtype=np.int64),
-            np.array([1, 0, 2, 0], dtype=np.int64),
-            np.array([1, 0, 1, 0], dtype=np.int64),
-        ],
-        names=("pix", "ngs_count", "asterism_count"),
-    )
-
-    monkeypatch.setattr(
-        "ao_sky.build.runner.build_outer_pixel_asterisms",
-        lambda store, runtime, outer_pix: (stars, ngs, asterisms),
-    )
-    monkeypatch.setattr(
-        "ao_sky.build.runner.build_inner_table",
-        lambda store, runtime, outer_pix, asterisms=None: inner,
     )
 
     run_build(build_path)
 
     state = load_state(build_path)
-    assert int(state["work_status"][0]) == WORK_STATUS_DONE
-    assert int(state["outer_file_state"][0]) == ARTIFACT_STATE_DONE
-    assert int(state["inner_state"][0]) == ARTIFACT_STATE_DONE
-    assert int(state["asterisms_state"][0]) == ARTIFACT_STATE_DONE
+    assert np.all(state["traversal_status"] == WORK_STATUS_DONE)
 
     outer_filename = outer_artifact_filename(
         build_path,
@@ -325,9 +420,24 @@ def test_build_outer_artifact_is_written_and_state_updates(
     with h5py.File(outer_filename, "r") as handle:
         assert OUTER_DATASET_INNER in handle
         assert OUTER_DATASET_ASTERISMS in handle
+        assert set(handle[OUTER_DATASET_INNER].dtype.names) == {
+            "pix",
+            "star_count",
+            "ngs_count",
+            "asterism_count",
+            "best_ee",
+            "best_sr",
+            "best_fwhm",
+            "winner_asterism_id",
+            "winner_distance_arcsec",
+            "winner_ee_resolved",
+            "winner_ee_averaged",
+            "coverage_resolved",
+            "coverage_averaged",
+        }
 
 
-def test_skipped_asterisms_still_write_outer_file_with_inner_only(
+def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -340,22 +450,12 @@ def test_skipped_asterisms_still_write_outer_file_with_inner_only(
         legacy_config_path=legacy,
     )
 
-    inner = Table(
-        [
-            np.array([0, 1, 2, 3], dtype=np.int64),
-            np.array([0, 0, 0, 0], dtype=np.int64),
-            np.array([0, 0, 0, 0], dtype=np.int64),
-        ],
-        names=("pix", "ngs_count", "asterism_count"),
-    )
-
-    def _unexpected(*args: object, **kwargs: object) -> object:
-        raise AssertionError("asterism search should not run for skipped pixels")
-
-    monkeypatch.setattr("ao_sky.build.runner.build_outer_pixel_asterisms", _unexpected)
     monkeypatch.setattr(
-        "ao_sky.build.runner.build_inner_table",
-        lambda store, runtime, outer_pix, asterisms=None: inner,
+        "ao_sky.build.runner.build_traversal_products",
+        lambda store, runtime, outer_pix: (
+            _make_asterisms(empty=True),
+            _make_inner(star_count=4, ngs_count=0, asterism_count=0),
+        ),
     )
 
     run_build(build_path)
@@ -366,8 +466,8 @@ def test_skipped_asterisms_still_write_outer_file_with_inner_only(
         0,
     )
     with h5py.File(outer_filename, "r") as handle:
-        assert OUTER_DATASET_INNER in handle
-        assert OUTER_DATASET_ASTERISMS not in handle
+        assert OUTER_DATASET_ASTERISMS in handle
+        assert len(handle[OUTER_DATASET_ASTERISMS]) == 0
 
 
 def test_restart_build_uses_latest_lineage_version(
@@ -404,73 +504,20 @@ def test_run_build_repairs_stale_running_rows_and_logs_it(
     )
     state = load_state(build_path)
     for outer_pix in range(1, len(state)):
-        update_state_row(build_path, outer_pix, work_status=WORK_STATUS_DONE)
-    update_state_row(build_path, 0, work_status=WORK_STATUS_RUNNING)
-
-    inner = Table(
-        [
-            np.array([0, 1, 2, 3], dtype=np.int64),
-            np.array([0, 0, 0, 0], dtype=np.int64),
-            np.array([0, 0, 0, 0], dtype=np.int64),
-        ],
-        names=("pix", "ngs_count", "asterism_count"),
-    )
-    asterisms = Table(
-        [
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-        ],
-        names=(
-            "asterism_id",
-            "ra",
-            "dec",
-            "num_stars",
-            "pix",
-            "star1_source_id",
-            "star1_ra",
-            "star1_dec",
-            "star1_mag",
-            "star2_source_id",
-            "star2_ra",
-            "star2_dec",
-            "star2_mag",
-            "star3_source_id",
-            "star3_ra",
-            "star3_dec",
-            "star3_mag",
-        ),
-    )
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
+    update_state_row(build_path, 0, traversal_status=WORK_STATUS_RUNNING)
 
     monkeypatch.setattr(
-        "ao_sky.build.runner.build_outer_pixel_asterisms",
-        lambda store, runtime, outer_pix: (Table(), Table(), asterisms),
-    )
-    monkeypatch.setattr(
-        "ao_sky.build.runner.build_inner_table",
-        lambda store, runtime, outer_pix, asterisms=None: inner,
+        "ao_sky.build.runner.build_traversal_products",
+        lambda store, runtime, outer_pix: (_make_asterisms(empty=True), _make_inner()),
     )
 
     run_build(build_path)
 
     state = load_state(build_path)
-    assert int(state["work_status"][0]) == WORK_STATUS_DONE
+    assert int(state["traversal_status"][0]) == WORK_STATUS_DONE
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "run start repaired_stale_running=1" in log_text
+    assert "run start phase=traversal repaired_stale_running=1" in log_text
 
 
 def test_run_build_is_successful_no_op_when_all_rows_done(
@@ -487,20 +534,19 @@ def test_run_build_is_successful_no_op_when_all_rows_done(
     )
     state = load_state(build_path)
     for outer_pix in range(len(state)):
-        update_state_row(build_path, outer_pix, work_status=WORK_STATUS_DONE)
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
 
     def _unexpected(*args: object, **kwargs: object) -> object:
         raise AssertionError("run_build should not process completed builds")
 
-    monkeypatch.setattr("ao_sky.build.runner.build_outer_pixel_asterisms", _unexpected)
-    monkeypatch.setattr("ao_sky.build.runner.build_inner_table", _unexpected)
+    monkeypatch.setattr("ao_sky.build.runner.build_traversal_products", _unexpected)
 
     run_build(build_path)
 
     summary = summarize_build(build_path)
     assert summary["build_status"] == "completed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "run complete status=completed" in log_text
+    assert "run complete phase=traversal status=completed" in log_text
 
 
 def test_run_build_continues_after_failure_and_marks_build_failed(
@@ -517,79 +563,45 @@ def test_run_build_continues_after_failure_and_marks_build_failed(
     )
     state = load_state(build_path)
     for outer_pix in range(2, len(state)):
-        update_state_row(build_path, outer_pix, work_status=WORK_STATUS_DONE)
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
 
-    inner = Table(
-        [
-            np.array([0, 1, 2, 3], dtype=np.int64),
-            np.array([0, 0, 0, 0], dtype=np.int64),
-            np.array([0, 0, 0, 0], dtype=np.int64),
-        ],
-        names=("pix", "ngs_count", "asterism_count"),
-    )
-    asterisms = Table(
-        [
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.int64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-            np.array([], dtype=np.float64),
-        ],
-        names=(
-            "asterism_id",
-            "ra",
-            "dec",
-            "num_stars",
-            "pix",
-            "star1_source_id",
-            "star1_ra",
-            "star1_dec",
-            "star1_mag",
-            "star2_source_id",
-            "star2_ra",
-            "star2_dec",
-            "star2_mag",
-            "star3_source_id",
-            "star3_ra",
-            "star3_dec",
-            "star3_mag",
-        ),
-    )
-
-    def _build_outer(store: object, runtime: object, outer_pix: int) -> tuple[Table, Table, Table]:
+    def _build_traversal_products(store: object, runtime: object, outer_pix: int) -> tuple[Table, Table]:
         if outer_pix == 0:
             raise RuntimeError("boom")
-        return Table(), Table(), asterisms
+        return _make_asterisms(empty=True), _make_inner()
 
-    monkeypatch.setattr("ao_sky.build.runner.build_outer_pixel_asterisms", _build_outer)
-    monkeypatch.setattr(
-        "ao_sky.build.runner.build_inner_table",
-        lambda store, runtime, outer_pix, asterisms=None: inner,
-    )
+    monkeypatch.setattr("ao_sky.build.runner.build_traversal_products", _build_traversal_products)
 
     run_build(build_path)
 
     state = load_state(build_path)
-    assert int(state["work_status"][0]) == WORK_STATUS_FAILED
-    assert int(state["outer_file_state"][0]) == ARTIFACT_STATE_FAILED
-    assert int(state["work_status"][1]) == WORK_STATUS_DONE
+    assert int(state["traversal_status"][0]) == WORK_STATUS_FAILED
+    assert int(state["traversal_status"][1]) == WORK_STATUS_DONE
     summary = summarize_build(build_path)
     assert summary["build_status"] == "failed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "outer_pix=0 failed: boom" in log_text
-    assert "run complete status=failed" in log_text
+    assert "phase=traversal outer_pix=0 failed: boom" in log_text
+    assert "run complete phase=traversal status=failed" in log_text
+
+
+def test_show_build_reports_phase_and_phase_counts(tmp_path: Path) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        legacy_config_path=legacy,
+    )
+    update_state_row(build_path, 0, traversal_status=WORK_STATUS_DONE)
+    update_state_row(build_path, 1, traversal_status=WORK_STATUS_FAILED)
+
+    text = show_build(build_path)
+
+    assert "phase: traversal" in text
+    assert "pending=10" in text
+    assert "done=1" in text
+    assert "failed=1" in text
 
 
 def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None:
@@ -602,5 +614,5 @@ def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None
         legacy_config_path=legacy,
     )
 
-    with pytest.raises(BuildError, match="last_error_message exceeds persisted limit"):
-        update_state_row(build_path, 0, last_error_message="x" * 1025)
+    with pytest.raises(BuildError, match="traversal_last_error_message exceeds persisted limit"):
+        update_state_row(build_path, 0, traversal_last_error_message="x" * 1025)

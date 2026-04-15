@@ -177,9 +177,9 @@ Build execution is organized around restartable outer-pixel work.
   possible.
 - Work balancing should use star count or another practical work proxy.
 - Build state should record:
-  - overall outer-pixel work status
-  - artifact states for `outer_file`, `inner`, and `asterisms`
-  - attempt count and last error message
+  - the current build phase
+  - explicit per-phase outer-pixel status for `gaia_loading` and `traversal`
+  - per-phase attempt count and last error message
 - Cache policy should remain simple until neighbour-aware scheduling has been
   benchmarked.
 

@@ -4,14 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from astropy.table import Table
 import numpy as np
 
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig
 from ._constants import (
-    ARTIFACT_STATE_DONE,
-    ARTIFACT_STATE_FAILED,
-    ARTIFACT_STATE_SKIPPED,
+    BUILD_PHASE_TRAVERSAL,
     BUILD_STATUS_FAILED,
     BUILD_STATUS_RUNNING,
     WORK_STATUS_DONE,
@@ -19,6 +16,7 @@ from ._constants import (
     WORK_STATUS_PENDING,
     WORK_STATUS_RUNNING,
 )
+from ._exceptions import BuildError
 from .artifacts import write_outer_artifact
 from .config import load_build_definition, resolve_build_root_only, resolve_build_roots
 from .control import (
@@ -28,16 +26,17 @@ from .control import (
     latest_build_path,
     load_build_definition as load_persisted_build_definition,
     load_build_roots,
+    load_current_phase,
     load_legacy_config_path,
     load_state,
     outer_artifact_filename,
+    phase_state_fields,
     refresh_build_status,
     set_build_status,
     summarize_build,
     update_state_row,
 )
-from ._exceptions import BuildError
-from .legacy_runtime import build_inner_table, build_outer_pixel_asterisms, load_legacy_runtime
+from .legacy_runtime import build_traversal_products, load_legacy_runtime
 from .scheduler import OuterPixelScheduler
 
 
@@ -66,27 +65,12 @@ def init_build(
     )
 
 
-def _to_persisted_asterisms(asterisms: Table) -> Table:
-    result = Table()
-    result["asterism_id"] = asterisms["asterism_id"]
-    result["ra"] = asterisms["ra"]
-    result["dec"] = asterisms["dec"]
-    result["num_stars"] = asterisms["num_stars"]
-    result["pix"] = asterisms["pix"]
-    for index in (1, 2, 3):
-        result[f"star{index}_source_id"] = asterisms[f"star{index}_source_id"]
-        result[f"star{index}_ra"] = asterisms[f"star{index}_ra"]
-        result[f"star{index}_dec"] = asterisms[f"star{index}_dec"]
-        result[f"star{index}_mag"] = asterisms[f"star{index}_mag"]
-    return result
-
-
 def build_outer_pixel_products(build_path: Path, outer_pix: int) -> None:
-    """Build and persist one outer-pixel artifact container."""
+    """Run the Phase 5 Traversal pipeline for one outer pixel."""
 
     definition = load_persisted_build_definition(build_path)
     roots = load_build_roots(build_path)
-    legacy_runtime = load_legacy_runtime(definition, load_legacy_config_path(build_path))
+    runtime = load_legacy_runtime(definition, load_legacy_config_path(build_path))
     store = GaiaHealpixStore(
         GaiaStoreConfig(
             root=roots.gaia_root,
@@ -96,89 +80,78 @@ def build_outer_pixel_products(build_path: Path, outer_pix: int) -> None:
     )
 
     current_state = load_state(build_path)[int(outer_pix)]
-    asterisms_skipped = int(current_state["asterisms_state"]) == ARTIFACT_STATE_SKIPPED
-
     update_state_row(
         build_path,
         outer_pix,
-        work_status=WORK_STATUS_RUNNING,
-        attempt_count=int(current_state["attempt_count"]) + 1,
-        last_error_message="",
+        traversal_status=WORK_STATUS_RUNNING,
+        traversal_attempt_count=int(current_state["traversal_attempt_count"]) + 1,
+        traversal_last_error_message="",
     )
 
     try:
-        asterisms = None
-        if not asterisms_skipped:
-            _, _, final_asterisms = build_outer_pixel_asterisms(store, legacy_runtime, outer_pix)
-            asterisms = _to_persisted_asterisms(final_asterisms)
-            asterisms_state = ARTIFACT_STATE_DONE
-            skip_reason = ""
-        else:
-            asterisms_state = ARTIFACT_STATE_SKIPPED
-            skip_reason = current_state["asterisms_skip_reason"].decode("utf-8").strip()
-
-        inner = build_inner_table(store, legacy_runtime, outer_pix, asterisms=asterisms)
+        asterisms, inner = build_traversal_products(store, runtime, outer_pix)
         filename = outer_artifact_filename(build_path, definition, outer_pix)
         write_outer_artifact(filename, inner=inner, asterisms=asterisms)
         update_state_row(
             build_path,
             outer_pix,
-            work_status=WORK_STATUS_DONE,
-            outer_file_state=ARTIFACT_STATE_DONE,
-            inner_state=ARTIFACT_STATE_DONE,
-            asterisms_state=asterisms_state,
-            asterisms_skip_reason=skip_reason,
-            last_error_message="",
+            traversal_status=WORK_STATUS_DONE,
+            traversal_last_error_message="",
         )
     except Exception as exc:
         update_state_row(
             build_path,
             outer_pix,
-            work_status=WORK_STATUS_FAILED,
-            outer_file_state=ARTIFACT_STATE_FAILED,
-            inner_state=ARTIFACT_STATE_FAILED,
-            asterisms_state=(
-                ARTIFACT_STATE_SKIPPED
-                if asterisms_skipped
-                else ARTIFACT_STATE_FAILED
-            ),
-            last_error_message=str(exc),
+            traversal_status=WORK_STATUS_FAILED,
+            traversal_last_error_message=str(exc),
         )
         raise
 
 
-def _repair_stale_running_rows(build_path: Path) -> int:
+def _repair_stale_running_rows(build_path: Path, *, status_field: str) -> int:
     state = load_state(build_path)
-    stale = np.flatnonzero(state["work_status"] == WORK_STATUS_RUNNING)
+    stale = np.flatnonzero(state[status_field] == WORK_STATUS_RUNNING)
     for outer_pix in stale:
         update_state_row(
             build_path,
             int(outer_pix),
-            work_status=WORK_STATUS_PENDING,
+            **{status_field: WORK_STATUS_PENDING},
         )
     return int(len(stale))
 
 
 def run_build(build_path: Path) -> Path:
-    """Run all unfinished work in one build."""
+    """Run all unfinished Phase 5 Traversal work in one build."""
 
     if not build_path.is_dir():
         raise BuildError(f"Build path does not exist: {build_path}")
-    definition = load_persisted_build_definition(build_path)
-    build_artifact_root(build_path, definition).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-    repaired = _repair_stale_running_rows(build_path)
-    set_build_status(build_path, BUILD_STATUS_RUNNING)
-    append_build_log(
-        build_path,
-        f"run start repaired_stale_running={repaired}",
-    )
 
-    scheduler = OuterPixelScheduler(outer_level=definition.outer_level)
+    current_phase = load_current_phase(build_path)
+    if current_phase != BUILD_PHASE_TRAVERSAL:
+        raise BuildError(
+            f"Phase 5 runner only implements {BUILD_PHASE_TRAVERSAL!r}, "
+            f"but build phase is {current_phase!r}"
+        )
+
+    fields = phase_state_fields(current_phase)
+    if fields is None:
+        raise BuildError(f"Build phase {current_phase!r} is not outer-pixel-local")
+    status_field, _, _ = fields
+
+    definition = load_persisted_build_definition(build_path)
+    build_artifact_root(build_path, definition).mkdir(parents=True, exist_ok=True)
+
+    repaired = _repair_stale_running_rows(build_path, status_field=status_field)
+    set_build_status(build_path, BUILD_STATUS_RUNNING)
+    append_build_log(build_path, f"run start phase={current_phase} repaired_stale_running={repaired}")
+
+    scheduler = OuterPixelScheduler(
+        outer_level=definition.outer_level,
+        status_field=status_field,
+    )
     last_completed_outer_pix: int | None = None
     failed = False
+
     while True:
         state = load_state(build_path)
         outer_pix = scheduler.select_next_outer_pixel(
@@ -192,23 +165,26 @@ def run_build(build_path: Path) -> Path:
             last_completed_outer_pix = outer_pix
         except Exception as exc:
             failed = True
-            append_build_log(
-                build_path,
-                f"outer_pix={outer_pix} failed: {exc}",
-            )
+            append_build_log(build_path, f"phase={current_phase} outer_pix={outer_pix} failed: {exc}")
+
     final_status = refresh_build_status(build_path)
     if failed and final_status != BUILD_STATUS_FAILED:
         set_build_status(build_path, BUILD_STATUS_FAILED)
         final_status = BUILD_STATUS_FAILED
+
     summary = summarize_build(build_path)
+    phase_counts = summary["phase_counts"]
+    if phase_counts is None:
+        raise BuildError(f"Build summary missing counts for active phase {current_phase!r}")
     append_build_log(
         build_path,
         "run complete "
+        f"phase={current_phase} "
         f"status={final_status} "
-        f"pending={summary['work_counts']['pending']} "
-        f"running={summary['work_counts']['running']} "
-        f"done={summary['work_counts']['done']} "
-        f"failed={summary['work_counts']['failed']}",
+        f"pending={phase_counts['pending']} "
+        f"running={phase_counts['running']} "
+        f"done={phase_counts['done']} "
+        f"failed={phase_counts['failed']}",
     )
     return build_path
 
@@ -241,15 +217,17 @@ def show_build(build_path: Path) -> str:
     lines = [
         f"build: {summary['build_path']}",
         f"status: {summary['build_status']}",
-        "work:",
-        f"  pending={summary['work_counts']['pending']}",
-        f"  running={summary['work_counts']['running']}",
-        f"  done={summary['work_counts']['done']}",
-        f"  failed={summary['work_counts']['failed']}",
+        f"phase: {summary['current_phase']}",
     ]
-    skip_reasons: dict[str, int] = summary["skip_reasons"]  # type: ignore[assignment]
-    if skip_reasons:
-        lines.append("asterism skips:")
-        for reason, count in sorted(skip_reasons.items()):
-            lines.append(f"  {reason}={count}")
+    phase_counts: dict[str, int] | None = summary["phase_counts"]  # type: ignore[assignment]
+    if phase_counts is not None:
+        lines.extend(
+            [
+                "phase work:",
+                f"  pending={phase_counts['pending']}",
+                f"  running={phase_counts['running']}",
+                f"  done={phase_counts['done']}",
+                f"  failed={phase_counts['failed']}",
+            ]
+        )
     return "\n".join(lines)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -11,13 +10,14 @@ import h5py
 import numpy as np
 
 from .._paths import get_outer_pixel_bucket_path
-from ..spatial import get_pixel_skycoord
 from ._constants import (
-    ARTIFACT_STATE_PENDING,
-    ARTIFACT_STATE_SKIPPED,
     BUILD_FILENAME,
     BUILD_LAYOUT_VERSION,
     BUILD_LOG_FILENAME,
+    BUILD_PHASE_AGGREGATION,
+    BUILD_PHASE_AUGMENTATION,
+    BUILD_PHASE_GAIA_LOADING,
+    BUILD_PHASE_TRAVERSAL,
     BUILD_STATUS_COMPLETED,
     BUILD_STATUS_FAILED,
     BUILD_STATUS_INITIALIZED,
@@ -25,6 +25,7 @@ from ._constants import (
     WORK_STATUS_DONE,
     WORK_STATUS_FAILED,
     WORK_STATUS_PENDING,
+    WORK_STATUS_RUNNING,
 )
 from ._exceptions import BuildError
 from ._models import BuildDefinition, BuildPaths, LegacyBuildRuntime
@@ -147,24 +148,10 @@ def create_build_root(
     num_pixels = 12 * (4 ** definition.outer_level)
     state = np.zeros(num_pixels, dtype=STATE_DTYPE)
     state["outer_pix"] = np.arange(num_pixels, dtype=np.int64)
-    state["work_status"] = WORK_STATUS_PENDING
-    state["attempt_count"] = 0
-    state["outer_file_state"] = ARTIFACT_STATE_PENDING
-    state["inner_state"] = ARTIFACT_STATE_PENDING
-    state["asterisms_state"] = ARTIFACT_STATE_PENDING
-
-    if definition.min_galactic_latitude is not None:
-        for outer_pix in range(num_pixels):
-            coord = get_pixel_skycoord(definition.outer_level, outer_pix)
-            if abs(coord.galactic.b.degree) < definition.min_galactic_latitude:
-                state["asterisms_state"][outer_pix] = ARTIFACT_STATE_SKIPPED
-                state["asterisms_skip_reason"][outer_pix] = (
-                    _encode_fixed_bytes(
-                        f"min_galactic_latitude<{definition.min_galactic_latitude:g}",
-                        max_bytes=state.dtype["asterisms_skip_reason"].itemsize,
-                        field_name="asterisms_skip_reason",
-                    )
-                )
+    state["gaia_loading_status"] = WORK_STATUS_DONE
+    state["gaia_loading_attempt_count"] = 0
+    state["traversal_status"] = WORK_STATUS_PENDING
+    state["traversal_attempt_count"] = 0
 
     with h5py.File(build_path / BUILD_FILENAME, "w") as handle:
         metadata_group = handle.create_group("metadata")
@@ -192,6 +179,7 @@ def create_build_root(
             ),
             "layout_version": BUILD_LAYOUT_VERSION,
             "build_status": BUILD_STATUS_INITIALIZED,
+            "current_phase": BUILD_PHASE_TRAVERSAL,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         for key, value in normalized.items():
@@ -275,6 +263,40 @@ def set_build_status(build_path: Path, status: str) -> None:
         dataset[()] = np.asarray(status, dtype=h5py.string_dtype("utf-8"))
 
 
+def load_current_phase(build_path: Path) -> str:
+    """Return the persisted current build phase."""
+
+    with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
+        dataset = handle["metadata"]["config"]["current_phase"]
+        return str(_decode_bytes(dataset[()]))
+
+
+def set_current_phase(build_path: Path, phase: str) -> None:
+    """Update the persisted current build phase."""
+
+    with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
+        dataset = handle["metadata"]["config"]["current_phase"]
+        dataset[()] = np.asarray(phase, dtype=h5py.string_dtype("utf-8"))
+
+
+def phase_state_fields(phase: str) -> tuple[str, str, str] | None:
+    """Return the state field names for one per-outer-pixel build phase."""
+
+    if phase == BUILD_PHASE_GAIA_LOADING:
+        return (
+            "gaia_loading_status",
+            "gaia_loading_attempt_count",
+            "gaia_loading_last_error_message",
+        )
+    if phase == BUILD_PHASE_TRAVERSAL:
+        return (
+            "traversal_status",
+            "traversal_attempt_count",
+            "traversal_last_error_message",
+        )
+    return None
+
+
 def summarize_build(build_path: Path) -> dict[str, object]:
     """Return a human-readable build summary payload."""
 
@@ -282,27 +304,24 @@ def summarize_build(build_path: Path) -> dict[str, object]:
     with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
         config_group = handle["metadata"]["config"]
         build_status = str(_decode_bytes(config_group["build_status"][()]))
+        current_phase = str(_decode_bytes(config_group["current_phase"][()]))
 
-    work_counts = {
-        "pending": int(np.count_nonzero(state["work_status"] == WORK_STATUS_PENDING)),
-        "running": int(np.count_nonzero(state["work_status"] == 1)),
-        "done": int(np.count_nonzero(state["work_status"] == WORK_STATUS_DONE)),
-        "failed": int(np.count_nonzero(state["work_status"] == WORK_STATUS_FAILED)),
-    }
-    skip_reasons = [
-        str(_decode_bytes(value)).strip()
-        for value in state["asterisms_skip_reason"]
-        if str(_decode_bytes(value)).strip()
-    ]
-    reason_counts: dict[str, int] = {}
-    for reason in skip_reasons:
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    phase_counts: dict[str, int] | None = None
+    fields = phase_state_fields(current_phase)
+    if fields is not None:
+        status_field, _, _ = fields
+        phase_counts = {
+            "pending": int(np.count_nonzero(state[status_field] == WORK_STATUS_PENDING)),
+            "running": int(np.count_nonzero(state[status_field] == WORK_STATUS_RUNNING)),
+            "done": int(np.count_nonzero(state[status_field] == WORK_STATUS_DONE)),
+            "failed": int(np.count_nonzero(state[status_field] == WORK_STATUS_FAILED)),
+        }
 
     return {
         "build_path": str(build_path),
         "build_status": build_status,
-        "work_counts": work_counts,
-        "skip_reasons": reason_counts,
+        "current_phase": current_phase,
+        "phase_counts": phase_counts,
     }
 
 
@@ -310,9 +329,17 @@ def refresh_build_status(build_path: Path) -> str:
     """Derive and persist the current build-level status from outer-pixel rows."""
 
     state = load_state(build_path)
-    if np.any(state["work_status"] == WORK_STATUS_FAILED):
+    current_phase = load_current_phase(build_path)
+    fields = phase_state_fields(current_phase)
+    if fields is None:
+        if current_phase in (BUILD_PHASE_AGGREGATION, BUILD_PHASE_AUGMENTATION):
+            return BUILD_STATUS_INITIALIZED
+        raise BuildError(f"Unknown build phase {current_phase!r}")
+
+    status_field, _, _ = fields
+    if np.any(state[status_field] == WORK_STATUS_FAILED):
         status = BUILD_STATUS_FAILED
-    elif np.all(state["work_status"] == WORK_STATUS_DONE):
+    elif current_phase == BUILD_PHASE_TRAVERSAL and np.all(state[status_field] == WORK_STATUS_DONE):
         status = BUILD_STATUS_COMPLETED
     else:
         status = BUILD_STATUS_INITIALIZED
