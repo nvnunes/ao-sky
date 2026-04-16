@@ -142,12 +142,17 @@ model_root: /data/models
 ```
 
 If `aosky.conf` is present in the working project root, `init`, `restart`,
-`check`, and `fetch-dust` can use it automatically. Otherwise pass the root
-flags explicitly.
+`check`, `fetch-dust`, and `fetch-gaia` can use it automatically. Otherwise
+pass the root flags explicitly.
 
 Example CLI flow with explicit roots:
 
 ```bash
+./.conda/bin/ao-sky fetch-gaia \
+  --gaia-root /data/gaia \
+  --gaia-release dr3 \
+  --outer-level 6
+
 ./.conda/bin/ao-sky check \
   --gaia-root /data/gaia \
   --build-root /data/ao-builds \

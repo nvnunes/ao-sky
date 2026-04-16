@@ -11,14 +11,16 @@ import yaml
 import astropy.units as u
 from astropy.table import Table
 
-from ao_sky.build import init_build
+from ao_sky.build import init_build as real_init_build
 from ao_sky.build._models import BuildDefinition
+from ao_sky.build.config import load_build_definition as load_build_definition_yaml
 from ao_sky.build.control import load_build_roots
 from ao_sky.build.legacy_config import load_native_runtime
 from ao_sky.build.traversal import (
     _update_inner_pixel_asterism_performance,
     build_traversal_products,
 )
+from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
 from ao_sky.gaia._constants import GAIA_SCHEMA_COLUMNS
 from ao_sky.predict import PredictError
 from ao_sky.predict import backend as predict_backend
@@ -82,6 +84,52 @@ def _write_gaia_tge_map(
                 f"1,{healpix_id},{healpix_level},{a0},0.1,0.0,1.0,10,\"True\",0\n"
             )
     return filename
+
+
+def _write_gaia_summary(
+    gaia_root: Path,
+    *,
+    release: str,
+    outer_level: int,
+) -> Path:
+    num_pixels = 12 * (4 ** outer_level)
+    summary = np.zeros(
+        num_pixels,
+        dtype=[("outer_pix", "<i8"), ("star_count", "<i8"), ("loaded", "?")],
+    )
+    summary["outer_pix"] = np.arange(num_pixels, dtype=np.int64)
+    summary["loaded"] = True
+    return GaiaSummaryStore(
+        GaiaStoreConfig(root=gaia_root, release=release, healpix_level=outer_level)
+    ).write_summary(Table(summary))
+
+
+def init_build(
+    *,
+    definition_filename: Path,
+    gaia_root: Path | None,
+    build_root: Path | None,
+    dust_root: Path | None,
+    legacy_config_path: Path,
+    model_root: Path | None = None,
+    aosky_conf: Path | None = None,
+) -> Path:
+    definition, _ = load_build_definition_yaml(definition_filename)
+    if gaia_root is not None:
+        _write_gaia_summary(
+            Path(gaia_root),
+            release=definition.gaia_release,
+            outer_level=definition.outer_level,
+        )
+    return real_init_build(
+        definition_filename=definition_filename,
+        gaia_root=gaia_root,
+        build_root=build_root,
+        dust_root=dust_root,
+        legacy_config_path=legacy_config_path,
+        model_root=model_root,
+        aosky_conf=aosky_conf,
+    )
 
 
 def _empty_gaia_table() -> Table:

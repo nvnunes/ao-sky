@@ -7,10 +7,13 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 
+import numpy as np
+from astropy.table import Table
+
 from ao_sky import __version__, describe_package
 from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
-from ao_sky.build import check_runtime_roots, fetch_dust_data, init_build, load_build_definition, show_build
-from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig, apply_proper_motion
+from ao_sky.build import check_runtime_roots, fetch_dust_data, fetch_gaia_data, init_build, load_build_definition, show_build
+from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore, apply_proper_motion, fetch_gaia_store
 
 
 def test_package_root_exports_version() -> None:
@@ -34,7 +37,9 @@ def test_gaia_surface_is_importable() -> None:
     assert AsterismSearchOptions().max_stars == 1
     assert check_runtime_roots is not None
     assert fetch_dust_data is not None
+    assert fetch_gaia_data is not None
     assert init_build is not None
+    assert fetch_gaia_store is not None
     assert load_build_definition is not None
     assert show_build is not None
 
@@ -56,7 +61,7 @@ def test_module_cli_help_lists_build_commands() -> None:
         capture_output=True,
         text=True,
     )
-    assert "{status,init,run,restart,fetch-dust,check,show}" in result.stdout
+    assert "{status,init,run,restart,fetch-dust,fetch-gaia,check,show}" in result.stdout
 
 
 def test_module_cli_help_lists_fetch_dust_command() -> None:
@@ -68,6 +73,18 @@ def test_module_cli_help_lists_fetch_dust_command() -> None:
     )
     assert "--dust-root" in result.stdout
     assert "--aosky-conf" in result.stdout
+
+
+def test_module_cli_help_lists_fetch_gaia_command() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "ao_sky", "fetch-gaia", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--gaia-release" in result.stdout
+    assert "--outer-level" in result.stdout
+    assert "--force" in result.stdout
 
 
 def test_module_cli_help_lists_check_command() -> None:
@@ -125,6 +142,15 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
     gaia_root = tmp_path / "gaia"
     build_root = tmp_path / "builds"
     dust_root = tmp_path / "dust"
+    summary = np.zeros(
+        12,
+        dtype=[("outer_pix", "<i8"), ("star_count", "<i8"), ("loaded", "?")],
+    )
+    summary["outer_pix"] = np.arange(12, dtype=np.int64)
+    summary["loaded"] = True
+    GaiaSummaryStore(
+        GaiaStoreConfig(root=gaia_root, release="dr3", healpix_level=0)
+    ).write_summary(Table(summary))
 
     init_result = subprocess.run(
         [

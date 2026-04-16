@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..gaia import GaiaHealpixStore, GaiaStoreConfig
+from ..gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore
 from .augmentation import build_survey_extent_layers
 from .aggregation import build_maps
 from ._constants import (
@@ -67,6 +67,11 @@ def init_build(
         default_model_root=Path(legacy_config_path).resolve().parents[1] / "data" / "models",
         aosky_conf=aosky_conf,
     )
+    _require_gaia_summary(
+        gaia_root=roots.gaia_root,
+        gaia_release=definition.gaia_release,
+        outer_level=definition.outer_level,
+    )
     load_native_runtime(
         definition,
         legacy_config_path=legacy_config_path,
@@ -78,6 +83,58 @@ def init_build(
         roots=roots,
         legacy_config_path=legacy_config_path,
     )
+
+
+def _load_gaia_star_counts(
+    *,
+    gaia_root: Path,
+    gaia_release: str,
+    outer_level: int,
+) -> np.ndarray:
+    summary = GaiaSummaryStore(
+        GaiaStoreConfig(
+            root=gaia_root,
+            release=gaia_release,
+            healpix_level=outer_level,
+        )
+    ).load_summary()
+    expected_rows = 12 * (4 ** outer_level)
+    if len(summary) != expected_rows:
+        raise BuildError(
+            "Gaia summary has wrong size; rerun "
+            f"`ao-sky fetch-gaia --gaia-release {gaia_release} --outer-level {outer_level}`"
+        )
+    loaded = np.asarray(summary["loaded"], dtype=np.bool_)
+    if not np.all(loaded):
+        missing = np.flatnonzero(~loaded)
+        raise BuildError(
+            "Gaia summary is incomplete; rerun "
+            f"`ao-sky fetch-gaia --gaia-release {gaia_release} --outer-level {outer_level}` "
+            f"(first missing outer_pix={int(missing[0])})"
+        )
+    return np.asarray(summary["star_count"], dtype=np.int64)
+
+
+def _require_gaia_summary(
+    *,
+    gaia_root: Path,
+    gaia_release: str,
+    outer_level: int,
+) -> None:
+    try:
+        _load_gaia_star_counts(
+            gaia_root=gaia_root,
+            gaia_release=gaia_release,
+            outer_level=outer_level,
+        )
+    except Exception as exc:
+        if isinstance(exc, BuildError):
+            raise
+        raise BuildError(
+            "Missing Gaia summary for build initialization; run "
+            f"`ao-sky fetch-gaia --gaia-release {gaia_release} --outer-level {outer_level}` "
+            "first"
+        ) from exc
 
 
 def build_outer_pixel_products(build_path: Path, outer_pix: int) -> None:
@@ -157,6 +214,12 @@ def _run_traversal_phase(build_path: Path) -> tuple[bool, dict[str, int]]:
 
     definition = load_persisted_build_definition(build_path)
     build_artifact_root(build_path, definition).mkdir(parents=True, exist_ok=True)
+    roots = load_build_roots(build_path)
+    star_counts = _load_gaia_star_counts(
+        gaia_root=roots.gaia_root,
+        gaia_release=definition.gaia_release,
+        outer_level=definition.outer_level,
+    )
 
     repaired = _repair_stale_running_rows(build_path, status_field=status_field)
     set_build_status(build_path, BUILD_STATUS_RUNNING)
@@ -165,6 +228,7 @@ def _run_traversal_phase(build_path: Path) -> tuple[bool, dict[str, int]]:
     scheduler = OuterPixelScheduler(
         outer_level=definition.outer_level,
         status_field=status_field,
+        star_counts=star_counts,
     )
     last_completed_outer_pix: int | None = None
     failed = False

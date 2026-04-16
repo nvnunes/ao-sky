@@ -51,6 +51,7 @@ commands:
 ```bash
 ./.conda/bin/ao-sky check --help
 ./.conda/bin/ao-sky fetch-dust --help
+./.conda/bin/ao-sky fetch-gaia --help
 ```
 
 When the public build surface changes, also smoke-check the build lifecycle.
@@ -85,6 +86,10 @@ asterisms_max_star_density: 6.0
 asterisms_max_bright_star_mag: 8.0
 asterisms_max_overlap: 0.66
 YAML
+./.conda/bin/ao-sky fetch-gaia \
+  --gaia-root "$tmpdir/gaia" \
+  --gaia-release dr3 \
+  --outer-level 0
 build_path="$(
   ./.conda/bin/ao-sky init "$tmpdir/build.yaml" \
     --gaia-root "$tmpdir/gaia" \

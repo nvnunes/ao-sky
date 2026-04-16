@@ -33,6 +33,13 @@ GAIA_SCHEMA_DTYPE: Final[tuple[tuple[str, str], ...]] = (
 )
 
 HDF5_DATASET_NAME: Final[str] = "gaia"
+GAIA_SUMMARY_FILENAME: Final[str] = "summary.h5"
+GAIA_SUMMARY_DATASET_NAME: Final[str] = "summary"
+GAIA_SUMMARY_DTYPE: Final[tuple[tuple[str, str], ...]] = (
+    ("outer_pix", "<i8"),
+    ("star_count", "<i8"),
+    ("loaded", "?"),
+)
 HDF5_COMPRESSION: Final[str] = "gzip"
 HDF5_COMPRESSION_OPTS: Final[int] = 9
 HDF5_SHUFFLE: Final[bool] = True

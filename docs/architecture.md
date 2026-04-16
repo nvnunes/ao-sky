@@ -130,11 +130,13 @@ The architecture uses distinct data layers with explicit ownership.
 
 - Raw Gaia DR3 per-outer-pixel HDF5 files.
 - Versioned by Gaia release and outer HEALPix level.
+- One shared Gaia summary artifact per Gaia release and outer HEALPix level.
 - Shared across all derived builds.
 - Stored without derived working bands.
 - Loaded through explicit schema-aware readers.
 - Stored at `<root>/gaia-<release>-hpx<healpix_level>/<hour>h/<sign><deg>/<outer_pix>/gaia.h5`.
 - Stored as one HDF5 dataset named `gaia` using `gzip=9` and `shuffle=True`.
+- The shared summary is stored at `<root>/gaia-<release>-hpx<healpix_level>/summary.h5`.
 
 ### Derived Build Artifacts
 
@@ -162,6 +164,7 @@ The architecture uses distinct data layers with explicit ownership.
 `ao-sky` uses an explicit build model for derived artifacts.
 
 - Gaia store has its own root and stable path contract.
+- Gaia summary is a Gaia-side artifact, not a build-side artifact.
 - Dust store has its own root and stable path contract.
 - Derived work happens inside explicit build directories.
 - Every build has:
@@ -193,6 +196,8 @@ Build execution is organized around restartable outer-pixel work.
 - Traversal should prefer neighbouring unfinished outer pixels whenever
   possible.
 - Work balancing should use star count or another practical work proxy.
+- Build creation depends on a shared Gaia summary for the configured Gaia
+  release and outer level.
 - Build state should record:
   - the current build phase
   - explicit per-phase outer-pixel status for `gaia_loading` and `traversal`

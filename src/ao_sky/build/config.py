@@ -221,6 +221,30 @@ def resolve_build_root_only(
     return resolved_build_root.expanduser().resolve()
 
 
+def resolve_gaia_root_only(
+    *,
+    gaia_root: Path | None,
+    aosky_conf: Path | None = None,
+    cwd: Path | None = None,
+) -> Path:
+    """Resolve only the Gaia root from CLI arguments or `aosky.conf`."""
+
+    candidates = resolve_runtime_root_candidates(
+        gaia_root=gaia_root,
+        build_root=None,
+        dust_root=None,
+        model_root=None,
+        aosky_conf=aosky_conf,
+        cwd=cwd,
+    )
+    resolved_gaia_root = candidates["gaia_root"]
+    if resolved_gaia_root is None:
+        raise BuildError(
+            "gaia_root must be provided either via CLI or aosky.conf"
+        )
+    return resolved_gaia_root.expanduser().resolve()
+
+
 def resolve_dust_root_only(
     *,
     dust_root: Path | None,

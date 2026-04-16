@@ -10,12 +10,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+import time
+from typing import TextIO
 
 import h5py
 import numpy as np
 from astropy.table import Table
 
 from ._constants import (
+    GAIA_SUMMARY_DATASET_NAME,
+    GAIA_SUMMARY_DTYPE,
+    GAIA_SUMMARY_FILENAME,
     GAIA_SCHEMA_COLUMNS,
     HDF5_COMPRESSION,
     HDF5_COMPRESSION_OPTS,
@@ -30,6 +36,29 @@ from ._schema import (
 )
 from ._query import query_healpix_table
 from .._paths import get_outer_pixel_bucket_path
+
+
+def _gaia_root_prefix(root: Path, release: str, healpix_level: int) -> Path:
+    return Path(root) / f"gaia-{release}-hpx{healpix_level}"
+
+
+def _build_empty_summary(num_pixels: int) -> np.ndarray:
+    summary = np.zeros(num_pixels, dtype=np.dtype(list(GAIA_SUMMARY_DTYPE)))
+    summary["outer_pix"] = np.arange(num_pixels, dtype=np.int64)
+    return summary
+
+
+def _emit_fetch_gaia_progress(
+    output: TextIO | None,
+    message: str,
+    *,
+    transient: bool = False,
+) -> None:
+    if output is None:
+        return
+    prefix = "\r" if transient else ""
+    suffix = "" if transient else "\n"
+    print(f"{prefix}{message}", end=suffix, file=output, flush=True)
 
 
 # Config
@@ -111,8 +140,11 @@ class GaiaHealpixStore:
         """
 
         return (
-            self.config.root
-            / f"gaia-{self.config.release}-hpx{self.config.healpix_level}"
+            _gaia_root_prefix(
+                self.config.root,
+                self.config.release,
+                self.config.healpix_level,
+            )
             / get_outer_pixel_bucket_path(self.config.healpix_level, outer_pix)
             / "gaia.h5"
         )
@@ -178,3 +210,177 @@ class GaiaHealpixStore:
                 compression_opts=HDF5_COMPRESSION_OPTS,
                 shuffle=HDF5_SHUFFLE,
             )
+
+
+class GaiaSummaryStore:
+    """Read and write the shared Gaia per-pixel summary for one release and level."""
+
+    def __init__(self, config: GaiaStoreConfig) -> None:
+        self.config = config
+
+    def summary_filename(self) -> Path:
+        return (
+            _gaia_root_prefix(
+                self.config.root,
+                self.config.release,
+                self.config.healpix_level,
+            )
+            / GAIA_SUMMARY_FILENAME
+        )
+
+    def load_summary(self) -> Table:
+        filename = self.summary_filename()
+        if not filename.is_file():
+            raise GaiaError(f"Missing Gaia summary file: {filename}")
+        with h5py.File(filename, "r") as handle:
+            array = self._require_summary_dataset(handle)[...]
+        return Table(array)
+
+    def write_summary(self, table: Table) -> Path:
+        filename = self.summary_filename()
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        data = np.asarray(table.as_array(), dtype=np.dtype(list(GAIA_SUMMARY_DTYPE)))
+        with NamedTemporaryFile(
+            dir=filename.parent,
+            prefix=f".{filename.stem}-",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_handle:
+            tmp_path = Path(tmp_handle.name)
+        try:
+            with h5py.File(tmp_path, "w") as handle:
+                handle.create_dataset(
+                    GAIA_SUMMARY_DATASET_NAME,
+                    data=data,
+                    compression=HDF5_COMPRESSION,
+                    compression_opts=HDF5_COMPRESSION_OPTS,
+                    shuffle=HDF5_SHUFFLE,
+                )
+            tmp_path.replace(filename)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+        return filename
+
+    def initialize_summary(self, num_pixels: int) -> Path:
+        """Ensure the shared summary file exists and matches one dense level."""
+
+        filename = self.summary_filename()
+        if filename.is_file():
+            with h5py.File(filename, "r") as handle:
+                self._require_summary_dataset(handle, expected_num_pixels=num_pixels)
+            return filename
+        return self.write_summary(Table(_build_empty_summary(num_pixels)))
+
+    def open_summary_for_update(self, num_pixels: int) -> tuple[h5py.File, h5py.Dataset]:
+        """Open the shared summary file for in-place row updates."""
+
+        filename = self.initialize_summary(num_pixels)
+        handle = h5py.File(filename, "r+")
+        try:
+            dataset = self._require_summary_dataset(
+                handle,
+                expected_num_pixels=num_pixels,
+            )
+        except Exception:
+            handle.close()
+            raise
+        return handle, dataset
+
+    def _require_summary_dataset(
+        self,
+        handle: h5py.File,
+        *,
+        expected_num_pixels: int | None = None,
+    ) -> h5py.Dataset:
+        filename = Path(handle.filename)
+        if GAIA_SUMMARY_DATASET_NAME not in handle:
+            raise GaiaError(
+                f"Missing {GAIA_SUMMARY_DATASET_NAME!r} dataset in Gaia summary file {filename}"
+            )
+        dataset = handle[GAIA_SUMMARY_DATASET_NAME]
+        dtype_names = tuple(dataset.dtype.names or ())
+        expected_names = tuple(name for name, _ in GAIA_SUMMARY_DTYPE)
+        if dtype_names != expected_names:
+            raise GaiaError(
+                "Stored Gaia summary dataset does not match the summary schema: "
+                f"expected {expected_names}, got {dtype_names}"
+            )
+        if expected_num_pixels is not None and len(dataset) != expected_num_pixels:
+            raise GaiaError(
+                "Stored Gaia summary dataset does not match the requested HEALPix level: "
+                f"expected {expected_num_pixels} rows, got {len(dataset)}"
+            )
+        if expected_num_pixels is not None and not np.array_equal(
+            dataset["outer_pix"],
+            np.arange(expected_num_pixels, dtype=np.int64),
+        ):
+            raise GaiaError(
+                "Stored Gaia summary dataset does not use the required dense outer_pix ordering"
+            )
+        return dataset
+
+
+def fetch_gaia_store(
+    config: GaiaStoreConfig,
+    *,
+    force_reload: bool = False,
+    output: TextIO | None = None,
+) -> Path:
+    """Materialize one full-sky Gaia store and refresh its shared summary."""
+
+    store = GaiaHealpixStore(config)
+    summary_store = GaiaSummaryStore(config)
+    num_pixels = 12 * (4 ** config.healpix_level)
+    _emit_fetch_gaia_progress(
+        output,
+        f"Loading Gaia outer pixels for release {config.release} at level {config.healpix_level}:",
+    )
+    summary_handle, summary_dataset = summary_store.open_summary_for_update(num_pixels)
+    start_time = time.time()
+    last_time = start_time
+    loaded_pixels = 0
+    skipped_pixels = 0
+    try:
+        for outer_pix in range(num_pixels):
+            filename = store.healpix_filename(outer_pix)
+            existed = filename.is_file()
+            already_loaded = bool(summary_dataset[outer_pix]["loaded"])
+            if existed and already_loaded and not force_reload:
+                skipped_pixels += 1
+            else:
+                summary_dataset[outer_pix] = (outer_pix, 0, False)
+                summary_handle.flush()
+                final_table = store.load_healpix(outer_pix, force_reload=force_reload)
+                summary_dataset[outer_pix] = (
+                    outer_pix,
+                    len(final_table),
+                    True,
+                )
+                summary_handle.flush()
+                loaded_pixels += 1
+            now = time.time()
+            current_time = time.strftime("%H:%M:%S", time.localtime(now))
+            _emit_fetch_gaia_progress(
+                output,
+                (
+                    f"  {current_time}: {outer_pix + 1}/{num_pixels} "
+                    f"(1px in {now - last_time:.2f}s, {loaded_pixels} loaded, "
+                    f"{skipped_pixels} skipped)          "
+                ),
+                transient=True,
+            )
+            last_time = now
+    finally:
+        summary_handle.close()
+
+    _emit_fetch_gaia_progress(output, "")
+    total_time = time.time() - start_time
+    _emit_fetch_gaia_progress(
+        output,
+        (
+            f"  done: {num_pixels}px in {total_time:.1f}s "
+            f"({loaded_pixels} loaded, {skipped_pixels} skipped)"
+        ),
+    )
+    return summary_store.summary_filename()

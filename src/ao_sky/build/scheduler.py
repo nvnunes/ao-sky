@@ -19,14 +19,23 @@ class OuterPixelScheduler:
     - local continuation uses immediate neighbours at the build outer level
     - neighbour order follows `get_pixel_neighbours(...)`
     - local traversal is depth-first
-    - when the local frontier is exhausted, the next seed is the lowest
+    - when the local frontier is exhausted, the next seed is chosen by the
+      optional star-count proxy, with lowest outer-pixel id as the tie-breaker
+    - when no star-count proxy is available, the next seed is the lowest
       unfinished outer-pixel id
     - each pixel is selected at most once per run
     """
 
-    def __init__(self, *, outer_level: int, status_field: str = "traversal_status") -> None:
+    def __init__(
+        self,
+        *,
+        outer_level: int,
+        status_field: str = "traversal_status",
+        star_counts: np.ndarray | None = None,
+    ) -> None:
         self.outer_level = outer_level
         self.status_field = status_field
+        self.star_counts = None if star_counts is None else np.asarray(star_counts, dtype=np.int64)
         self._frontier: list[int] = []
         self._selected: set[int] = set()
         self._last_completed_seen: int | None = None
@@ -50,7 +59,7 @@ class OuterPixelScheduler:
                 self._selected.add(outer_pix)
                 return outer_pix
 
-        outer_pix = self._lowest_unfinished_outer_pix(state)
+        outer_pix = self._best_unfinished_outer_pix(state)
         if outer_pix is None:
             return None
         self._selected.add(outer_pix)
@@ -78,11 +87,28 @@ class OuterPixelScheduler:
         for outer_pix in reversed(selectable):
             self._frontier.append(outer_pix)
 
-    def _lowest_unfinished_outer_pix(self, state: np.ndarray) -> int | None:
+    def _best_unfinished_outer_pix(self, state: np.ndarray) -> int | None:
+        if self.star_counts is None:
+            for outer_pix in np.asarray(state["outer_pix"], dtype=np.int64):
+                if self._is_selectable(state, int(outer_pix)):
+                    return int(outer_pix)
+            return None
+
+        best_outer_pix: int | None = None
+        best_star_count = -1
         for outer_pix in np.asarray(state["outer_pix"], dtype=np.int64):
-            if self._is_selectable(state, int(outer_pix)):
-                return int(outer_pix)
-        return None
+            candidate = int(outer_pix)
+            if not self._is_selectable(state, candidate):
+                continue
+            star_count = int(self.star_counts[candidate])
+            if (
+                best_outer_pix is None
+                or star_count > best_star_count
+                or (star_count == best_star_count and candidate < best_outer_pix)
+            ):
+                best_outer_pix = candidate
+                best_star_count = star_count
+        return best_outer_pix
 
     def _is_selectable(self, state: np.ndarray, outer_pix: int) -> bool:
         if outer_pix in self._selected:

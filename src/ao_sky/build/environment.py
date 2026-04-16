@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TextIO
 
 from ..dust import fetch_gaia_tge_dataset, gaia_tge_map_filename
-from .config import resolve_dust_root_only, resolve_runtime_root_candidates
+from ..gaia import GaiaStoreConfig, fetch_gaia_store
+from .config import (
+    resolve_dust_root_only,
+    resolve_gaia_root_only,
+    resolve_runtime_root_candidates,
+)
 
 
 def fetch_dust_data(
@@ -22,6 +28,34 @@ def fetch_dust_data(
         cwd=cwd,
     )
     return fetch_gaia_tge_dataset(resolved_dust_root)
+
+
+def fetch_gaia_data(
+    *,
+    gaia_root: Path | None,
+    gaia_release: str,
+    outer_level: int,
+    force: bool = False,
+    aosky_conf: Path | None = None,
+    cwd: Path | None = None,
+    output: TextIO | None = None,
+) -> Path:
+    """Resolve `gaia_root`, fetch one full Gaia store, and return the summary path."""
+
+    resolved_gaia_root = resolve_gaia_root_only(
+        gaia_root=gaia_root,
+        aosky_conf=aosky_conf,
+        cwd=cwd,
+    )
+    return fetch_gaia_store(
+        GaiaStoreConfig(
+            root=resolved_gaia_root,
+            release=gaia_release,
+            healpix_level=outer_level,
+        ),
+        force_reload=force,
+        output=output,
+    )
 
 
 def check_runtime_roots(

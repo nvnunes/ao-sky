@@ -18,11 +18,14 @@ The current package-supported Gaia API exposes:
 
 - `GaiaStoreConfig`
 - `GaiaHealpixStore`
+- `GaiaSummaryStore`
 - `GaiaError`
+- `fetch_gaia_store`
 - `apply_proper_motion`
 - `compute_legacy_r_magnitude`
 - `GAIA_SCHEMA_COLUMNS`
 - `HDF5_DATASET_NAME`
+- `GAIA_SUMMARY_DATASET_NAME`
 - `HDF5_COMPRESSION`
 - `HDF5_COMPRESSION_OPTS`
 - `HDF5_SHUFFLE`
@@ -45,12 +48,22 @@ The canonical raw Gaia path contract is:
 
 `<root>/gaia-<release>-hpx<healpix_level>/<hour>h/<sign><deg>/<outer_pix>/gaia.h5`
 
+The shared Gaia summary path contract is:
+
+`<root>/gaia-<release>-hpx<healpix_level>/summary.h5`
+
 The canonical stored dataset is:
 
 - HDF5 dataset name: `gaia`
 - compression: `gzip`
 - compression options: `9`
 - shuffle: `True`
+
+The shared Gaia summary dataset is:
+
+- HDF5 dataset name: `summary`
+- one dense row per outer pixel
+- fields: `outer_pix`, `star_count`, `loaded`
 
 ### `ao_sky.spatial`
 
@@ -80,6 +93,8 @@ The current package-supported build API exposes:
 
 - `BuildError`
 - `load_build_definition`
+- `fetch_gaia_data`
+- `resolve_gaia_root_only`
 - `resolve_build_roots`
 - `resolve_build_root_only`
 - `init_build`
@@ -102,6 +117,28 @@ Behavior:
 - if the canonical HDF5 file already exists and `force_reload=False`, read it
 - otherwise query the Gaia archive seam, write the canonical file, then return
   the canonical table
+
+### `GaiaSummaryStore.summary_filename() -> Path`
+
+Return the shared Gaia summary filename for one Gaia release and outer level.
+
+### `GaiaSummaryStore.load_summary() -> Table`
+
+Load the shared dense Gaia summary table for one Gaia release and outer level.
+
+### `fetch_gaia_store(config, *, force_reload=False, output=None) -> Path`
+
+Materialize the full-sky canonical Gaia store for one Gaia release and outer
+level, then refresh the shared Gaia summary from the final on-disk file state.
+
+Behavior:
+
+- ensure the dense shared `summary.h5` file exists before the full-sky pass
+- skip existing Gaia files unless `force_reload=True`
+- after each outer-pixel step, reopen the final on-disk Gaia file, count its
+  rows, and update the corresponding summary row immediately
+- leave partial summary progress behind if the run is interrupted or fails
+- when `output` is provided, emit legacy-style start, progress, and done lines
 
 ### `apply_proper_motion(table, *, epoch=None, dt_years=None) -> Table`
 
@@ -154,6 +191,8 @@ and create the build artifact layout.
 Behavior:
 
 - load a minimal build-definition YAML with the required build identity fields
+- require the matching shared Gaia summary to exist for the configured Gaia
+  release and outer level
 - resolve `gaia_root`, `build_root`, and `dust_root` from explicit arguments or `aosky.conf`
 - persist the resolved roots into `build.h5`
 

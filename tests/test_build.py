@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from gzip import open as gzip_open
 
@@ -15,7 +16,8 @@ from mocpy import MOC
 from ao_sky.build import (
     check_runtime_roots,
     fetch_dust_data,
-    init_build,
+    fetch_gaia_data,
+    init_build as real_init_build,
     restart_build,
     run_build,
     show_build,
@@ -42,6 +44,8 @@ from ao_sky.build._exceptions import BuildError
 from ao_sky.build.config import (
     load_build_definition as load_build_definition_yaml,
     resolve_dust_root_only,
+    resolve_gaia_root_only,
+    resolve_runtime_root_candidates,
 )
 from ao_sky.build.control import (
     load_build_definition,
@@ -54,6 +58,7 @@ from ao_sky.build.control import (
 )
 from ao_sky.build.scheduler import OuterPixelScheduler
 from ao_sky.build.artifacts import write_outer_artifact
+from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
 
 
 def _write_build_definition(
@@ -105,6 +110,66 @@ asterisms_max_overlap: 0.66
         encoding="utf-8",
     )
     return path
+
+
+def _write_gaia_summary(
+    gaia_root: Path,
+    *,
+    release: str,
+    outer_level: int,
+    star_counts: list[int] | None = None,
+    loaded: bool = True,
+) -> Path:
+    num_pixels = 12 * (4 ** outer_level)
+    counts = np.zeros(num_pixels, dtype=np.int64)
+    if star_counts is not None:
+        counts[: len(star_counts)] = np.asarray(star_counts, dtype=np.int64)
+    summary = np.zeros(
+        num_pixels,
+        dtype=[("outer_pix", "<i8"), ("star_count", "<i8"), ("loaded", "?")],
+    )
+    summary["outer_pix"] = np.arange(num_pixels, dtype=np.int64)
+    summary["star_count"] = counts
+    summary["loaded"] = loaded
+    return GaiaSummaryStore(
+        GaiaStoreConfig(root=gaia_root, release=release, healpix_level=outer_level)
+    ).write_summary(Table(summary))
+
+
+def init_build(
+    *,
+    definition_filename: Path,
+    gaia_root: Path | None,
+    build_root: Path | None,
+    dust_root: Path | None,
+    legacy_config_path: Path,
+    model_root: Path | None = None,
+    aosky_conf: Path | None = None,
+) -> Path:
+    definition, _ = load_build_definition_yaml(definition_filename)
+    resolved_roots = resolve_runtime_root_candidates(
+        gaia_root=gaia_root,
+        build_root=build_root,
+        dust_root=dust_root,
+        model_root=model_root,
+        aosky_conf=aosky_conf,
+    )
+    resolved_gaia_root = resolved_roots["gaia_root"]
+    if resolved_gaia_root is not None:
+        _write_gaia_summary(
+            resolved_gaia_root,
+            release=definition.gaia_release,
+            outer_level=definition.outer_level,
+        )
+    return real_init_build(
+        definition_filename=definition_filename,
+        gaia_root=gaia_root,
+        build_root=build_root,
+        dust_root=dust_root,
+        legacy_config_path=legacy_config_path,
+        model_root=model_root,
+        aosky_conf=aosky_conf,
+    )
 
 
 def _make_scheduler_state(statuses: list[int], *, field: str = "traversal_status") -> np.ndarray:
@@ -355,6 +420,24 @@ def test_resolve_dust_root_only_requires_cli_or_conf(tmp_path: Path) -> None:
         resolve_dust_root_only(dust_root=None, cwd=tmp_path)
 
 
+def test_resolve_gaia_root_only_uses_aosky_conf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    expected = tmp_path / "gaia"
+    (project_root / "aosky.conf").write_text(
+        f"gaia_root: {expected}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project_root)
+
+    assert resolve_gaia_root_only(gaia_root=None) == expected.resolve()
+
+
+def test_resolve_gaia_root_only_requires_cli_or_conf(tmp_path: Path) -> None:
+    with pytest.raises(BuildError, match="gaia_root must be provided"):
+        resolve_gaia_root_only(gaia_root=None, cwd=tmp_path)
+
+
 def test_check_runtime_roots_reports_ok_and_missing(tmp_path: Path) -> None:
     gaia_root = tmp_path / "gaia"
     build_root = tmp_path / "builds"
@@ -421,6 +504,58 @@ def test_fetch_dust_data_resolves_dust_root_from_aosky_conf(
     )
 
     assert fetch_dust_data(dust_root=None) == expected.resolve()
+
+
+def test_fetch_gaia_data_resolves_gaia_root_from_aosky_conf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    expected = tmp_path / "gaia" / "gaia-dr3-hpx0" / "summary.h5"
+    (project_root / "aosky.conf").write_text(
+        f"gaia_root: {tmp_path / 'gaia'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project_root)
+    monkeypatch.setattr(
+        "ao_sky.build.environment.fetch_gaia_store",
+        lambda config, force_reload=False, output=None: expected.resolve(),
+    )
+
+    assert fetch_gaia_data(gaia_root=None, gaia_release="dr3", outer_level=0) == expected.resolve()
+
+
+def test_fetch_gaia_data_propagates_force_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_fetch(config, force_reload: bool = False, output=None):
+        captured["root"] = config.root
+        captured["release"] = config.release
+        captured["level"] = config.healpix_level
+        captured["force_reload"] = force_reload
+        captured["output"] = output
+        return tmp_path / "gaia" / "gaia-dr3-hpx0" / "summary.h5"
+
+    monkeypatch.setattr("ao_sky.build.environment.fetch_gaia_store", fake_fetch)
+
+    output = io.StringIO()
+
+    fetch_gaia_data(
+        gaia_root=tmp_path / "gaia",
+        gaia_release="dr3",
+        outer_level=0,
+        force=True,
+        output=output,
+    )
+
+    assert captured == {
+        "root": (tmp_path / "gaia").resolve(),
+        "release": "dr3",
+        "level": 0,
+        "force_reload": True,
+        "output": output,
+    }
 
 
 def test_load_build_definition_parses_overlay_specs_and_resolves_relative_paths(
@@ -521,7 +656,23 @@ def test_load_build_definition_rejects_max_data_level_above_inner_level(tmp_path
         load_build_definition_yaml(definition)
 
 
-def test_scheduler_uses_lowest_unfinished_seed_when_no_anchor() -> None:
+def test_scheduler_uses_highest_star_count_seed_when_no_anchor() -> None:
+    scheduler = OuterPixelScheduler(
+        outer_level=0,
+        star_counts=np.array([1, 3, 7], dtype=np.int64),
+    )
+    state = _make_scheduler_state(
+        [
+            WORK_STATUS_DONE,
+            WORK_STATUS_FAILED,
+            WORK_STATUS_PENDING,
+        ]
+    )
+
+    assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=None) == 2
+
+
+def test_scheduler_falls_back_to_lowest_unfinished_seed_without_star_counts() -> None:
     scheduler = OuterPixelScheduler(outer_level=0)
     state = _make_scheduler_state(
         [
@@ -585,6 +736,20 @@ def test_scheduler_does_not_retry_failed_pixel_in_same_run(
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=0) == 1
     state["traversal_status"][1] = WORK_STATUS_FAILED
     assert scheduler.select_next_outer_pixel(state, last_completed_outer_pix=0) == 2
+
+
+def test_init_build_requires_matching_gaia_summary(tmp_path: Path) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+
+    with pytest.raises(BuildError, match="fetch-gaia --gaia-release dr3 --outer-level 0"):
+        real_init_build(
+            definition_filename=definition,
+            gaia_root=tmp_path / "gaia",
+            build_root=tmp_path / "builds",
+            dust_root=tmp_path / "dust",
+            legacy_config_path=legacy,
+        )
 
 
 def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
@@ -657,6 +822,40 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
             "coverage_resolved",
             "coverage_averaged",
         }
+
+
+def test_run_build_uses_gaia_summary_star_counts_for_initial_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    gaia_root = tmp_path / "gaia"
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=gaia_root,
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    _write_gaia_summary(
+        gaia_root,
+        release="dr3",
+        outer_level=0,
+        star_counts=[0, 3, 1, 9] + [0] * 8,
+    )
+    visited: list[int] = []
+
+    def fake_build_outer(build_path: Path, outer_pix: int) -> None:
+        visited.append(int(outer_pix))
+        update_state_row(build_path, int(outer_pix), traversal_status=WORK_STATUS_DONE)
+
+    monkeypatch.setattr("ao_sky.build.runner.build_outer_pixel_products", fake_build_outer)
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
+
+    run_build(build_path)
+
+    assert visited[0] == 3
 
 
 def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
