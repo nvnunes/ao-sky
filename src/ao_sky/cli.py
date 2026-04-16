@@ -34,6 +34,33 @@ def _add_gaia_root_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_traversal_execution_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of Traversal worker processes to use.",
+    )
+    parser.add_argument(
+        "--gaia-cache-entries",
+        type=int,
+        default=None,
+        help="Worker-local Gaia table cache entry target; 0 disables caching.",
+    )
+    parser.add_argument(
+        "--gaia-cache-mb",
+        type=int,
+        default=None,
+        help="Worker-local Gaia table cache memory cap in MiB; 0 disables caching.",
+    )
+    parser.add_argument(
+        "--region-level",
+        type=int,
+        default=None,
+        help="Coarse HEALPix level used for regional Traversal worker assignment.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level CLI parser."""
 
@@ -75,11 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("build", type=Path, help="Build directory to run.")
     run_parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of Traversal worker processes to use.",
+        "--aosky-conf",
+        type=Path,
+        default=None,
+        help="Optional aosky.conf YAML with Traversal execution defaults.",
     )
+    _add_traversal_execution_arguments(run_parser)
     run_parser.set_defaults(handler=_handle_run)
 
     restart_parser = subparsers.add_parser(
@@ -89,12 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     restart_parser.add_argument("ao_system_short_name", help="AO-system lineage name.")
     restart_parser.add_argument("config_short_name", help="Config lineage name.")
     restart_parser.add_argument("--build-root", type=Path, default=None, help="Resolved build root.")
-    restart_parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of Traversal worker processes to use.",
-    )
+    _add_traversal_execution_arguments(restart_parser)
     restart_parser.add_argument(
         "--aosky-conf",
         type=Path,
@@ -198,7 +221,16 @@ def _handle_init(args: argparse.Namespace) -> int:
 def _handle_run(args: argparse.Namespace) -> int:
     from .build import run_build
 
-    print(run_build(args.build, workers=args.workers))
+    print(
+        run_build(
+            args.build,
+            workers=args.workers,
+            gaia_cache_entries=args.gaia_cache_entries,
+            gaia_cache_mb=args.gaia_cache_mb,
+            region_level=args.region_level,
+            aosky_conf=args.aosky_conf,
+        )
+    )
     return 0
 
 
@@ -212,6 +244,9 @@ def _handle_restart(args: argparse.Namespace) -> int:
             build_root=args.build_root,
             aosky_conf=args.aosky_conf,
             workers=args.workers,
+            gaia_cache_entries=args.gaia_cache_entries,
+            gaia_cache_mb=args.gaia_cache_mb,
+            region_level=args.region_level,
         )
     )
     return 0

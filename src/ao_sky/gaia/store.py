@@ -149,7 +149,13 @@ class GaiaHealpixStore:
             / "gaia.h5"
         )
 
-    def load_healpix(self, outer_pix: int, *, force_reload: bool = False) -> Table:
+    def load_healpix(
+        self,
+        outer_pix: int,
+        *,
+        force_reload: bool = False,
+        read_only: bool = False,
+    ) -> Table:
         """Load one canonical raw Gaia table for an outer pixel.
 
         This method is the public entry point for raw Gaia access. When the
@@ -169,6 +175,10 @@ class GaiaHealpixStore:
                 ``healpix_level``.
             force_reload: When true, bypass any existing canonical file and
                 rewrite it from a fresh Gaia archive query.
+            read_only: When true, mark the returned table columns as
+                non-writeable. This protects canonical cached Gaia rows from
+                accidental in-place value mutation, but does not freeze table
+                structure.
 
         Returns:
             An `astropy.table.Table` in the canonical raw-store schema.
@@ -181,7 +191,10 @@ class GaiaHealpixStore:
 
         filename = self.healpix_filename(outer_pix)
         if filename.exists() and not force_reload:
-            return self._read_healpix_file(filename)
+            return _maybe_mark_read_only(
+                self._read_healpix_file(filename),
+                read_only=read_only,
+            )
 
         table = query_healpix_table(
             self.config.release,
@@ -189,7 +202,10 @@ class GaiaHealpixStore:
             outer_pix,
         )
         self._write_healpix_file(filename, table)
-        return coerce_table_to_canonical_gaia_schema(table)
+        return _maybe_mark_read_only(
+            coerce_table_to_canonical_gaia_schema(table),
+            read_only=read_only,
+        )
 
     def _read_healpix_file(self, filename: Path) -> Table:
         with h5py.File(filename, "r") as handle:
@@ -210,6 +226,13 @@ class GaiaHealpixStore:
                 compression_opts=HDF5_COMPRESSION_OPTS,
                 shuffle=HDF5_SHUFFLE,
             )
+
+
+def _maybe_mark_read_only(table: Table, *, read_only: bool) -> Table:
+    if read_only:
+        for name in table.colnames:
+            table[name].flags.writeable = False
+    return table
 
 
 class GaiaSummaryStore:

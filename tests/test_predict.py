@@ -16,7 +16,13 @@ from ao_sky.build._models import BuildDefinition
 from ao_sky.build.config import load_build_definition as load_build_definition_yaml
 from ao_sky.build.control import load_build_roots
 from ao_sky.build.legacy_config import load_native_runtime
+from ao_sky.build.runtime_gaia import RUNTIME_HPX_COLUMN, RuntimeGaiaHealpixStore
 from ao_sky.build.traversal import (
+    TraversalGeometry,
+    _filter_neighbours_by_galactic_latitude,
+    build_base_inner_table,
+    prepare_search_inputs,
+    _update_inner_pixel_asterism_field_mean,
     _update_inner_pixel_asterism_performance,
     build_traversal_products,
 )
@@ -26,6 +32,7 @@ from ao_sky.predict import PredictError
 from ao_sky.predict import backend as predict_backend
 from ao_sky.predict import service as predict_service
 from ao_sky.predict._models import AOSystemRuntime, PointPredictionBatch, PredictRuntime
+from ao_sky.spatial import get_pixel_skycoord
 
 
 def _write_legacy_config(path: Path) -> Path:
@@ -141,9 +148,63 @@ def _empty_gaia_table() -> Table:
     return table[list(GAIA_SCHEMA_COLUMNS)]
 
 
+def _gaia_table(
+    rows: list[tuple[int, float, float, float, float, float]],
+) -> Table:
+    return Table(
+        [
+            np.asarray([row[0] for row in rows], dtype=np.int64),
+            np.asarray([row[1] for row in rows], dtype=np.float64),
+            np.asarray([row[2] for row in rows], dtype=np.float64),
+            np.asarray([row[3] for row in rows], dtype=np.float64),
+            np.asarray([row[3] + 0.2 for row in rows], dtype=np.float64),
+            np.asarray([row[3] - 0.2 for row in rows], dtype=np.float64),
+            np.asarray([2016.0 for _ in rows], dtype=np.float64),
+            np.asarray([row[4] for row in rows], dtype=np.float64),
+            np.asarray([row[5] for row in rows], dtype=np.float64),
+            np.zeros(len(rows), dtype=np.bool_),
+            np.ones(len(rows), dtype=np.float64),
+        ],
+        names=GAIA_SCHEMA_COLUMNS,
+    )
+
+
 class _FakeStore:
-    def load_healpix(self, outer_pix: int) -> Table:
-        return _empty_gaia_table()
+    def load_healpix(
+        self,
+        outer_pix: int,
+        *,
+        force_reload: bool = False,
+        read_only: bool = False,
+    ) -> Table:
+        table = _empty_gaia_table()
+        table["R"] = np.array([], dtype=np.float64)
+        table[RUNTIME_HPX_COLUMN] = np.array([], dtype=np.int64)
+        return table
+
+
+class _RawGaiaStore:
+    def __init__(self, root: Path, tables: dict[int, Table]) -> None:
+        self.config = GaiaStoreConfig(root=root, release="dr3", healpix_level=0)
+        self.tables = tables
+        self.loads: list[int] = []
+
+    def healpix_filename(self, outer_pix: int) -> Path:
+        return Path(f"{outer_pix}/gaia.h5")
+
+    def load_healpix(
+        self,
+        outer_pix: int,
+        *,
+        force_reload: bool = False,
+        read_only: bool = False,
+    ) -> Table:
+        self.loads.append(int(outer_pix))
+        table = self.tables.get(int(outer_pix), _empty_gaia_table()).copy(copy_data=True)
+        if read_only:
+            for name in table.colnames:
+                table[name].flags.writeable = False
+        return table
 
 
 def test_load_native_runtime_applies_defaults_and_model_root(tmp_path: Path) -> None:
@@ -233,12 +294,14 @@ def _make_predict_runtime(
     model_root: Path,
     point_model: str = "point-a.pt",
     mean_model: str = "mean-a.pt",
+    fov: u.Quantity = 120.0 * u.arcsec,
+    min_galactic_latitude: float | None = None,
 ) -> PredictRuntime:
     ao_system = AOSystemRuntime(
         name="GNAO",
         band="R",
-        fov=120.0 * u.arcsec,
-        fov_1ngs=120.0 * u.arcsec,
+        fov=fov,
+        fov_1ngs=fov,
         lgs=(),
         min_wfs=2,
         max_wfs=2,
@@ -261,7 +324,7 @@ def _make_predict_runtime(
         outer_level=0,
         inner_level=1,
         epoch=2028.0,
-        min_galactic_latitude=None,
+        min_galactic_latitude=min_galactic_latitude,
         max_star_density=None,
         max_bright_star_mag=None,
         max_overlap=None,
@@ -275,6 +338,233 @@ def _make_predict_runtime(
         model_root=model_root,
         legacy_config_path=model_root / "legacy.yaml",
     )
+
+
+def test_runtime_gaia_store_caches_epoch_shifted_read_only_rows(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    raw = _gaia_table([(101, 10.0, 0.0, 12.0, 100.0, 50.0)])
+    base_store = _RawGaiaStore(tmp_path, {0: raw})
+    store = RuntimeGaiaHealpixStore(
+        base_store,
+        runtime,
+        max_entries=4,
+        max_bytes=1024 * 1024,
+    )
+
+    first = store.load_healpix(0)
+    second = store.load_healpix(0)
+    mutable = store.load_healpix(0, read_only=False)
+    mutable["ra"][0] = 99.0
+
+    assert first is second
+    assert base_store.loads == [0]
+    assert "R" in first.colnames
+    assert RUNTIME_HPX_COLUMN in first.colnames
+    assert not first["ra"].flags.writeable
+    assert first["ref_epoch"][0] == pytest.approx(runtime.epoch)
+    assert float(first["ra"][0]) != pytest.approx(float(raw["ra"][0]))
+    assert float(second["ra"][0]) != pytest.approx(99.0)
+    assert store.stats().hits == 2
+    assert store.stats().misses == 1
+
+
+def test_runtime_gaia_store_force_reload_replaces_cached_table(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    base_store = _RawGaiaStore(
+        tmp_path,
+        {0: _gaia_table([(101, 10.0, 0.0, 12.0, 100.0, 50.0)])},
+    )
+    store = RuntimeGaiaHealpixStore(
+        base_store,
+        runtime,
+        max_entries=4,
+        max_bytes=1024 * 1024,
+    )
+
+    first = store.load_healpix(0)
+    base_store.tables[0] = _gaia_table([(202, 20.0, 0.0, 13.0, 0.0, 0.0)])
+    refreshed = store.load_healpix(0, force_reload=True)
+    again = store.load_healpix(0)
+
+    assert base_store.loads == [0, 0]
+    assert first is not refreshed
+    assert refreshed is again
+    assert int(again["source_id"][0]) == 202
+
+
+def test_runtime_gaia_store_marks_invalid_coordinates_with_invalid_hpx(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    raw = _gaia_table(
+        [
+            (101, 10.0, 0.0, 12.0, 0.0, 0.0),
+            (202, np.nan, 0.0, 13.0, 0.0, 0.0),
+        ]
+    )
+    store = RuntimeGaiaHealpixStore(
+        _RawGaiaStore(tmp_path, {0: raw}),
+        runtime,
+        max_entries=4,
+        max_bytes=1024 * 1024,
+    )
+
+    table = store.load_healpix(0)
+
+    assert int(table[RUNTIME_HPX_COLUMN][0]) >= 0
+    assert int(table[RUNTIME_HPX_COLUMN][1]) == -1
+
+
+def test_prepare_search_inputs_uses_runtime_gaia_without_reapplying_epoch_shift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    raw = _gaia_table([(101, 10.0, 0.0, 12.0, 0.0, 0.0)])
+    store = RuntimeGaiaHealpixStore(
+        _RawGaiaStore(tmp_path, {0: raw}),
+        runtime,
+        max_entries=4,
+        max_bytes=1024 * 1024,
+    )
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.get_pixel_from_skycoord",
+        lambda *args, **kwargs: pytest.fail("runtime hpx14 was not reused"),
+    )
+
+    stars, ngs = prepare_search_inputs(store, runtime, 0)
+
+    assert stars["source_id"].tolist() == [101]
+    assert ngs["source_id"].tolist() == [101]
+    assert RUNTIME_HPX_COLUMN in stars.colnames
+
+
+def test_prepare_search_inputs_ignores_invalid_runtime_gaia_rows(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    raw = _gaia_table(
+        [
+            (101, 10.0, 0.0, 12.0, 0.0, 0.0),
+            (202, np.nan, 0.0, 13.0, 0.0, 0.0),
+        ]
+    )
+    store = RuntimeGaiaHealpixStore(
+        _RawGaiaStore(tmp_path, {0: raw}),
+        runtime,
+        max_entries=4,
+        max_bytes=1024 * 1024,
+    )
+
+    stars, ngs = prepare_search_inputs(store, runtime, 0)
+
+    assert stars["source_id"].tolist() == [101]
+    assert ngs["source_id"].tolist() == [101]
+    assert np.all(np.asarray(stars[RUNTIME_HPX_COLUMN], dtype=np.int64) >= 0)
+
+
+def test_build_base_inner_table_ignores_invalid_runtime_gaia_rows(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    coord = get_pixel_skycoord(runtime.outer_level, 0)
+    raw = _gaia_table(
+        [
+            (101, float(coord.ra.degree), float(coord.dec.degree), 12.0, 0.0, 0.0),
+            (202, np.nan, 0.0, 13.0, 0.0, 0.0),
+        ]
+    )
+    store = RuntimeGaiaHealpixStore(
+        _RawGaiaStore(tmp_path, {0: raw}),
+        runtime,
+        max_entries=4,
+        max_bytes=1024 * 1024,
+    )
+
+    inner = build_base_inner_table(store, runtime, 0)
+
+    assert int(np.sum(inner["star_count"])) == 1
+    assert int(np.sum(inner["ngs_count"])) == 1
+
+
+def test_build_base_inner_table_counts_raw_gaia_coordinates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    raw = _gaia_table([(101, 10.0, 0.0, 12.0, 100.0, 50.0)])
+    store = RuntimeGaiaHealpixStore(
+        _RawGaiaStore(tmp_path, {0: raw}),
+        runtime,
+        max_entries=4,
+        max_bytes=1024 * 1024,
+    )
+    projected_ra: list[float] = []
+
+    def fake_get_pixel_from_skycoord(level, skycoord):
+        projected_ra.append(float(np.atleast_1d(skycoord.ra.degree)[0]))
+        return np.zeros(len(skycoord), dtype=np.int64)
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.get_pixel_from_skycoord",
+        fake_get_pixel_from_skycoord,
+    )
+
+    inner = build_base_inner_table(store, runtime, 0)
+
+    assert int(np.sum(inner["star_count"])) == 1
+    assert projected_ra == [10.0]
+
+
+def test_traversal_geometry_reuses_inner_pixel_geometry(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    geometry = TraversalGeometry.from_runtime(runtime)
+
+    assert geometry.inner_pixs(0) is geometry.inner_pixs(0)
+    assert geometry.inner_centres(0) is geometry.inner_centres(0)
+
+
+def test_neighbour_latitude_filter_uses_outer_pixel_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        fov=30.0 * u.deg,
+        min_galactic_latitude=10.0,
+    )
+    geometry = TraversalGeometry.from_runtime(runtime)
+    stars = Table(
+        [
+            np.array([101, 202], dtype=np.int64),
+            np.array([0, 1], dtype=np.int64),
+        ],
+        names=("source_id", "source_outer_pix"),
+    )
+    seen_levels: list[int] = []
+
+    def fake_get_pixel_skycoord(level: int, pix: int):
+        seen_levels.append(int(level))
+        assert level == runtime.outer_level
+
+        class _B:
+            degree = 0.0 if pix == 1 else 90.0
+
+        class _Galactic:
+            b = _B()
+
+        class _Coord:
+            galactic = _Galactic()
+
+        return _Coord()
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.get_pixel_skycoord",
+        fake_get_pixel_skycoord,
+    )
+
+    filtered = _filter_neighbours_by_galactic_latitude(
+        stars,
+        outer_pix=0,
+        geometry=geometry,
+    )
+
+    assert filtered["source_id"].tolist() == [101]
+    assert seen_levels == [runtime.outer_level]
 
 
 def test_model_cache_key_includes_model_root_and_model_name(
@@ -420,7 +710,11 @@ def test_winner_fields_remain_local_when_neighbour_has_better_best_ee(
     )
     monkeypatch.setattr("ao_sky.build.traversal.clear_backend_cache", lambda: None)
 
-    winner_idxs, winner_angles = _update_inner_pixel_asterism_performance(runtime, inner, context)
+    winner_idxs, winner_angles, winner_ngs_payloads = _update_inner_pixel_asterism_performance(
+        runtime,
+        inner,
+        context,
+    )
 
     assert float(inner["best_ee"][0]) == pytest.approx(0.8)
     assert float(inner["winner_ee_resolved"][0]) == pytest.approx(0.7)
@@ -428,6 +722,230 @@ def test_winner_fields_remain_local_when_neighbour_has_better_best_ee(
     assert float(inner["winner_distance_arcsec"][0]) == pytest.approx(1.0)
     assert int(winner_idxs[0]) == 0
     assert float(winner_angles[0]) == pytest.approx(0.0)
+    assert winner_ngs_payloads[0] == [
+        {"zd": 1.0, "az": 0.0, "mag": 10.0},
+        {"zd": 2.0, "az": 90.0, "mag": 11.0},
+    ]
+
+
+def test_field_mean_reuses_winner_ngs_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = load_native_runtime(
+        BuildDefinition(
+            ao_system_short_name="GNAO",
+            config_short_name="baseline",
+            gaia_release="dr3",
+            outer_level=0,
+            inner_level=1,
+            max_data_level=1,
+            epoch=2028.0,
+        ),
+        legacy_config_path=_write_legacy_config(tmp_path / "legacy.yaml"),
+        model_root=tmp_path / "models",
+    )
+    inner = Table(
+        [
+            np.array([0], dtype=np.int64),
+            np.array([np.nan], dtype=np.float64),
+        ],
+        names=("pix", "winner_ee_averaged"),
+    )
+    payload = [
+        {"zd": 1.0, "az": 0.0, "mag": 10.0},
+        {"zd": 2.0, "az": 90.0, "mag": 11.0},
+    ]
+    winner_payloads = np.empty((1,), dtype=object)
+    winner_payloads[0] = payload
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal._get_valid_ngs_from_context_pair",
+        lambda *args, **kwargs: pytest.fail("winner NGS payload was recomputed"),
+    )
+    monkeypatch.setattr("ao_sky.build.traversal.get_mean_model", lambda runtime, surviving_stars: object())
+
+    def fake_predict_field_mean_batch(runtime, num_stars, model, ngs, rot_angles):
+        seen["num_stars"] = num_stars
+        seen["ngs"] = ngs
+        seen["rot_angles"] = rot_angles
+        return np.array([0.42], dtype=np.float64)
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.predict_field_mean_batch",
+        fake_predict_field_mean_batch,
+    )
+    monkeypatch.setattr("ao_sky.build.traversal.clear_backend_cache", lambda: None)
+
+    _update_inner_pixel_asterism_field_mean(
+        runtime,
+        inner,
+        context=object(),
+        winner_asterism_idxs=np.array([0], dtype=np.int64),
+        winner_angles=np.array([15.0], dtype=np.float64),
+        winner_ngs_payloads=winner_payloads,
+    )
+
+    assert float(inner["winner_ee_averaged"][0]) == pytest.approx(0.42)
+    assert seen == {
+        "num_stars": 2,
+        "ngs": [payload],
+        "rot_angles": [15.0],
+    }
+
+
+def test_build_traversal_products_uses_expanded_asterisms_for_inner_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    definition = BuildDefinition(
+        ao_system_short_name="GNAO",
+        config_short_name="baseline",
+        gaia_release="dr3",
+        outer_level=1,
+        inner_level=2,
+        max_data_level=2,
+        epoch=2028.0,
+    )
+    runtime = load_native_runtime(
+        definition,
+        legacy_config_path=legacy,
+        model_root=tmp_path / "models",
+    )
+    local_coord = get_pixel_skycoord(runtime.outer_level, 0)
+    nonlocal_coord = get_pixel_skycoord(runtime.outer_level, 1)
+    expanded_asterisms = Table()
+    expanded_asterisms["asterism_id"] = np.array([10, 20], dtype=np.int64)
+    expanded_asterisms["ra"] = np.array(
+        [local_coord.ra.deg, nonlocal_coord.ra.deg],
+        dtype=np.float64,
+    )
+    expanded_asterisms["dec"] = np.array(
+        [local_coord.dec.deg, nonlocal_coord.dec.deg],
+        dtype=np.float64,
+    )
+    expanded_asterisms["num_stars"] = np.array([2, 2], dtype=np.int64)
+    expanded_asterisms["pix"] = np.array([0, 4], dtype=np.int64)
+    for index in (1, 2, 3):
+        expanded_asterisms[f"star{index}_source_id"] = np.array(
+            [index, index + 10],
+            dtype=np.int64,
+        )
+        expanded_asterisms[f"star{index}_ra"] = np.array(
+            [local_coord.ra.deg, nonlocal_coord.ra.deg],
+            dtype=np.float64,
+        )
+        expanded_asterisms[f"star{index}_dec"] = np.array(
+            [local_coord.dec.deg, nonlocal_coord.dec.deg],
+            dtype=np.float64,
+        )
+        expanded_asterisms[f"star{index}_mag"] = np.array([10.0, 10.5], dtype=np.float64)
+
+    inner = Table(
+        [
+            np.array([0], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            np.array([1], dtype=np.int64),
+            np.array([np.nan], dtype=np.float64),
+            np.array([np.nan], dtype=np.float64),
+            np.array([np.nan], dtype=np.float64),
+            np.array([-1], dtype=np.int64),
+            np.array([np.nan], dtype=np.float64),
+            np.array([np.nan], dtype=np.float64),
+            np.array([np.nan], dtype=np.float64),
+            np.array([False], dtype=np.bool_),
+            np.array([False], dtype=np.bool_),
+        ],
+        names=(
+            "pix",
+            "star_count",
+            "ngs_count",
+            "asterism_count",
+            "best_ee",
+            "best_sr",
+            "best_fwhm",
+            "winner_asterism_id",
+            "winner_distance_arcsec",
+            "winner_ee_resolved",
+            "winner_ee_averaged",
+            "coverage_resolved",
+            "coverage_averaged",
+        ),
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal._build_expanded_outer_pixel_asterisms",
+        lambda store, runtime, outer_pix, **kwargs: (
+            _empty_gaia_table(),
+            _empty_gaia_table(),
+            expanded_asterisms,
+            get_pixel_skycoord(runtime.inner_level, np.asarray(expanded_asterisms["pix"])),
+        ),
+    )
+
+    def fake_build_base_inner_table(
+        store,
+        runtime,
+        outer_pix,
+        *,
+        geometry=None,
+        asterisms=None,
+    ):
+        seen["persisted_candidate_ids"] = np.asarray(
+            asterisms["asterism_id"],
+            dtype=np.int64,
+        ).tolist()
+        return inner.copy(copy_data=True)
+
+    monkeypatch.setattr("ao_sky.build.traversal.build_base_inner_table", fake_build_base_inner_table)
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.search_around_sky",
+        lambda *args, **kwargs: (
+            np.array([0, 0], dtype=np.int64),
+            np.array([0, 1], dtype=np.int64),
+            None,
+            None,
+        ),
+    )
+
+    def fake_update_performance(runtime, inner, context):
+        seen["context_candidate_ids"] = np.asarray(
+            context.asterisms["asterism_id"],
+            dtype=np.int64,
+        ).tolist()
+        seen["local_asterism_mask"] = context.local_asterism_mask.tolist()
+        inner["best_ee"][0] = 0.8
+        winner_payloads = np.empty((1,), dtype=object)
+        winner_payloads[:] = None
+        return (
+            np.array([-1], dtype=np.int64),
+            np.array([np.nan], dtype=np.float64),
+            winner_payloads,
+        )
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal._update_inner_pixel_asterism_performance",
+        fake_update_performance,
+    )
+    monkeypatch.setattr("ao_sky.build.traversal.add_gaia_a0_to_inner", lambda inner, **kwargs: inner)
+
+    asterisms, result_inner = build_traversal_products(
+        _FakeStore(),
+        runtime,
+        0,
+        dust_root=tmp_path / "dust",
+        max_data_level=2,
+    )
+
+    assert seen["persisted_candidate_ids"] == [10]
+    assert seen["context_candidate_ids"] == [10, 20]
+    assert seen["local_asterism_mask"] == [True, False]
+    assert asterisms["asterism_id"].tolist() == [10]
+    assert float(result_inner["best_ee"][0]) == pytest.approx(0.8)
 
 
 def test_build_traversal_products_skip_path_still_injects_dust(tmp_path: Path) -> None:

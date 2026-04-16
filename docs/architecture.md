@@ -199,9 +199,29 @@ Build execution is organized around restartable outer-pixel work.
 - Traversal should prefer neighbouring unfinished outer pixels whenever
   possible.
 - Work balancing should use star count or another practical work proxy.
-- Traversal can run with multiple joblib/loky process workers as an
-  execution-time option; worker count is not part of the persisted build
-  contract.
+- Traversal uses a long-lived worker runtime even when `workers=1`, and can run
+  with multiple regional process workers as an execution-time option; worker
+  count, regional scheduling, and Gaia memory-cache settings are not part of
+  the persisted build contract.
+- Canonical Gaia files remain raw on disk, but long-lived Traversal workers
+  use a runtime-local Gaia cache whose rows are shifted to the build epoch,
+  enriched with `R` and `hpx14`, and then marked read-only. Downstream
+  native Traversal logic expects this runtime row contract and derives
+  lower-level pixel assignments from `hpx14` instead of recomputing sky
+  projections. Raw-row compatibility remains at the lower-level asterism
+  loader boundary, not in the build Traversal hot path.
+- Retained local asterisms and rich inner Traversal products are derived from
+  each outer pixel's two-ring expanded Gaia-star footprint; they do not depend
+  on neighbouring pixels' derived asterism artifacts. The expansion is applied
+  before build-epoch proper-motion shifting, so stars that start just outside
+  the raw outer-pixel boundary can still be included if epoch shifting moves
+  them into the relevant edge footprint.
+- The two-ring asterism boundary is an internal fixed rule rather than a
+  runtime setting; it is the minimal integer-ring margin used to avoid the
+  insufficient one-ring self-contained boundary while providing a small
+  proper-motion buffer without adding another user-facing knob.
+- Cache-aware Traversal groups outer pixels by coarse HEALPix regions and keeps
+  Gaia table caches worker-local so build state remains parent-owned.
 - Build creation depends on a shared Gaia summary for the configured Gaia
   release and outer level.
 - Build state should record:

@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord, search_around_sky
-from astropy.table import Table, vstack
+from astropy.table import Table
 import numpy as np
 
 from ..asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
 from ..dust import add_gaia_a0_to_inner
-from ..gaia import GAIA_SCHEMA_COLUMNS, GaiaHealpixStore, apply_proper_motion, compute_legacy_r_magnitude
+from ..gaia import GAIA_SCHEMA_COLUMNS, GaiaHealpixStore, compute_legacy_r_magnitude
 from ..predict import (
     clear_backend_cache,
     get_mean_model,
@@ -23,8 +24,9 @@ from ..predict import (
     predict_field_mean_batch,
     predict_point_batch,
 )
-from ..predict._models import PredictRuntime
+from ..predict._models import PredictRuntime, SeeingBaselinePerformance
 from ..spatial import (
+    get_parent_pixel,
     get_pixel_area,
     get_pixel_from_skycoord,
     get_pixel_neighbours,
@@ -33,6 +35,113 @@ from ..spatial import (
     get_subpixels,
 )
 from ._exceptions import BuildError
+from .runtime_gaia import RUNTIME_HPX_COLUMN, RUNTIME_HPX_LEVEL
+
+ASTERISM_BOUNDARY_RINGS = 2
+
+
+@dataclass(slots=True)
+class TraversalGeometry:
+    """Worker-local geometry values reused while building outer pixels."""
+
+    outer_level: int
+    inner_level: int
+    fov_level: int
+    fov_level_area_arcmin2: float
+    inner_resolution: u.Quantity
+    baseline: SeeingBaselinePerformance
+    min_galactic_latitude: float | None
+    _inner_pixs: dict[int, np.ndarray] = field(default_factory=dict)
+    _inner_centres: dict[int, SkyCoord] = field(default_factory=dict)
+    _skip_asterisms: dict[int, tuple[bool, str]] = field(default_factory=dict)
+
+    @classmethod
+    def from_runtime(cls, runtime: PredictRuntime) -> TraversalGeometry:
+        """Build static traversal geometry from the native runtime contract."""
+
+        fov_level = _get_level_with_resolution(runtime.ao_system.fov)
+        return cls(
+            outer_level=runtime.outer_level,
+            inner_level=runtime.inner_level,
+            fov_level=fov_level,
+            fov_level_area_arcmin2=get_pixel_area(fov_level).to(u.arcmin**2).value,
+            inner_resolution=get_pixel_resolution(runtime.inner_level),
+            baseline=get_seeing_baseline_performance(runtime),
+            min_galactic_latitude=runtime.min_galactic_latitude,
+        )
+
+    def inner_pixs(self, outer_pix: int) -> np.ndarray:
+        outer_pix = int(outer_pix)
+        if outer_pix not in self._inner_pixs:
+            self._inner_pixs[outer_pix] = get_subpixels(
+                self.outer_level,
+                outer_pix,
+                self.inner_level,
+            )
+        return self._inner_pixs[outer_pix]
+
+    def inner_centres(self, outer_pix: int) -> SkyCoord:
+        outer_pix = int(outer_pix)
+        if outer_pix not in self._inner_centres:
+            self._inner_centres[outer_pix] = get_pixel_skycoord(
+                self.inner_level,
+                self.inner_pixs(outer_pix),
+            )
+        return self._inner_centres[outer_pix]
+
+    def should_skip_asterisms(self, outer_pix: int) -> tuple[bool, str]:
+        """Return the cached Galactic-latitude skip decision for an outer pixel."""
+
+        outer_pix = int(outer_pix)
+        if outer_pix not in self._skip_asterisms:
+            if self.min_galactic_latitude is None:
+                self._skip_asterisms[outer_pix] = (False, "")
+            else:
+                coord = get_pixel_skycoord(self.outer_level, outer_pix)
+                if abs(coord.galactic.b.degree) < self.min_galactic_latitude:
+                    self._skip_asterisms[outer_pix] = (
+                        True,
+                        f"min_galactic_latitude<{self.min_galactic_latitude:g}",
+                    )
+                else:
+                    self._skip_asterisms[outer_pix] = (False, "")
+        return self._skip_asterisms[outer_pix]
+
+
+def _require_runtime_gaia_columns(table: Table) -> None:
+    missing = [name for name in ("R", RUNTIME_HPX_COLUMN) if name not in table.colnames]
+    if missing:
+        raise BuildError(
+            "Native Traversal requires runtime Gaia rows with columns: "
+            + ", ".join(missing)
+        )
+
+
+def _get_runtime_table_pixels(table: Table, level: int) -> np.ndarray:
+    _require_runtime_gaia_columns(table)
+    if level > RUNTIME_HPX_LEVEL:
+        raise BuildError(
+            f"Runtime Gaia {RUNTIME_HPX_COLUMN} cannot derive finer level {level}"
+        )
+    hpx = np.asarray(table[RUNTIME_HPX_COLUMN], dtype=np.int64)
+    pixels = np.full(hpx.shape, -1, dtype=np.int64)
+    valid = hpx >= 0
+    if np.any(valid):
+        pixels[valid] = np.asarray(
+            get_parent_pixel(RUNTIME_HPX_LEVEL, hpx[valid], level),
+            dtype=np.int64,
+        )
+    return pixels
+
+
+def _valid_runtime_gaia_mask(table: Table) -> np.ndarray:
+    _require_runtime_gaia_columns(table)
+    return (
+        np.isfinite(np.asarray(table["ra"], dtype=np.float64))
+        & np.isfinite(np.asarray(table["dec"], dtype=np.float64))
+        & np.isfinite(np.asarray(table["R"], dtype=np.float64))
+        & (np.asarray(table[RUNTIME_HPX_COLUMN], dtype=np.int64) >= 0)
+    )
 
 
 def _get_level_with_resolution(target_resolution: u.Quantity) -> int:
@@ -43,8 +152,16 @@ def _get_level_with_resolution(target_resolution: u.Quantity) -> int:
     raise BuildError(f"Could not find HEALPix level for resolution {target_resolution}")
 
 
-def should_skip_asterisms(runtime: PredictRuntime, outer_pix: int) -> tuple[bool, str]:
+def should_skip_asterisms(
+    runtime: PredictRuntime,
+    outer_pix: int,
+    *,
+    geometry: TraversalGeometry | None = None,
+) -> tuple[bool, str]:
     """Return whether asterisms should be skipped for one outer pixel."""
+
+    if geometry is not None:
+        return geometry.should_skip_asterisms(outer_pix)
 
     if runtime.min_galactic_latitude is None:
         return False, ""
@@ -58,33 +175,66 @@ def should_skip_asterisms(runtime: PredictRuntime, outer_pix: int) -> tuple[bool
 def _get_band_values(table: Table, band: str) -> np.ndarray:
     if band in table.colnames:
         return np.asarray(table[band], dtype=np.float64)
-    if band == "R":
-        return compute_legacy_r_magnitude(table[list(GAIA_SCHEMA_COLUMNS)])
     raise BuildError(f"Unsupported build band {band!r}")
+
+
+def _get_inner_count_band_values(table: Table, band: str) -> np.ndarray:
+    if band in table.colnames:
+        return np.asarray(table[band], dtype=np.float64)
+    if band == "R":
+        return np.asarray(
+            compute_legacy_r_magnitude(table[list(GAIA_SCHEMA_COLUMNS)]),
+            dtype=np.float64,
+        )
+    raise BuildError(f"Unsupported build band {band!r}")
+
+
+def _get_inner_count_pixels(table: Table, level: int) -> np.ndarray:
+    pixels = np.full((len(table),), -1, dtype=np.int64)
+    valid = np.isfinite(np.asarray(table["ra"], dtype=np.float64)) & np.isfinite(
+        np.asarray(table["dec"], dtype=np.float64)
+    )
+    if np.any(valid):
+        pixels[valid] = np.asarray(
+            get_pixel_from_skycoord(
+                level,
+                SkyCoord(
+                    ra=table["ra"][valid],
+                    dec=table["dec"][valid],
+                    unit=(u.degree, u.degree),
+                ),
+            ),
+            dtype=np.int64,
+        )
+    return pixels
+
+
+def _load_inner_count_stars(store: GaiaHealpixStore, outer_pix: int) -> Table:
+    raw_store = getattr(store, "store", store)
+    return raw_store.load_healpix(outer_pix, read_only=True)
 
 
 def _filter_neighbours_by_galactic_latitude(
     stars: Table,
     *,
-    runtime: PredictRuntime,
     outer_pix: int,
-    neighbour_level: int | None,
+    geometry: TraversalGeometry,
 ) -> Table:
     if (
-        runtime.min_galactic_latitude is None
+        geometry.min_galactic_latitude is None
         or "source_outer_pix" not in stars.colnames
-        or neighbour_level is None
     ):
         return stars
 
     keep = np.ones(len(stars), dtype=np.bool_)
-    unique_source_pixels = np.unique(np.asarray(stars["source_outer_pix"], dtype=np.int64))
+    source_outer_pixs = np.asarray(stars["source_outer_pix"], dtype=np.int64)
+    unique_source_pixels = np.unique(source_outer_pixs)
     for source_outer_pix in unique_source_pixels:
         if source_outer_pix == outer_pix:
             continue
-        source_coord = get_pixel_skycoord(neighbour_level, int(source_outer_pix))
-        if abs(source_coord.galactic.b.degree) < runtime.min_galactic_latitude:
-            keep &= np.asarray(stars["source_outer_pix"], dtype=np.int64) != int(source_outer_pix)
+        skip, _ = geometry.should_skip_asterisms(int(source_outer_pix))
+        if skip:
+            keep &= source_outer_pixs != int(source_outer_pix)
     return stars[keep]
 
 
@@ -92,42 +242,29 @@ def prepare_search_inputs(
     store: GaiaHealpixStore,
     runtime: PredictRuntime,
     outer_pix: int,
+    *,
+    geometry: TraversalGeometry | None = None,
+    boundary_rings: int = ASTERISM_BOUNDARY_RINGS,
 ) -> tuple[Table, Table]:
     """Return the prepared search-star and NGS tables for one outer pixel."""
 
-    fov_level = _get_level_with_resolution(runtime.ao_system.fov)
+    geometry = geometry or TraversalGeometry.from_runtime(runtime)
     stars = load_asterism_stars(
         store,
         outer_pix,
-        neighbour_level=fov_level,
+        neighbour_level=geometry.fov_level,
+        boundary_rings=boundary_rings,
         include_locality=True,
     )
     stars = _filter_neighbours_by_galactic_latitude(
         stars,
-        runtime=runtime,
         outer_pix=outer_pix,
-        neighbour_level=fov_level,
+        geometry=geometry,
     )
-    stars["pix"] = get_pixel_from_skycoord(
-        fov_level,
-        SkyCoord(ra=stars["ra"], dec=stars["dec"], unit=(u.degree, u.degree)),
-    )
+    _require_runtime_gaia_columns(stars)
+    stars = stars[_valid_runtime_gaia_mask(stars)]
+    stars["pix"] = _get_runtime_table_pixels(stars, geometry.fov_level)
 
-    locality_columns = {
-        "is_local": np.asarray(stars["is_local"]).copy(),
-        "source_outer_pix": np.asarray(stars["source_outer_pix"]).copy(),
-        "pix": np.asarray(stars["pix"]).copy(),
-        "R": np.asarray(stars["R"]).copy(),
-    }
-    shifted = apply_proper_motion(
-        stars[list(GAIA_SCHEMA_COLUMNS)],
-        epoch=runtime.epoch,
-    )
-    for name, values in locality_columns.items():
-        shifted[name] = values
-    stars = shifted
-
-    stars = stars[~np.isnan(stars["ra"]) & ~np.isnan(stars["dec"]) & ~np.isnan(stars["R"])]
     ngs = stars[
         (stars["R"] >= runtime.ao_system.min_mag) & (stars["R"] < runtime.ao_system.max_mag)
     ]
@@ -137,8 +274,9 @@ def prepare_search_inputs(
             np.asarray(stars["pix"], dtype=np.int64),
             return_counts=True,
         )
-        fov_level_area = get_pixel_area(fov_level).to(u.arcmin**2).value
-        remove_pixs = unique_pixs[star_counts / fov_level_area > runtime.max_star_density]
+        remove_pixs = unique_pixs[
+            star_counts / geometry.fov_level_area_arcmin2 > runtime.max_star_density
+        ]
         if len(remove_pixs) > 0:
             ngs = ngs[~np.isin(ngs["pix"], remove_pixs)]
 
@@ -298,49 +436,52 @@ def _get_asterism_quality(asterisms: Table, runtime: PredictRuntime) -> np.ndarr
 
 def _filter_bright_star_exclusion(
     asterisms: Table,
+    centres: SkyCoord,
     stars: Table,
     runtime: PredictRuntime,
-) -> Table:
+) -> tuple[Table, SkyCoord]:
     threshold = runtime.max_bright_star_mag
     if threshold is None or len(asterisms) == 0:
-        return asterisms
+        return asterisms, centres
 
     bright_stars = stars[stars["R"] < threshold]
     if len(bright_stars) == 0:
-        return asterisms
+        return asterisms, centres
 
     bright_star_coords = SkyCoord(
         ra=bright_stars["ra"],
         dec=bright_stars["dec"],
         unit=(u.degree, u.degree),
     )
-    asterism_centres = SkyCoord(ra=asterisms["ra"], dec=asterisms["dec"], unit=(u.degree, u.degree))
     keep = np.asarray(
         [
             np.min(centre.separation(bright_star_coords))
             > 2.0 * runtime.ao_system.fov
-            for centre in asterism_centres
+            for centre in centres
         ],
         dtype=np.bool_,
     )
-    return asterisms[keep]
+    return asterisms[keep], centres[keep]
 
 
-def _filter_overlaps(asterisms: Table, runtime: PredictRuntime) -> Table:
+def _filter_overlaps(
+    asterisms: Table,
+    centres: SkyCoord,
+    runtime: PredictRuntime,
+    geometry: TraversalGeometry,
+) -> tuple[Table, SkyCoord]:
     threshold = runtime.max_overlap
     if threshold is None or len(asterisms) == 0:
-        return asterisms
+        return asterisms, centres
 
-    fov_level = _get_level_with_resolution(runtime.ao_system.fov)
     fov_radius = runtime.ao_system.fov.to(u.rad).value
     fov_1ngs_radius = runtime.ao_system.fov_1ngs.to(u.rad).value
-    centres = SkyCoord(ra=asterisms["ra"], dec=asterisms["dec"], unit=(u.degree, u.degree))
-    asterism_pixs = get_pixel_from_skycoord(fov_level, centres)
+    asterism_pixs = get_pixel_from_skycoord(geometry.fov_level, centres)
     keep = np.ones(len(asterisms), dtype=np.bool_)
     qualities = _get_asterism_quality(asterisms, runtime)
 
     for pix in np.unique(asterism_pixs):
-        search_pixs = np.concatenate([[pix], get_pixel_neighbours(fov_level, int(pix))])
+        search_pixs = np.concatenate([[pix], get_pixel_neighbours(geometry.fov_level, int(pix))])
         candidate_indexes = np.flatnonzero(keep & np.isin(asterism_pixs, search_pixs))
         if len(candidate_indexes) == 0:
             continue
@@ -362,11 +503,16 @@ def _filter_overlaps(asterisms: Table, runtime: PredictRuntime) -> Table:
                     skip[offset] = True
         current_pix = asterism_pixs[candidate_indexes] == pix
         keep[candidate_indexes[current_pix & skip]] = False
-    return asterisms[keep]
+    return asterisms[keep], centres[keep]
 
 
-def _filter_relative_constraints(asterisms: Table, runtime: PredictRuntime) -> Table:
+def _filter_relative_constraints(
+    asterisms: Table,
+    centres: SkyCoord,
+    runtime: PredictRuntime,
+) -> tuple[Table, SkyCoord]:
     result = asterisms
+    result_centres = centres
     if runtime.ao_system.max_rel_sep > 0:
         keep = (
             np.asarray(result["relative_separation"], dtype=np.float64) >= runtime.ao_system.min_rel_sep
@@ -374,6 +520,7 @@ def _filter_relative_constraints(asterisms: Table, runtime: PredictRuntime) -> T
             np.asarray(result["relative_separation"], dtype=np.float64) < runtime.ao_system.max_rel_sep
         )
         result = result[keep]
+        result_centres = result_centres[keep]
     if runtime.ao_system.max_rel_area > 0 and len(result) > 0:
         keep = (
             np.asarray(result["relative_area"], dtype=np.float64) >= runtime.ao_system.min_rel_area
@@ -381,17 +528,57 @@ def _filter_relative_constraints(asterisms: Table, runtime: PredictRuntime) -> T
             np.asarray(result["relative_area"], dtype=np.float64) < runtime.ao_system.max_rel_area
         )
         result = result[keep]
-    return result
+        result_centres = result_centres[keep]
+    return result, result_centres
 
 
 def build_outer_pixel_asterisms(
     store: GaiaHealpixStore,
     runtime: PredictRuntime,
     outer_pix: int,
+    *,
+    geometry: TraversalGeometry | None = None,
 ) -> tuple[Table, Table, Table]:
     """Return the search stars, filtered NGS, and retained asterisms."""
 
-    stars, ngs = prepare_search_inputs(store, runtime, outer_pix)
+    stars, ngs, asterisms, _ = _build_expanded_outer_pixel_asterisms(
+        store,
+        runtime,
+        outer_pix,
+        geometry=geometry,
+    )
+    if len(asterisms) == 0:
+        return stars, ngs, asterisms
+
+    keep = (
+        get_parent_pixel(
+            runtime.inner_level,
+            np.asarray(asterisms["pix"], dtype=np.int64),
+            runtime.outer_level,
+        )
+        == int(outer_pix)
+    )
+    return stars, ngs, asterisms[keep]
+
+
+def _build_expanded_outer_pixel_asterisms(
+    store: GaiaHealpixStore,
+    runtime: PredictRuntime,
+    outer_pix: int,
+    *,
+    geometry: TraversalGeometry | None = None,
+    boundary_rings: int = ASTERISM_BOUNDARY_RINGS,
+) -> tuple[Table, Table, Table, SkyCoord]:
+    """Return retained asterisms from one outer pixel's expanded star footprint."""
+
+    geometry = geometry or TraversalGeometry.from_runtime(runtime)
+    stars, ngs = prepare_search_inputs(
+        store,
+        runtime,
+        outer_pix,
+        geometry=geometry,
+        boundary_rings=boundary_rings,
+    )
     options = AsterismSearchOptions(
         min_stars=runtime.ao_system.min_wfs,
         max_stars=runtime.ao_system.max_wfs,
@@ -400,18 +587,15 @@ def build_outer_pixel_asterisms(
         max_single_star_radius_arcsec=runtime.ao_system.fov_1ngs.to(u.arcsec).value / 2.0,
     )
     asterisms = find_asterisms(ngs, options).copy(copy_data=True)
-    asterisms = _filter_bright_star_exclusion(asterisms, stars, runtime)
-    asterisms = _filter_overlaps(asterisms, runtime)
-    asterisms = _filter_relative_constraints(asterisms, runtime)
     centres = SkyCoord(ra=asterisms["ra"], dec=asterisms["dec"], unit=(u.degree, u.degree))
-    keep = get_pixel_from_skycoord(runtime.outer_level, centres) == int(outer_pix)
-    asterisms = asterisms[keep]
+    asterisms, centres = _filter_bright_star_exclusion(asterisms, centres, stars, runtime)
+    asterisms, centres = _filter_overlaps(asterisms, centres, runtime, geometry)
+    asterisms, centres = _filter_relative_constraints(asterisms, centres, runtime)
     if len(asterisms) > 0:
-        centres = SkyCoord(ra=asterisms["ra"], dec=asterisms["dec"], unit=(u.degree, u.degree))
         asterisms["pix"] = get_pixel_from_skycoord(runtime.inner_level, centres)
     else:
         asterisms["pix"] = np.array([], dtype=np.int64)
-    return stars, ngs, asterisms
+    return stars, ngs, asterisms, centres
 
 
 def _empty_persisted_asterisms() -> Table:
@@ -480,22 +664,25 @@ def build_base_inner_table(
     runtime: PredictRuntime,
     outer_pix: int,
     *,
+    geometry: TraversalGeometry | None = None,
     asterisms: Table | None = None,
 ) -> Table:
     """Return the dense base inner table for one outer pixel."""
 
-    local_stars = store.load_healpix(outer_pix)
-    pixs = get_subpixels(runtime.outer_level, outer_pix, runtime.inner_level)
+    geometry = geometry or TraversalGeometry.from_runtime(runtime)
+    local_stars = _load_inner_count_stars(store, outer_pix)
+    pixs = geometry.inner_pixs(outer_pix)
 
-    gaia_pixs = get_pixel_from_skycoord(
-        runtime.inner_level,
-        SkyCoord(ra=local_stars["ra"], dec=local_stars["dec"], unit=(u.degree, u.degree)),
+    gaia_pixs = _get_inner_count_pixels(local_stars, runtime.inner_level)
+    valid_gaia_pixs = np.asarray(gaia_pixs, dtype=np.int64) >= 0
+    unique_pixs, counts = np.unique(
+        np.asarray(gaia_pixs, dtype=np.int64)[valid_gaia_pixs],
+        return_counts=True,
     )
-    unique_pixs, counts = np.unique(np.asarray(gaia_pixs, dtype=np.int64), return_counts=True)
     count_map = dict(zip(unique_pixs, counts, strict=False))
 
-    band_values = _get_band_values(local_stars, runtime.ao_system.band)
-    ngs_mask = np.isfinite(band_values)
+    band_values = _get_inner_count_band_values(local_stars, runtime.ao_system.band)
+    ngs_mask = valid_gaia_pixs & np.isfinite(band_values)
     ngs_mask &= band_values >= runtime.ao_system.min_mag
     ngs_mask &= band_values < runtime.ao_system.max_mag
     if np.any(ngs_mask):
@@ -516,7 +703,7 @@ def build_base_inner_table(
     else:
         asterism_count_map = {}
 
-    baseline = get_seeing_baseline_performance(runtime)
+    baseline = geometry.baseline
     size = len(pixs)
     return Table(
         [
@@ -558,58 +745,46 @@ def _get_plane_offsets_arcsec(reference_coord: SkyCoord, skycoords: SkyCoord) ->
 
 
 def _build_context(
-    store: GaiaHealpixStore,
     runtime: PredictRuntime,
     outer_pix: int,
-    local_asterisms: Table,
+    asterisms: Table,
+    local_asterism_mask: np.ndarray,
+    *,
+    geometry: TraversalGeometry | None = None,
 ) -> SimpleNamespace:
+    geometry = geometry or TraversalGeometry.from_runtime(runtime)
     context = SimpleNamespace()
     context.outer_pix = outer_pix
     context.pixel_idxs = np.array([], dtype=np.int64)
     context.asterism_idxs = np.array([], dtype=np.int64)
-    inner_pixs = get_subpixels(runtime.outer_level, outer_pix, runtime.inner_level)
-    context.inner_centres = get_pixel_skycoord(runtime.inner_level, inner_pixs)
+    context.inner_centres = geometry.inner_centres(outer_pix)
     outer_centre = get_pixel_skycoord(runtime.outer_level, outer_pix)
     context.inner_x, context.inner_y = _get_plane_offsets_arcsec(outer_centre, context.inner_centres)
 
-    tables: list[Table] = []
-    locality: list[np.ndarray] = []
-    if len(local_asterisms) > 0:
-        tables.append(local_asterisms)
-        locality.append(np.ones((len(local_asterisms),), dtype=np.bool_))
-
-    for pix in get_pixel_neighbours(runtime.outer_level, outer_pix):
-        skip_asterisms, _ = should_skip_asterisms(runtime, int(pix))
-        if skip_asterisms:
-            continue
-        _, _, neighbour_asterisms = build_outer_pixel_asterisms(store, runtime, int(pix))
-        if len(neighbour_asterisms) == 0:
-            continue
-        tables.append(neighbour_asterisms)
-        locality.append(np.zeros((len(neighbour_asterisms),), dtype=np.bool_))
-
-    if len(tables) == 0:
+    if len(asterisms) == 0:
         context.asterisms = None
         context.local_asterism_mask = np.array([], dtype=np.bool_)
         return context
 
-    context.asterisms = tables[0] if len(tables) == 1 else vstack(tables)
-    context.local_asterism_mask = np.concatenate(locality) if locality else np.array([], dtype=np.bool_)
+    context.asterisms = asterisms
+    context.local_asterism_mask = np.asarray(local_asterism_mask, dtype=np.bool_)
     asterism_catalog = SkyCoord(
         ra=context.asterisms["ra"],
         dec=context.asterisms["dec"],
         unit=(u.degree, u.degree),
     )
     context.asterism_x, context.asterism_y = _get_plane_offsets_arcsec(outer_centre, asterism_catalog)
-    inner_resolution = get_pixel_resolution(runtime.inner_level)
     context.pixel_idxs, context.asterism_idxs, _, _ = search_around_sky(
         context.inner_centres,
         asterism_catalog,
-        (runtime.ao_system.fov - inner_resolution) / 2,
+        (runtime.ao_system.fov - geometry.inner_resolution) / 2,
     )
     context.star_x = {}
     context.star_y = {}
+    num_stars = np.asarray(context.asterisms["num_stars"], dtype=np.int64)
     for star_idx in range(1, 4):
+        if not np.any(num_stars >= star_idx):
+            continue
         star_coords = SkyCoord(
             ra=context.asterisms[f"star{star_idx}_ra"],
             dec=context.asterisms[f"star{star_idx}_dec"],
@@ -658,13 +833,15 @@ def _update_inner_pixel_asterism_performance(
     context: SimpleNamespace,
     *,
     batch_size: int = 10000,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     field_radius = runtime.ao_system.fov.to(u.arcsec).value / 2.0
     field_radius_1ngs = runtime.ao_system.fov_1ngs.to(u.arcsec).value / 2.0
     winner_asterism_idxs = np.full((len(inner),), -1, dtype=np.int64)
     winner_angles = np.full((len(inner),), np.nan, dtype=np.float64)
+    winner_ngs_payloads = np.empty((len(inner),), dtype=object)
+    winner_ngs_payloads[:] = None
     if len(context.pixel_idxs) == 0:
-        return winner_asterism_idxs, winner_angles
+        return winner_asterism_idxs, winner_angles, winner_ngs_payloads
 
     candidate_pixel_idxs = context.pixel_idxs
     candidate_asterism_idxs = context.asterism_idxs
@@ -705,10 +882,11 @@ def _update_inner_pixel_asterism_performance(
                 model=model,
                 ngs=group["ngs"],
             )
-            for result_idx, (pixel_idx, asterism_idx, sr, ee, fwhm) in enumerate(
+            for result_idx, (pixel_idx, asterism_idx, ngs, sr, ee, fwhm) in enumerate(
                 zip(
                     group["pixel_idxs"],
                     group["asterism_idxs"],
+                    group["ngs"],
                     metrics.sr,
                     metrics.ee,
                     metrics.fwhm,
@@ -734,6 +912,7 @@ def _update_inner_pixel_asterism_performance(
                     inner["winner_ee_resolved"][pixel_idx] = float(ee)
                     winner_angles[pixel_idx] = float(metrics.ee_angle[result_idx])
                     winner_asterism_idxs[pixel_idx] = int(asterism_idx)
+                    winner_ngs_payloads[pixel_idx] = ngs
                     inner["winner_asterism_id"][pixel_idx] = int(
                         context.asterisms["asterism_id"][asterism_idx]
                     )
@@ -748,7 +927,7 @@ def _update_inner_pixel_asterism_performance(
                 ):
                     inner["best_fwhm"][pixel_idx] = float(fwhm)
         clear_backend_cache()
-    return winner_asterism_idxs, winner_angles
+    return winner_asterism_idxs, winner_angles, winner_ngs_payloads
 
 
 def _update_inner_pixel_asterism_field_mean(
@@ -757,6 +936,7 @@ def _update_inner_pixel_asterism_field_mean(
     context: SimpleNamespace,
     winner_asterism_idxs: np.ndarray,
     winner_angles: np.ndarray,
+    winner_ngs_payloads: np.ndarray | None = None,
     *,
     batch_size: int = 10000,
 ) -> None:
@@ -769,13 +949,15 @@ def _update_inner_pixel_asterism_field_mean(
     grouped_pairs: dict[int, dict[str, list]] = {}
     for pixel_idx in winner_pixel_idxs:
         asterism_idx = int(winner_asterism_idxs[pixel_idx])
-        ngs = _get_valid_ngs_from_context_pair(
-            context,
-            int(pixel_idx),
-            asterism_idx,
-            field_radius=field_radius,
-            field_radius_1ngs=field_radius_1ngs,
-        )
+        ngs = None if winner_ngs_payloads is None else winner_ngs_payloads[pixel_idx]
+        if ngs is None:
+            ngs = _get_valid_ngs_from_context_pair(
+                context,
+                int(pixel_idx),
+                asterism_idx,
+                field_radius=field_radius,
+                field_radius_1ngs=field_radius_1ngs,
+            )
         surviving_stars = len(ngs)
         if surviving_stars < runtime.ao_system.min_wfs:
             continue
@@ -817,12 +999,20 @@ def build_traversal_products(
     *,
     dust_root: Path,
     max_data_level: int,
+    geometry: TraversalGeometry | None = None,
 ) -> tuple[Table, Table]:
     """Return retained asterisms and the rich inner table for one outer pixel."""
 
-    skip_asterisms, _ = should_skip_asterisms(runtime, outer_pix)
+    geometry = geometry or TraversalGeometry.from_runtime(runtime)
+    skip_asterisms, _ = should_skip_asterisms(runtime, outer_pix, geometry=geometry)
     if skip_asterisms:
-        inner = build_base_inner_table(store, runtime, outer_pix, asterisms=None)
+        inner = build_base_inner_table(
+            store,
+            runtime,
+            outer_pix,
+            geometry=geometry,
+            asterisms=None,
+        )
         inner = add_gaia_a0_to_inner(
             inner,
             dust_root=dust_root,
@@ -833,12 +1023,46 @@ def build_traversal_products(
         )
         return _empty_persisted_asterisms(), inner
 
-    _, _, local_asterisms = build_outer_pixel_asterisms(store, runtime, outer_pix)
-    inner = build_base_inner_table(store, runtime, outer_pix, asterisms=local_asterisms)
-    if len(local_asterisms) > 0:
-        context = _build_context(store, runtime, outer_pix, local_asterisms)
+    _, _, expanded_asterisms, _ = _build_expanded_outer_pixel_asterisms(
+        store,
+        runtime,
+        outer_pix,
+        geometry=geometry,
+    )
+    if len(expanded_asterisms) > 0:
+        local_asterism_mask = (
+            get_parent_pixel(
+                runtime.inner_level,
+                np.asarray(expanded_asterisms["pix"], dtype=np.int64),
+                runtime.outer_level,
+            )
+            == int(outer_pix)
+        )
+        local_asterisms = expanded_asterisms[local_asterism_mask]
+    else:
+        local_asterism_mask = np.array([], dtype=np.bool_)
+        local_asterisms = expanded_asterisms
+    inner = build_base_inner_table(
+        store,
+        runtime,
+        outer_pix,
+        geometry=geometry,
+        asterisms=local_asterisms,
+    )
+    if len(expanded_asterisms) > 0:
+        context = _build_context(
+            runtime,
+            outer_pix,
+            expanded_asterisms,
+            local_asterism_mask,
+            geometry=geometry,
+        )
         if context.asterisms is not None and len(context.asterisms) > 0 and len(context.pixel_idxs) > 0:
-            winner_asterism_idxs, winner_angles = _update_inner_pixel_asterism_performance(
+            (
+                winner_asterism_idxs,
+                winner_angles,
+                winner_ngs_payloads,
+            ) = _update_inner_pixel_asterism_performance(
                 runtime,
                 inner,
                 context,
@@ -850,6 +1074,7 @@ def build_traversal_products(
                     context,
                     winner_asterism_idxs,
                     winner_angles,
+                    winner_ngs_payloads,
                 )
             inner["coverage_resolved"] = (
                 np.asarray(inner["winner_ee_resolved"], dtype=np.float64)

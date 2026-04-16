@@ -5,17 +5,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import os
-import subprocess
 import sys
 import tempfile
-import textwrap
+import time
 from pathlib import Path
 
 import astropy.units as u
 import h5py
 import numpy as np
-from astropy.coordinates import SkyCoord
 from astropy.table import Table
 import yaml
 
@@ -27,7 +24,6 @@ if str(SRC_ROOT) not in sys.path:
 
 LEGACY_CONFIG_FILENAME = REPO_ROOT.parent / "survey_tools" / "aomap" / "config.yaml"
 LEGACY_RUNTIME_ROOT = REPO_ROOT.parent / "survey_tools"
-LEGACY_PYTHON = LEGACY_RUNTIME_ROOT / ".conda" / "bin" / "python"
 GAIA_ROOT = Path("/Volumes/Data/Galaxy/aosky")
 DUST_ROOT = LEGACY_RUNTIME_ROOT / "data" / "dust"
 MODEL_ROOT = LEGACY_RUNTIME_ROOT / "data" / "models"
@@ -119,6 +115,14 @@ LOCAL_WINNER_DIVERGENCE_COLUMNS = frozenset(
         "coverage_averaged",
     }
 )
+BOUNDARY_OVERLAP_DIVERGENCE_COLUMNS = frozenset(
+    {
+        "asterism_count",
+        "best_sr",
+        "best_ee",
+        "best_fwhm",
+    }
+)
 
 NEW_TO_LEGACY_COLUMNS = {
     "asterism_id": "id",
@@ -157,20 +161,16 @@ EMPTY_LEGACY_COLUMN_DTYPES = {
 
 GaiaHealpixStore = None
 GaiaStoreConfig = None
-GAIA_SCHEMA_COLUMNS = None
-AsterismSearchOptions = None
-apply_proper_motion = None
 aggregate_maps = None
 init_build = None
 read_outer_dataset = None
-run_build = None
 run_traversal_phase = None
-find_asterisms = None
-load_asterism_stars = None
+resolve_traversal_execution_config = None
 BuildDefinition = None
 build_traversal_products = None
 load_live_legacy_traversal_outputs = None
 load_native_runtime = None
+RuntimeGaiaHealpixStore = None
 maps_artifact_filename = None
 outer_artifact_filename = None
 sample_gaia_a0_for_outer_pixel = None
@@ -181,11 +181,6 @@ OUTER_DATASET_INNER = None
 WORK_STATUS_DONE = None
 WORK_STATUS_PENDING = None
 get_parent_pixel = None
-get_pixel_area = None
-get_pixel_from_skycoord = None
-get_pixel_neighbours = None
-get_pixel_resolution = None
-get_pixel_skycoord = None
 get_subpixels = None
 
 MAPS_COMPARISON_COLUMNS = (
@@ -203,29 +198,23 @@ MAPS_COMPARISON_COLUMNS = (
 
 
 def _load_runtime() -> None:
-    global GaiaHealpixStore, GaiaStoreConfig, GAIA_SCHEMA_COLUMNS
-    global AsterismSearchOptions, BuildDefinition
-    global apply_proper_motion, find_asterisms, load_asterism_stars
-    global aggregate_maps, init_build, read_outer_dataset, run_build, run_traversal_phase
+    global GaiaHealpixStore, GaiaStoreConfig
+    global BuildDefinition
+    global aggregate_maps, init_build, read_outer_dataset, run_traversal_phase
+    global resolve_traversal_execution_config
     global build_traversal_products, load_live_legacy_traversal_outputs, load_native_runtime
+    global RuntimeGaiaHealpixStore
     global maps_artifact_filename, outer_artifact_filename, sample_gaia_a0_for_outer_pixel
     global write_outer_artifact
     global BUILD_FILENAME, OUTER_DATASET_ASTERISMS, OUTER_DATASET_INNER
     global WORK_STATUS_DONE, WORK_STATUS_PENDING
     global get_parent_pixel
-    global get_pixel_area, get_pixel_from_skycoord, get_pixel_neighbours
-    global get_pixel_resolution, get_pixel_skycoord, get_subpixels
+    global get_subpixels
 
     if GaiaHealpixStore is not None:
         return
 
-    from ao_sky.asterisms import (
-        AsterismSearchOptions as _AsterismSearchOptions,
-        find_asterisms as _find_asterisms,
-        load_asterism_stars as _load_asterism_stars,
-    )
     from ao_sky.build import init_build as _init_build
-    from ao_sky.build import run_build as _run_build
     from ao_sky.build.aggregation import aggregate_maps as _aggregate_maps
     from ao_sky.build._constants import (
         BUILD_FILENAME as _BUILD_FILENAME,
@@ -247,41 +236,34 @@ def _load_runtime() -> None:
     from ao_sky.build.legacy_runtime import (
         load_live_legacy_traversal_outputs as _load_live_legacy_traversal_outputs,
     )
+    from ao_sky.build.config import (
+        resolve_traversal_execution_config as _resolve_traversal_execution_config,
+    )
     from ao_sky.build.runner import _run_traversal_phase as _run_traversal_phase
+    from ao_sky.build.runtime_gaia import RuntimeGaiaHealpixStore as _RuntimeGaiaHealpixStore
     from ao_sky.build.traversal import build_traversal_products as _build_traversal_products
     from ao_sky.dust import sample_gaia_a0_for_outer_pixel as _sample_gaia_a0_for_outer_pixel
     from ao_sky.gaia import (
         GaiaHealpixStore as _GaiaHealpixStore,
         GaiaStoreConfig as _GaiaStoreConfig,
-        GAIA_SCHEMA_COLUMNS as _GAIA_SCHEMA_COLUMNS,
-        apply_proper_motion as _apply_proper_motion,
     )
     from ao_sky.spatial import (
         get_parent_pixel as _get_parent_pixel,
-        get_pixel_area as _get_pixel_area,
-        get_pixel_from_skycoord as _get_pixel_from_skycoord,
-        get_pixel_neighbours as _get_pixel_neighbours,
-        get_pixel_resolution as _get_pixel_resolution,
-        get_pixel_skycoord as _get_pixel_skycoord,
         get_subpixels as _get_subpixels,
     )
 
     GaiaHealpixStore = _GaiaHealpixStore
     GaiaStoreConfig = _GaiaStoreConfig
-    GAIA_SCHEMA_COLUMNS = _GAIA_SCHEMA_COLUMNS
-    AsterismSearchOptions = _AsterismSearchOptions
-    apply_proper_motion = _apply_proper_motion
     aggregate_maps = _aggregate_maps
     init_build = _init_build
     read_outer_dataset = _read_outer_dataset
-    run_build = _run_build
     run_traversal_phase = _run_traversal_phase
-    find_asterisms = _find_asterisms
-    load_asterism_stars = _load_asterism_stars
+    resolve_traversal_execution_config = _resolve_traversal_execution_config
     BuildDefinition = _BuildDefinition
     build_traversal_products = _build_traversal_products
     load_live_legacy_traversal_outputs = _load_live_legacy_traversal_outputs
     load_native_runtime = _load_native_runtime
+    RuntimeGaiaHealpixStore = _RuntimeGaiaHealpixStore
     maps_artifact_filename = _maps_artifact_filename
     outer_artifact_filename = _outer_artifact_filename
     sample_gaia_a0_for_outer_pixel = _sample_gaia_a0_for_outer_pixel
@@ -292,11 +274,6 @@ def _load_runtime() -> None:
     WORK_STATUS_DONE = _WORK_STATUS_DONE
     WORK_STATUS_PENDING = _WORK_STATUS_PENDING
     get_parent_pixel = _get_parent_pixel
-    get_pixel_area = _get_pixel_area
-    get_pixel_from_skycoord = _get_pixel_from_skycoord
-    get_pixel_neighbours = _get_pixel_neighbours
-    get_pixel_resolution = _get_pixel_resolution
-    get_pixel_skycoord = _get_pixel_skycoord
     get_subpixels = _get_subpixels
 
 
@@ -333,23 +310,6 @@ class LegacyComparisonConfig:
     legacy_config_filename: Path
     model_root: Path
     ao_system: LegacyAOSystem
-
-
-def _get_level_with_resolution(target_resolution: u.Quantity) -> int:
-    _load_runtime()
-    target = target_resolution.to(u.arcmin)
-    for level in range(0, 30):
-        if get_pixel_resolution(level).to(u.arcmin) <= target:
-            return level
-    raise ValueError(f"Could not find HEALPix level for resolution {target_resolution}")
-
-
-def _get_hour_deg_for_path(outer_pix: int, coord: SkyCoord) -> tuple[int, int]:
-    if outer_pix in SPECIAL_HOUR_PIXELS:
-        return 0, 50
-    hour = int(coord.ra.degree / 15.0)
-    deg = int(np.abs(coord.dec.degree) / 10.0) * 10
-    return hour, deg
 
 
 def _load_live_legacy_dust_values(
@@ -433,27 +393,6 @@ def _get_membership_key(table: Table, row_index: int) -> str:
     return "-".join(str(star_id) for star_id in valid_ids)
 
 
-def _get_circle_overlap_area(radius1: float, radius2: float, separation: float) -> float:
-    if separation >= radius1 + radius2:
-        return 0.0
-    if separation <= abs(radius1 - radius2):
-        return np.pi * min(radius1, radius2) ** 2
-
-    term1 = radius1**2 * np.arccos(
-        (separation**2 + radius1**2 - radius2**2) / (2.0 * separation * radius1)
-    )
-    term2 = radius2**2 * np.arccos(
-        (separation**2 + radius2**2 - radius1**2) / (2.0 * separation * radius2)
-    )
-    term3 = 0.5 * np.sqrt(
-        (-separation + radius1 + radius2)
-        * (separation + radius1 - radius2)
-        * (separation - radius1 + radius2)
-        * (separation + radius1 + radius2)
-    )
-    return float(term1 + term2 - term3)
-
-
 def _empty_legacy_asterism_table() -> Table:
     return Table(
         [np.array([], dtype=EMPTY_LEGACY_COLUMN_DTYPES[name]) for name in COMPARISON_COLUMNS],
@@ -520,317 +459,6 @@ def load_legacy_config(filename: Path, ao_system_name: str) -> LegacyComparisonC
     )
 
 
-def _filter_neighbours_by_galactic_latitude(
-    stars: Table,
-    *,
-    outer_level: int,
-    outer_pix: int,
-    neighbour_level: int | None,
-    min_galactic_latitude: float,
-    bypass_pixs: tuple[int, ...],
-) -> Table:
-    _load_runtime()
-    if outer_pix in bypass_pixs or "source_outer_pix" not in stars.colnames or neighbour_level is None:
-        return stars
-
-    keep = np.ones(len(stars), dtype=np.bool_)
-    unique_source_pixels = np.unique(np.asarray(stars["source_outer_pix"], dtype=np.int64))
-    for source_outer_pix in unique_source_pixels:
-        if source_outer_pix == outer_pix:
-            continue
-        source_coord = get_pixel_skycoord(neighbour_level, int(source_outer_pix))
-        if np.abs(source_coord.galactic.b.degree) < min_galactic_latitude:
-            keep &= np.asarray(stars["source_outer_pix"], dtype=np.int64) != int(source_outer_pix)
-    return stars[keep]
-
-
-def _prepare_new_star_table(
-    store: object,
-    config: LegacyComparisonConfig,
-    outer_pix: int,
-) -> tuple[Table, Table]:
-    _load_runtime()
-    fov_level = _get_level_with_resolution(config.ao_system.fov)
-    stars = load_asterism_stars(
-        store,
-        outer_pix,
-        neighbour_level=fov_level,
-        include_locality=True,
-    )
-    stars = _filter_neighbours_by_galactic_latitude(
-        stars,
-        outer_level=config.outer_level,
-        outer_pix=outer_pix,
-        neighbour_level=fov_level,
-        min_galactic_latitude=config.asterisms_min_galactic_latitude,
-        bypass_pixs=config.asterisms_galactic_latitude_bypass_pixs,
-    )
-    stars["pix"] = get_pixel_from_skycoord(
-        fov_level,
-        SkyCoord(ra=stars["ra"], dec=stars["dec"], unit=(u.degree, u.degree)),
-    )
-
-    if config.asterism_epoch is not None:
-        locality_columns = {
-            "is_local": np.asarray(stars["is_local"]).copy(),
-            "source_outer_pix": np.asarray(stars["source_outer_pix"]).copy(),
-            "pix": np.asarray(stars["pix"]).copy(),
-            "R": np.asarray(stars["R"]).copy(),
-        }
-        shifted = apply_proper_motion(stars[list(GAIA_SCHEMA_COLUMNS)], epoch=config.asterism_epoch)
-        for name, values in locality_columns.items():
-            shifted[name] = values
-        stars = shifted
-
-    stars = stars[~np.isnan(stars["ra"]) & ~np.isnan(stars["dec"]) & ~np.isnan(stars["R"])]
-    filtered = stars[(stars["R"] >= config.ao_system.min_mag) & (stars["R"] < config.ao_system.max_mag)]
-
-    if config.asterisms_max_star_density is not None and len(stars) > 0:
-        unique_pixs, star_counts = np.unique(np.asarray(stars["pix"], dtype=np.int64), return_counts=True)
-        fov_level_area = get_pixel_area(fov_level).to(u.arcmin**2).value
-        remove_pixs = unique_pixs[star_counts / fov_level_area > config.asterisms_max_star_density]
-        if len(remove_pixs) > 0:
-            filtered = filtered[~np.isin(filtered["pix"], remove_pixs)]
-
-    return stars, filtered
-
-
-def _filter_bright_star_exclusion(asterisms: Table, stars: Table, config: LegacyComparisonConfig) -> Table:
-    threshold = config.asterisms_max_bright_star_mag
-    if threshold is None or len(asterisms) == 0:
-        return asterisms
-
-    bright_stars = stars[stars["R"] < threshold]
-    if len(bright_stars) == 0:
-        return asterisms
-
-    bright_star_coords = SkyCoord(
-        ra=bright_stars["ra"],
-        dec=bright_stars["dec"],
-        unit=(u.degree, u.degree),
-    )
-    asterism_centres = SkyCoord(ra=asterisms["ra"], dec=asterisms["dec"], unit=(u.degree, u.degree))
-    keep = np.asarray(
-        [np.min(centre.separation(bright_star_coords)) > 2.0 * config.ao_system.fov for centre in asterism_centres],
-        dtype=np.bool_,
-    )
-    return asterisms[keep]
-
-
-def _filter_overlaps(asterisms: Table, config: LegacyComparisonConfig) -> Table:
-    _load_runtime()
-    threshold = config.asterisms_max_overlap
-    if threshold is None or len(asterisms) == 0:
-        return asterisms
-
-    fov_level = _get_level_with_resolution(config.ao_system.fov)
-    fov_radius = config.ao_system.fov.to(u.rad).value
-    fov_1ngs_radius = config.ao_system.fov_1ngs.to(u.rad).value
-    centres = SkyCoord(ra=asterisms["ra"], dec=asterisms["dec"], unit=(u.degree, u.degree))
-    asterism_pixs = get_pixel_from_skycoord(fov_level, centres)
-    keep = np.ones(len(asterisms), dtype=np.bool_)
-    qualities = _get_asterism_quality(asterisms, config)
-
-    for pix in np.unique(asterism_pixs):
-        search_pixs = np.concatenate([[pix], get_pixel_neighbours(fov_level, int(pix))])
-        candidate_indexes = np.flatnonzero(keep & np.isin(asterism_pixs, search_pixs))
-        if len(candidate_indexes) == 0:
-            continue
-        candidate_indexes = candidate_indexes[np.argsort(qualities[candidate_indexes])[::-1]]
-
-        skip = np.zeros(len(candidate_indexes), dtype=np.bool_)
-        for j, idx1 in enumerate(candidate_indexes):
-            if skip[j]:
-                continue
-
-            separations = centres[idx1].separation(centres[candidate_indexes[j + 1 :]]).to(u.rad).value
-            for offset, separation in enumerate(separations, start=j + 1):
-                if skip[offset] or separation > fov_radius:
-                    continue
-                idx2 = candidate_indexes[offset]
-                radius1 = fov_radius if asterisms["num_stars"][idx1] > 1 else fov_1ngs_radius
-                radius2 = fov_radius if asterisms["num_stars"][idx2] > 1 else fov_1ngs_radius
-                overlap_area = _get_circle_overlap_area(radius1, radius2, float(separation))
-                overlap = overlap_area / (np.pi * min(radius1, radius2) ** 2)
-                if overlap > threshold:
-                    skip[offset] = True
-
-        current_pix = asterism_pixs[candidate_indexes] == pix
-        keep[candidate_indexes[current_pix & skip]] = False
-
-    return asterisms[keep]
-
-
-def _get_asterism_quality(asterisms: Table, config: LegacyComparisonConfig) -> np.ndarray:
-    model_qualities = _get_model_based_asterism_quality(asterisms, config)
-    if model_qualities is not None:
-        return model_qualities
-
-    ao_system = config.ao_system
-    max_separation = ao_system.fov.to(u.arcsec).value
-    radius_1ngs = ao_system.fov_1ngs.to(u.arcsec).value / 2.0
-    min_rel_factor_small = 0.25
-    min_rel_factor_large = 0.5
-    min_rel_sep = radius_1ngs / max_separation
-    mid_rel_sep = 0.5
-    max_rel_sep = 1.0
-
-    below_mid_slope = (1.0 - min_rel_factor_small) / (mid_rel_sep - min_rel_sep)
-    above_mid_slope = (1.0 - min_rel_factor_large) / (max_rel_sep - mid_rel_sep)
-    qualities = np.zeros(len(asterisms), dtype=np.float64)
-
-    for index, asterism in enumerate(asterisms):
-        rel_sep = float(asterism["relsep"]) if int(asterism["num_stars"]) > 1 else min_rel_sep
-        if rel_sep < 0.5:
-            rel_factor = max(
-                min_rel_factor_small,
-                1.0 - below_mid_slope * (mid_rel_sep - rel_sep),
-            )
-        else:
-            rel_factor = max(
-                min_rel_factor_large,
-                1.0 - above_mid_slope * (rel_sep - mid_rel_sep),
-            )
-
-        star_mags = [float(asterism["star1_mag"])]
-        if int(asterism["num_stars"]) >= 2:
-            star_mags.append(float(asterism["star2_mag"]))
-        if int(asterism["num_stars"]) >= 3:
-            star_mags.append(float(asterism["star3_mag"]))
-
-        mag_factors = []
-        for star_mag in star_mags:
-            if ao_system.max_mag == ao_system.nom_mag:
-                mag_factors.append(1.0)
-            else:
-                mag_factors.append(
-                    min(1.0, (ao_system.max_mag - star_mag) / (ao_system.max_mag - ao_system.nom_mag))
-                )
-        while len(mag_factors) < 3:
-            mag_factors.append(0.0)
-
-        mag_factor = sum(mag_factors) / 3.0
-        qualities[index] = rel_factor * mag_factor
-
-    return qualities
-
-
-def _get_model_based_asterism_quality(
-    asterisms: Table,
-    config: LegacyComparisonConfig,
-) -> np.ndarray | None:
-    if not LEGACY_PYTHON.exists():
-        return None
-    if len(asterisms) == 0:
-        return np.array([], dtype=np.float64)
-
-    with tempfile.TemporaryDirectory(prefix="ao-sky-legacy-quality-") as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        input_filename = tmpdir_path / "asterisms.fits"
-        output_filename = tmpdir_path / "qualities.npy"
-        asterisms.write(input_filename, format="fits", overwrite=True)
-
-        code = """
-import os
-import sys
-from pathlib import Path
-import numpy as np
-from astropy.table import Table
-
-survey_root = Path(sys.argv[1]).resolve()
-config_filename = Path(sys.argv[2]).resolve()
-input_filename = Path(sys.argv[3]).resolve()
-output_filename = Path(sys.argv[4]).resolve()
-ao_system_name = sys.argv[5]
-
-sys.path.insert(0, str(survey_root))
-import aomap.aomap as aomap
-
-config = aomap.read_config(str(config_filename))
-ao_system = aomap.get_ao_system(config, ao_system_name)
-asterisms = Table.read(input_filename, format="fits")
-qualities = aomap._get_asterism_quality(config, asterisms, ao_system)
-np.save(output_filename, np.asarray(qualities, dtype=np.float64))
-"""
-        env = os.environ.copy()
-        env.setdefault("MPLCONFIGDIR", str(tmpdir_path / "mpl"))
-
-        result = subprocess.run(
-            [
-                str(LEGACY_PYTHON),
-                "-c",
-                code,
-                str(LEGACY_RUNTIME_ROOT),
-                str(config.legacy_config_filename),
-                str(input_filename),
-                str(output_filename),
-                config.ao_system.name,
-            ],
-            cwd=LEGACY_RUNTIME_ROOT / "aomap",
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0 or not output_filename.exists():
-            return None
-        return np.load(output_filename)
-
-
-def _filter_relative_constraints(asterisms: Table, config: LegacyComparisonConfig) -> Table:
-    result = asterisms
-    if config.ao_system.max_rel_sep > 0:
-        keep = (result["relsep"] >= config.ao_system.min_rel_sep) & (
-            result["relsep"] < config.ao_system.max_rel_sep
-        )
-        result = result[keep]
-    if config.ao_system.max_rel_area > 0 and len(result) > 0:
-        keep = (result["relarea"] >= config.ao_system.min_rel_area) & (
-            result["relarea"] < config.ao_system.max_rel_area
-        )
-        result = result[keep]
-    return result
-
-
-def _prepare_new_asterisms(
-    stars: Table,
-    ngs: Table,
-    config: LegacyComparisonConfig,
-    outer_pix: int,
-) -> Table:
-    _load_runtime()
-    options = AsterismSearchOptions(
-        min_stars=config.ao_system.min_wfs,
-        max_stars=config.ao_system.max_wfs,
-        min_separation_arcsec=config.ao_system.min_sep.to(u.arcsec).value,
-        max_separation_arcsec=config.ao_system.max_sep.to(u.arcsec).value,
-        max_single_star_radius_arcsec=config.ao_system.fov_1ngs.to(u.arcsec).value / 2.0,
-    )
-    asterisms = find_asterisms(ngs, options)
-    working = asterisms.copy(copy_data=True)
-    for source_name, legacy_name in NEW_TO_LEGACY_COLUMNS.items():
-        if source_name in working.colnames:
-            working.rename_column(source_name, legacy_name)
-    for column_name in ("star1_idx", "star2_idx", "star3_idx"):
-        if column_name in working.colnames:
-            working.remove_column(column_name)
-
-    working = _filter_bright_star_exclusion(working, stars, config)
-    working = _filter_overlaps(working, config)
-    working = _filter_relative_constraints(working, config)
-
-    centres = SkyCoord(ra=working["ra"], dec=working["dec"], unit=(u.degree, u.degree))
-    keep = get_pixel_from_skycoord(config.outer_level, centres) == int(outer_pix)
-    working = working[keep]
-    if len(working) == 0:
-        working["pix"] = np.array([], dtype=np.int64)
-        return working
-
-    centres = SkyCoord(ra=working["ra"], dec=working["dec"], unit=(u.degree, u.degree))
-    working["pix"] = get_pixel_from_skycoord(config.inner_level, centres)
-    return working
-
-
 def _build_runtime(
     *,
     release: str,
@@ -863,10 +491,16 @@ def build_new_outputs(
     outer_pix: int,
 ) -> tuple[Table, Table]:
     _load_runtime()
-    store = GaiaHealpixStore(
+    base_store = GaiaHealpixStore(
         GaiaStoreConfig(root=gaia_root, release=release, healpix_level=config.outer_level)
     )
     runtime = _build_runtime(release=release, config=config)
+    store = RuntimeGaiaHealpixStore(
+        base_store,
+        runtime,
+        max_entries=0,
+        max_bytes=0,
+    )
     asterisms, inner = build_traversal_products(
         store,
         runtime,
@@ -901,6 +535,9 @@ def build_new_outputs_with_runner(
     config: LegacyComparisonConfig,
     outer_pixs: list[int],
     workers: int,
+    gaia_cache_entries: int | None,
+    gaia_cache_mb: int | None,
+    region_level: int | None,
 ) -> dict[int, tuple[Table, Table]]:
     _load_runtime()
     with tempfile.TemporaryDirectory(prefix="ao-sky-traversal-new-") as tmpdir:
@@ -929,8 +566,32 @@ def build_new_outputs_with_runner(
             model_root=config.model_root,
         )
         _write_subset_traversal_state(build_path, outer_pixs)
-        print(f"ao-sky runner workers: {workers}")
-        run_traversal_phase(build_path, workers=workers)
+        print(
+            "ao-sky runner "
+            f"workers={workers} "
+            f"gaia_cache_entries={gaia_cache_entries} "
+            f"gaia_cache_mb={gaia_cache_mb} "
+            f"region_level={region_level}"
+        )
+        execution_config = resolve_traversal_execution_config(
+            outer_level=config.outer_level,
+            workers=workers,
+            gaia_cache_entries=gaia_cache_entries,
+            gaia_cache_mb=gaia_cache_mb,
+            region_level=region_level,
+        )
+        start_time = time.perf_counter()
+        traversal_complete, traversal_counts = run_traversal_phase(
+            build_path,
+            execution_config=execution_config,
+        )
+        elapsed = time.perf_counter() - start_time
+        print(f"ao-sky runner elapsed: {elapsed:.3f} s")
+        if not traversal_complete:
+            log_filename = build_path / "build.log"
+            if log_filename.exists():
+                print(log_filename.read_text(encoding="utf-8"))
+            raise RuntimeError(f"ao-sky traversal failed: {traversal_counts}")
 
         outputs: dict[int, tuple[Table, Table]] = {}
         for outer_pix in outer_pixs:
@@ -973,7 +634,12 @@ def prepare_inner_table(table: Table) -> Table:
     return table[list(INNER_COMPARISON_COLUMNS)].copy(copy_data=True)
 
 
-def compare_tables(legacy: Table, new: Table) -> int:
+def compare_tables(
+    legacy: Table,
+    new: Table,
+    *,
+    allow_membership_divergence: bool = False,
+) -> int:
     legacy_keys = np.asarray([_get_membership_key(legacy, index) for index in range(len(legacy))])
     new_keys = np.asarray([_get_membership_key(new, index) for index in range(len(new))])
 
@@ -1038,7 +704,12 @@ def compare_tables(legacy: Table, new: Table) -> int:
     else:
         print("row ordering: differs")
 
-    return 1 if missing_from_new or extra_in_new or mismatch_count else 0
+    membership_status = bool(missing_from_new or extra_in_new)
+    if membership_status and allow_membership_divergence:
+        print("membership differences accepted: boundary overlap footprint divergence")
+        membership_status = False
+
+    return 1 if membership_status or mismatch_count else 0
 
 
 def compare_inner_tables(
@@ -1392,11 +1063,37 @@ def parse_args() -> argparse.Namespace:
         help="Number of ao-sky Traversal workers to use for non-map comparisons.",
     )
     parser.add_argument(
+        "--gaia-cache-entries",
+        type=int,
+        default=None,
+        help="Worker-local Gaia table cache entry target for ao-sky runner comparisons.",
+    )
+    parser.add_argument(
+        "--gaia-cache-mb",
+        type=int,
+        default=None,
+        help="Worker-local Gaia table cache memory cap in MiB for ao-sky runner comparisons.",
+    )
+    parser.add_argument(
+        "--region-level",
+        type=int,
+        default=None,
+        help="Regional HEALPix level for ao-sky runner comparisons.",
+    )
+    parser.add_argument(
         "--allow-local-winner-divergence",
         action="store_true",
         help=(
             "Ignore inner winner/coverage columns that intentionally diverge "
             "because ao-sky only persists traceable local winners."
+        ),
+    )
+    parser.add_argument(
+        "--allow-boundary-overlap-divergence",
+        action="store_true",
+        help=(
+            "Accept boundary asterism membership and best-map differences caused "
+            "by ao-sky's self-contained two-ring overlap/proper-motion buffer footprint."
         ),
     )
     return parser.parse_args()
@@ -1430,6 +1127,7 @@ def _compare_outer_pixel(
     config: LegacyComparisonConfig,
     new_outputs: dict[int, tuple[Table, Table]] | None = None,
     ignored_inner_columns: frozenset[str] = frozenset(),
+    allow_asterism_membership_divergence: bool = False,
 ) -> int:
     print(f"outer pixel: {outer_pix}")
     legacy_asterisms, legacy_inner = load_live_legacy_outputs(
@@ -1460,7 +1158,11 @@ def _compare_outer_pixel(
 
     print(legacy_label)
     print("asterisms:")
-    asterism_status = compare_tables(legacy_table, prepared_new)
+    asterism_status = compare_tables(
+        legacy_table,
+        prepared_new,
+        allow_membership_divergence=allow_asterism_membership_divergence,
+    )
     print("inner:")
     inner_status = compare_inner_tables(
         legacy_inner,
@@ -1525,6 +1227,9 @@ def main() -> int:
             config=config,
             outer_pixs=outer_pixs,
             workers=args.workers,
+            gaia_cache_entries=args.gaia_cache_entries,
+            gaia_cache_mb=args.gaia_cache_mb,
+            region_level=args.region_level,
         )
 
     ignored_inner_columns = (
@@ -1536,6 +1241,12 @@ def main() -> int:
         print(
             "ignoring intentional local-winner divergence columns:",
             " ".join(sorted(ignored_inner_columns)),
+        )
+    if args.allow_boundary_overlap_divergence:
+        ignored_inner_columns = ignored_inner_columns | BOUNDARY_OVERLAP_DIVERGENCE_COLUMNS
+        print(
+            "accepting boundary overlap divergence:",
+            " ".join(sorted(BOUNDARY_OVERLAP_DIVERGENCE_COLUMNS)),
         )
 
     failures = 0
@@ -1550,6 +1261,7 @@ def main() -> int:
             config=config,
             new_outputs=new_outputs,
             ignored_inner_columns=ignored_inner_columns,
+            allow_asterism_membership_divergence=args.allow_boundary_overlap_divergence,
         )
     return 1 if failures else 0
 

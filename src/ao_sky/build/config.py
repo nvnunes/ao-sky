@@ -9,12 +9,14 @@ import yaml
 
 from ..survey import SurveyError, normalize_survey_extent_overlays
 from ._exceptions import BuildError
-from ._models import BuildDefinition, BuildPaths
+from ._models import BuildDefinition, BuildPaths, TraversalExecutionConfig
 
 
 DEFAULT_LEGACY_CONFIG = (
     Path(__file__).resolve().parents[3] / "survey_tools" / "aomap" / "config.yaml"
 )
+DEFAULT_GAIA_CACHE_ENTRIES = 64
+DEFAULT_GAIA_CACHE_MB = 2048
 
 
 def _load_aosky_conf(
@@ -267,3 +269,79 @@ def resolve_dust_root_only(
             "dust_root must be provided either via CLI or aosky.conf"
         )
     return resolved_dust_root.expanduser().resolve()
+
+
+def resolve_traversal_execution_config(
+    *,
+    outer_level: int,
+    workers: int | None = None,
+    gaia_cache_entries: int | None = None,
+    gaia_cache_mb: int | None = None,
+    region_level: int | None = None,
+    aosky_conf: Path | None = None,
+    cwd: Path | None = None,
+) -> TraversalExecutionConfig:
+    """Resolve runtime-only Traversal execution settings."""
+
+    conf_data = _load_aosky_conf(aosky_conf=aosky_conf, cwd=cwd)
+    resolved_workers = _resolve_int_setting(
+        workers,
+        conf_data.get("workers"),
+        default=1,
+        name="workers",
+    )
+    resolved_cache_entries = _resolve_int_setting(
+        gaia_cache_entries,
+        conf_data.get("gaia_cache_entries"),
+        default=DEFAULT_GAIA_CACHE_ENTRIES,
+        name="gaia_cache_entries",
+    )
+    resolved_cache_mb = _resolve_int_setting(
+        gaia_cache_mb,
+        conf_data.get("gaia_cache_mb"),
+        default=DEFAULT_GAIA_CACHE_MB,
+        name="gaia_cache_mb",
+    )
+    resolved_region_level = _resolve_int_setting(
+        region_level,
+        conf_data.get("region_level"),
+        default=max(0, int(outer_level) - 2),
+        name="region_level",
+    )
+
+    if resolved_workers < 1:
+        raise BuildError(f"workers must be at least 1, got {resolved_workers}")
+    if resolved_cache_entries < 0:
+        raise BuildError(
+            f"gaia_cache_entries must be non-negative, got {resolved_cache_entries}"
+        )
+    if resolved_cache_mb < 0:
+        raise BuildError(f"gaia_cache_mb must be non-negative, got {resolved_cache_mb}")
+    if resolved_region_level < 0 or resolved_region_level > int(outer_level):
+        raise BuildError(
+            "region_level must be between 0 and outer_level "
+            f"({int(outer_level)}), got {resolved_region_level}"
+        )
+
+    return TraversalExecutionConfig(
+        workers=resolved_workers,
+        gaia_cache_entries=resolved_cache_entries,
+        gaia_cache_mb=resolved_cache_mb,
+        region_level=resolved_region_level,
+    )
+
+
+def _resolve_int_setting(
+    explicit: int | None,
+    configured: object,
+    *,
+    default: int,
+    name: str,
+) -> int:
+    value = explicit if explicit is not None else configured
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise BuildError(f"{name} must be an integer") from exc

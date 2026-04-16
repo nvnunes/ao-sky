@@ -50,3 +50,47 @@ class TraversalTaskResult:
     outer_pix: int
     success: bool
     error_message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalExecutionConfig:
+    """Runtime-only Traversal execution settings."""
+
+    workers: int = 1
+    gaia_cache_entries: int = 64
+    gaia_cache_mb: int = 2048
+    region_level: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalWorkerPlan:
+    """Outer-pixel work assigned to one long-lived Traversal worker."""
+
+    worker_id: int
+    region_pixs: tuple[int, ...]
+    outer_pixs: tuple[int, ...]
+    estimated_star_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalCacheStats:
+    """Serialized worker-local Gaia cache counters."""
+
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    current_bytes: int = 0
+    peak_bytes: int = 0
+    entries: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalWorkerMessage:
+    """Message emitted by a long-lived Traversal worker."""
+
+    worker_id: int
+    kind: str
+    outer_pix: int | None = None
+    result: TraversalTaskResult | None = None
+    cache_stats: TraversalCacheStats | None = None
+    error_message: str = ""

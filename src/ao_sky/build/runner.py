@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, wait
+from collections.abc import Iterator
+import multiprocessing
 from pathlib import Path
+from queue import Empty
 
 from joblib.externals.loky import ProcessPoolExecutor
 import numpy as np
@@ -19,6 +22,7 @@ from ._constants import (
     BUILD_STATUS_COMPLETED,
     BUILD_STATUS_FAILED,
     BUILD_STATUS_RUNNING,
+    STATE_ERROR_MAX_BYTES,
     WORK_STATUS_DONE,
     WORK_STATUS_FAILED,
     WORK_STATUS_PENDING,
@@ -26,7 +30,12 @@ from ._constants import (
 )
 from ._exceptions import BuildError
 from .artifacts import write_outer_artifact
-from .config import load_build_definition, resolve_build_root_only, resolve_build_roots
+from .config import (
+    load_build_definition,
+    resolve_build_root_only,
+    resolve_build_roots,
+    resolve_traversal_execution_config,
+)
 from .control import (
     append_build_log,
     build_artifact_root,
@@ -45,9 +54,21 @@ from .control import (
     update_state_row,
 )
 from .legacy_config import load_native_runtime
-from ._models import TraversalTaskContext, TraversalTaskResult
+from ._models import (
+    TraversalCacheStats,
+    TraversalExecutionConfig,
+    TraversalTaskContext,
+    TraversalTaskResult,
+    TraversalWorkerMessage,
+    TraversalWorkerPlan,
+)
+from .regional import build_regional_worker_plans
+from .runtime_gaia import RuntimeGaiaHealpixStore
 from .scheduler import OuterPixelScheduler
-from .traversal import build_traversal_products
+from .traversal import TraversalGeometry, build_traversal_products
+
+TRAVERSAL_PROGRESS_LOG_INTERVAL = 100
+TRUNCATED_ERROR_SUFFIX = "... [truncated]"
 
 
 def init_build(
@@ -155,28 +176,43 @@ def _load_traversal_task_context(build_path: Path) -> TraversalTaskContext:
 def _materialize_outer_pixel_products(
     context: TraversalTaskContext,
     outer_pix: int,
+    *,
+    runtime=None,
+    store=None,
+    geometry: TraversalGeometry | None = None,
 ) -> None:
     """Run the Traversal pipeline for one outer pixel without mutating build state."""
 
-    runtime = load_native_runtime(
-        context.definition,
-        legacy_config_path=context.legacy_config_path,
-        model_root=context.roots.model_root,
-    )
-    warm_model_cache(runtime)
-    store = GaiaHealpixStore(
-        GaiaStoreConfig(
-            root=context.roots.gaia_root,
-            release=context.definition.gaia_release,
-            healpix_level=context.definition.outer_level,
+    if runtime is None:
+        runtime = load_native_runtime(
+            context.definition,
+            legacy_config_path=context.legacy_config_path,
+            model_root=context.roots.model_root,
         )
-    )
+        warm_model_cache(runtime)
+    if store is None:
+        base_store = GaiaHealpixStore(
+            GaiaStoreConfig(
+                root=context.roots.gaia_root,
+                release=context.definition.gaia_release,
+                healpix_level=context.definition.outer_level,
+            )
+        )
+        store = RuntimeGaiaHealpixStore(
+            base_store,
+            runtime,
+            max_entries=0,
+            max_bytes=0,
+        )
+    if geometry is None:
+        geometry = TraversalGeometry.from_runtime(runtime)
     asterisms, inner = build_traversal_products(
         store,
         runtime,
         outer_pix,
         dust_root=context.roots.dust_root,
         max_data_level=context.definition.max_data_level,
+        geometry=geometry,
     )
     filename = outer_artifact_filename(context.build_path, context.definition, outer_pix)
     write_outer_artifact(filename, inner=inner, asterisms=asterisms)
@@ -242,22 +278,43 @@ def _record_traversal_result(
         state["traversal_last_error_message"][int(result.outer_pix)] = b""
         return
 
+    error_message = _truncate_state_error_message(result.error_message)
     update_state_row(
         build_path,
         result.outer_pix,
         traversal_status=WORK_STATUS_FAILED,
-        traversal_last_error_message=result.error_message,
+        traversal_last_error_message=error_message,
     )
     state["traversal_status"][int(result.outer_pix)] = WORK_STATUS_FAILED
-    state["traversal_last_error_message"][int(result.outer_pix)] = str(
-        result.error_message
-    ).encode("utf-8")
+    state["traversal_last_error_message"][int(result.outer_pix)] = error_message.encode(
+        "utf-8"
+    )
+
+
+def _truncate_state_error_message(message: object) -> str:
+    """Return a UTF-8-safe error message that fits the persisted state field."""
+
+    text = str(message)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= STATE_ERROR_MAX_BYTES:
+        return text
+
+    suffix = TRUNCATED_ERROR_SUFFIX.encode("utf-8")
+    limit = max(0, STATE_ERROR_MAX_BYTES - len(suffix))
+    truncated = encoded[:limit].decode("utf-8", errors="ignore")
+    return truncated + TRUNCATED_ERROR_SUFFIX
 
 
 def _create_traversal_executor(workers: int) -> ProcessPoolExecutor:
     """Create the loky process pool used by the parallel Traversal runner."""
 
     return ProcessPoolExecutor(max_workers=int(workers))
+
+
+def _create_regional_process_context():
+    """Return the process context used by cache-aware regional Traversal."""
+
+    return multiprocessing.get_context("spawn")
 
 
 def _repair_stale_running_rows(build_path: Path, *, status_field: str) -> int:
@@ -314,12 +371,313 @@ def _dispatch_parallel_outer_pixel(
         if outer_pix is None:
             return
         _mark_outer_pixel_running(build_path, state, outer_pix)
-        append_build_log(build_path, f"phase=traversal outer_pix={outer_pix} dispatched")
         future = executor.submit(_run_outer_pixel_traversal_task, context, outer_pix)
         active[future] = int(outer_pix)
 
 
-def _run_traversal_phase(build_path: Path, *, workers: int) -> tuple[bool, dict[str, int]]:
+def _gaia_cache_enabled(config: TraversalExecutionConfig) -> bool:
+    return config.gaia_cache_entries > 0 and config.gaia_cache_mb > 0
+
+
+def _run_regional_traversal_worker(
+    context: TraversalTaskContext,
+    plan: TraversalWorkerPlan,
+    execution_config: TraversalExecutionConfig,
+    result_queue,
+) -> None:
+    """Worker entrypoint for one region-owned Traversal plan."""
+
+    for message in _iter_long_lived_traversal_worker_messages(
+        context,
+        plan,
+        execution_config,
+    ):
+        result_queue.put(message)
+
+
+def _iter_long_lived_traversal_worker_messages(
+    context: TraversalTaskContext,
+    plan: TraversalWorkerPlan,
+    execution_config: TraversalExecutionConfig,
+) -> Iterator[TraversalWorkerMessage]:
+    """Yield Traversal messages from one reusable worker runtime."""
+
+    configure_inference_threads(1)
+    runtime = load_native_runtime(
+        context.definition,
+        legacy_config_path=context.legacy_config_path,
+        model_root=context.roots.model_root,
+    )
+    warm_model_cache(runtime)
+    base_store = GaiaHealpixStore(
+        GaiaStoreConfig(
+            root=context.roots.gaia_root,
+            release=context.definition.gaia_release,
+            healpix_level=context.definition.outer_level,
+        )
+    )
+    store = RuntimeGaiaHealpixStore(
+        base_store,
+        runtime,
+        max_entries=execution_config.gaia_cache_entries,
+        max_bytes=execution_config.gaia_cache_mb * 1024 * 1024,
+    )
+    geometry = TraversalGeometry.from_runtime(runtime)
+
+    for outer_pix in plan.outer_pixs:
+        yield TraversalWorkerMessage(
+            worker_id=plan.worker_id,
+            kind="started",
+            outer_pix=int(outer_pix),
+        )
+        try:
+            _materialize_outer_pixel_products(
+                context,
+                int(outer_pix),
+                runtime=runtime,
+                store=store,
+                geometry=geometry,
+            )
+        except Exception as exc:
+            yield TraversalWorkerMessage(
+                worker_id=plan.worker_id,
+                kind="failed",
+                outer_pix=int(outer_pix),
+                result=TraversalTaskResult(
+                    outer_pix=int(outer_pix),
+                    success=False,
+                    error_message=str(exc),
+                ),
+            )
+            continue
+        yield TraversalWorkerMessage(
+            worker_id=plan.worker_id,
+            kind="completed",
+            outer_pix=int(outer_pix),
+            result=TraversalTaskResult(outer_pix=int(outer_pix), success=True),
+        )
+
+    if isinstance(store, RuntimeGaiaHealpixStore) and store.enabled:
+        stats = store.stats()
+        yield TraversalWorkerMessage(
+            worker_id=plan.worker_id,
+            kind="cache_stats",
+            cache_stats=TraversalCacheStats(
+                hits=stats.hits,
+                misses=stats.misses,
+                evictions=stats.evictions,
+                current_bytes=stats.current_bytes,
+                peak_bytes=stats.peak_bytes,
+                entries=stats.entries,
+            ),
+        )
+    yield TraversalWorkerMessage(worker_id=plan.worker_id, kind="done")
+
+
+def _handle_regional_worker_message(
+    *,
+    build_path: Path,
+    state: np.ndarray,
+    message: TraversalWorkerMessage,
+    progress: dict[int, dict[str, int]] | None = None,
+    progress_interval: int = TRAVERSAL_PROGRESS_LOG_INTERVAL,
+) -> bool:
+    """Apply one regional worker message. Return whether it marks a failure."""
+
+    worker_progress = None
+    if progress is not None:
+        worker_progress = progress.setdefault(
+            int(message.worker_id),
+            {"completed": 0, "failed": 0},
+        )
+
+    if message.kind == "started":
+        if message.outer_pix is None:
+            raise BuildError("Regional worker start message is missing outer_pix")
+        _mark_outer_pixel_running(build_path, state, int(message.outer_pix))
+        return False
+
+    if message.kind in ("completed", "failed"):
+        if message.result is None:
+            raise BuildError(f"Regional worker {message.kind} message is missing result")
+        _record_traversal_result(build_path, state, message.result)
+        if message.result.success:
+            if worker_progress is not None:
+                worker_progress["completed"] += 1
+                if (
+                    progress_interval > 0
+                    and worker_progress["completed"] % progress_interval == 0
+                ):
+                    append_build_log(
+                        build_path,
+                        "phase=traversal "
+                        f"worker={message.worker_id} "
+                        f"progress completed={worker_progress['completed']} "
+                        f"failed={worker_progress['failed']} "
+                        f"last_outer_pix={message.result.outer_pix}",
+                    )
+            return False
+        if worker_progress is not None:
+            worker_progress["failed"] += 1
+        append_build_log(
+            build_path,
+            f"phase=traversal worker={message.worker_id} outer_pix={message.result.outer_pix} failed: {message.result.error_message}",
+        )
+        return True
+
+    if message.kind == "cache_stats":
+        stats = message.cache_stats
+        if stats is None:
+            raise BuildError("Regional worker cache_stats message is missing stats")
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={message.worker_id} "
+            "cache_stats "
+            f"hits={stats.hits} "
+            f"misses={stats.misses} "
+            f"evictions={stats.evictions} "
+            f"entries={stats.entries} "
+            f"current_bytes={stats.current_bytes} "
+            f"peak_bytes={stats.peak_bytes}",
+        )
+        return False
+
+    if message.kind == "done":
+        return False
+
+    raise BuildError(f"Unknown regional worker message kind {message.kind!r}")
+
+
+def _run_regional_traversal_workers(
+    *,
+    build_path: Path,
+    context: TraversalTaskContext,
+    state: np.ndarray,
+    plans: tuple[TraversalWorkerPlan, ...],
+    execution_config: TraversalExecutionConfig,
+) -> bool:
+    """Run long-lived region-owned Traversal workers."""
+
+    if not plans:
+        return False
+
+    process_context = _create_regional_process_context()
+    result_queue = process_context.Queue()
+    processes = []
+    active_worker_ids = {plan.worker_id for plan in plans}
+    progress: dict[int, dict[str, int]] = {
+        plan.worker_id: {"completed": 0, "failed": 0} for plan in plans
+    }
+    failed = False
+
+    for plan in plans:
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={plan.worker_id} "
+            f"regions={','.join(str(pix) for pix in plan.region_pixs)} "
+            f"outer_pixels={len(plan.outer_pixs)} "
+            f"estimated_star_count={plan.estimated_star_count} started",
+        )
+        process = process_context.Process(
+            target=_run_regional_traversal_worker,
+            args=(context, plan, execution_config, result_queue),
+        )
+        process.start()
+        processes.append(process)
+
+    try:
+        while active_worker_ids:
+            try:
+                message = result_queue.get(timeout=0.1)
+            except Empty:
+                for process, plan in zip(processes, plans, strict=True):
+                    if plan.worker_id not in active_worker_ids:
+                        continue
+                    if process.exitcode not in (None, 0):
+                        raise RuntimeError(
+                            f"regional worker {plan.worker_id} exited with code {process.exitcode}"
+                        )
+                continue
+
+            failed = _handle_regional_worker_message(
+                build_path=build_path,
+                state=state,
+                message=message,
+                progress=progress,
+            ) or failed
+            if message.kind == "done":
+                active_worker_ids.discard(message.worker_id)
+                worker_progress = progress[message.worker_id]
+                append_build_log(
+                    build_path,
+                    "phase=traversal "
+                    f"worker={message.worker_id} "
+                    f"done completed={worker_progress['completed']} "
+                    f"failed={worker_progress['failed']}",
+                )
+    except Exception:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        raise
+    finally:
+        for process in processes:
+            process.join()
+    return failed
+
+
+def _run_in_process_traversal_worker(
+    *,
+    build_path: Path,
+    context: TraversalTaskContext,
+    state: np.ndarray,
+    plan: TraversalWorkerPlan,
+    execution_config: TraversalExecutionConfig,
+) -> bool:
+    """Run one long-lived Traversal worker in the parent process."""
+
+    failed = False
+    progress: dict[int, dict[str, int]] = {
+        plan.worker_id: {"completed": 0, "failed": 0}
+    }
+    append_build_log(
+        build_path,
+        "phase=traversal "
+        f"worker={plan.worker_id} "
+        f"regions={','.join(str(pix) for pix in plan.region_pixs)} "
+        f"outer_pixels={len(plan.outer_pixs)} "
+        f"estimated_star_count={plan.estimated_star_count} started",
+    )
+    for message in _iter_long_lived_traversal_worker_messages(
+        context,
+        plan,
+        execution_config,
+    ):
+        failed = _handle_regional_worker_message(
+            build_path=build_path,
+            state=state,
+            message=message,
+            progress=progress,
+        ) or failed
+        if message.kind == "done":
+            worker_progress = progress[message.worker_id]
+            append_build_log(
+                build_path,
+                "phase=traversal "
+                f"worker={message.worker_id} "
+                f"done completed={worker_progress['completed']} "
+                f"failed={worker_progress['failed']}",
+            )
+    return failed
+
+
+def _run_traversal_phase(
+    build_path: Path,
+    *,
+    execution_config: TraversalExecutionConfig,
+) -> tuple[bool, dict[str, int]]:
     current_phase = load_current_phase(build_path)
     if current_phase != BUILD_PHASE_TRAVERSAL:
         raise BuildError(f"Expected traversal phase, got {current_phase!r}")
@@ -349,7 +707,13 @@ def _run_traversal_phase(build_path: Path, *, workers: int) -> tuple[bool, dict[
     set_build_status(build_path, BUILD_STATUS_RUNNING)
     append_build_log(
         build_path,
-        f"run start phase={current_phase} repaired_stale_running={repaired} workers={workers}",
+        "run start "
+        f"phase={current_phase} "
+        f"repaired_stale_running={repaired} "
+        f"workers={execution_config.workers} "
+        f"region_level={execution_config.region_level} "
+        f"gaia_cache_entries={execution_config.gaia_cache_entries} "
+        f"gaia_cache_mb={execution_config.gaia_cache_mb}",
     )
 
     scheduler = OuterPixelScheduler(
@@ -359,45 +723,88 @@ def _run_traversal_phase(build_path: Path, *, workers: int) -> tuple[bool, dict[
     )
     failed = False
 
-    if workers == 1:
-        last_completed_outer_pix: int | None = None
-        while True:
-            outer_pix = scheduler.select_next_outer_pixel(
-                state,
-                last_completed_outer_pix=last_completed_outer_pix,
+    if execution_config.workers == 1:
+        try:
+            plans = build_regional_worker_plans(
+                state=state,
+                outer_level=definition.outer_level,
+                region_level=int(execution_config.region_level),
+                workers=1,
+                status_field=status_field,
+                star_counts=star_counts,
             )
-            if outer_pix is None:
-                break
-            append_build_log(build_path, f"phase=traversal outer_pix={outer_pix} dispatched")
-            build_outer_pixel_products(build_path, outer_pix)
-            state = load_state(build_path)
-            row = state[int(outer_pix)]
-            if int(row["traversal_status"]) == WORK_STATUS_DONE:
-                append_build_log(
-                    build_path,
-                    f"phase=traversal outer_pix={outer_pix} completed",
-                )
-                last_completed_outer_pix = outer_pix
-            else:
-                failed = True
-                error_message = row["traversal_last_error_message"].decode("utf-8")
-                append_build_log(
-                    build_path,
-                    f"phase=traversal outer_pix={outer_pix} failed: {error_message}",
-                )
-                last_completed_outer_pix = None
+            if plans:
+                failed = _run_in_process_traversal_worker(
+                    build_path=build_path,
+                    context=context,
+                    state=state,
+                    plan=plans[0],
+                    execution_config=execution_config,
+                ) or failed
+        except Exception as exc:
+            reset_running = _reset_running_rows(
+                build_path,
+                state,
+                status_field=status_field,
+                error_field=error_field,
+            )
+            set_build_status(build_path, BUILD_STATUS_FAILED)
+            append_build_log(build_path, f"phase=traversal infrastructure failed: {exc}")
+            append_build_log(
+                build_path,
+                "run complete "
+                "phase=traversal "
+                "status=failed "
+                f"reset_running={reset_running}",
+            )
+            raise
+    elif _gaia_cache_enabled(execution_config):
+        try:
+            plans = build_regional_worker_plans(
+                state=state,
+                outer_level=definition.outer_level,
+                region_level=int(execution_config.region_level),
+                workers=execution_config.workers,
+                status_field=status_field,
+                star_counts=star_counts,
+            )
+            failed = _run_regional_traversal_workers(
+                build_path=build_path,
+                context=context,
+                state=state,
+                plans=plans,
+                execution_config=execution_config,
+            ) or failed
+        except Exception as exc:
+            reset_running = _reset_running_rows(
+                build_path,
+                state,
+                status_field=status_field,
+                error_field=error_field,
+            )
+            set_build_status(build_path, BUILD_STATUS_FAILED)
+            append_build_log(build_path, f"phase=traversal infrastructure failed: {exc}")
+            append_build_log(
+                build_path,
+                "run complete "
+                "phase=traversal "
+                "status=failed "
+                f"reset_running={reset_running}",
+            )
+            raise
     else:
         executor = None
         try:
-            executor = _create_traversal_executor(workers)
+            executor = _create_traversal_executor(execution_config.workers)
             active: dict[Future[TraversalTaskResult], int] = {}
+            completed_successes = 0
             _dispatch_parallel_outer_pixel(
                 build_path=build_path,
                 context=context,
                 state=state,
                 scheduler=scheduler,
                 executor=executor,
-                workers=workers,
+                workers=execution_config.workers,
                 active=active,
                 dispatch_after_outer_pix=None,
             )
@@ -417,10 +824,14 @@ def _run_traversal_phase(build_path: Path, *, workers: int) -> tuple[bool, dict[
 
                     _record_traversal_result(build_path, state, result)
                     if result.success:
-                        append_build_log(
-                            build_path,
-                            f"phase=traversal outer_pix={result.outer_pix} completed",
-                        )
+                        completed_successes += 1
+                        if completed_successes % TRAVERSAL_PROGRESS_LOG_INTERVAL == 0:
+                            append_build_log(
+                                build_path,
+                                "phase=traversal "
+                                f"progress completed={completed_successes} "
+                                f"last_outer_pix={result.outer_pix}",
+                            )
                         dispatch_after_outer_pix: int | None = result.outer_pix
                     else:
                         failed = True
@@ -436,7 +847,7 @@ def _run_traversal_phase(build_path: Path, *, workers: int) -> tuple[bool, dict[
                         state=state,
                         scheduler=scheduler,
                         executor=executor,
-                        workers=workers,
+                        workers=execution_config.workers,
                         active=active,
                         dispatch_after_outer_pix=dispatch_after_outer_pix,
                     )
@@ -544,10 +955,18 @@ def _run_augmentation_phase(build_path: Path) -> None:
     )
 
 
-def run_build(build_path: Path, *, workers: int = 1) -> Path:
+def run_build(
+    build_path: Path,
+    *,
+    workers: int | None = 1,
+    gaia_cache_entries: int | None = None,
+    gaia_cache_mb: int | None = None,
+    region_level: int | None = None,
+    aosky_conf: Path | None = None,
+) -> Path:
     """Run all unfinished build work through the implemented phases."""
 
-    if workers < 1:
+    if workers is not None and int(workers) < 1:
         raise BuildError(f"workers must be at least 1, got {workers}")
     if not build_path.is_dir():
         raise BuildError(f"Build path does not exist: {build_path}")
@@ -565,7 +984,19 @@ def run_build(build_path: Path, *, workers: int = 1) -> Path:
         )
 
     if current_phase == BUILD_PHASE_TRAVERSAL:
-        traversal_complete, _ = _run_traversal_phase(build_path, workers=int(workers))
+        definition = load_persisted_build_definition(build_path)
+        execution_config = resolve_traversal_execution_config(
+            outer_level=definition.outer_level,
+            workers=workers,
+            gaia_cache_entries=gaia_cache_entries,
+            gaia_cache_mb=gaia_cache_mb,
+            region_level=region_level,
+            aosky_conf=aosky_conf,
+        )
+        traversal_complete, _ = _run_traversal_phase(
+            build_path,
+            execution_config=execution_config,
+        )
         if not traversal_complete:
             return build_path
         set_current_phase(build_path, BUILD_PHASE_AGGREGATION)
@@ -588,7 +1019,10 @@ def restart_build(
     config_short_name: str,
     build_root: Path | None,
     aosky_conf: Path | None = None,
-    workers: int = 1,
+    workers: int | None = 1,
+    gaia_cache_entries: int | None = None,
+    gaia_cache_mb: int | None = None,
+    region_level: int | None = None,
 ) -> Path:
     """Restart the latest build in one lineage."""
 
@@ -601,7 +1035,14 @@ def restart_build(
         ao_system_short_name=ao_system_short_name,
         config_short_name=config_short_name,
     )
-    return run_build(build_path, workers=workers)
+    return run_build(
+        build_path,
+        workers=workers,
+        gaia_cache_entries=gaia_cache_entries,
+        gaia_cache_mb=gaia_cache_mb,
+        region_level=region_level,
+        aosky_conf=aosky_conf,
+    )
 
 
 def show_build(build_path: Path) -> str:

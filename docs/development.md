@@ -139,11 +139,16 @@ gaia_root: /data/gaia
 build_root: /data/ao-builds
 dust_root: /data/dust
 model_root: /data/models
+workers: 3
+gaia_cache_entries: 64
+gaia_cache_mb: 2048
+region_level: 4
 ```
 
-If `aosky.conf` is present in the working project root, `init`, `restart`,
-`check`, `fetch-dust`, `fetch-gaia`, and `fetch-model` can use it
-automatically. Otherwise pass the root flags explicitly.
+If `aosky.conf` is present in the working project root, `init`, `run`,
+`restart`, `check`, `fetch-dust`, `fetch-gaia`, and `fetch-model` can use it
+automatically. Otherwise pass the root flags explicitly. The execution settings
+are runtime defaults only and are not persisted into build metadata.
 
 Example CLI flow with explicit roots:
 
@@ -172,8 +177,13 @@ Example CLI flow with explicit roots:
   --model-root /data/models
 
 ./.conda/bin/ao-sky show /data/ao-builds/GNAO-baseline-v1
-./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1 --workers 3
-./.conda/bin/ao-sky restart GNAO baseline --build-root /data/ao-builds --workers 3
+./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1 \
+  --workers 3 \
+  --gaia-cache-entries 64 \
+  --gaia-cache-mb 2048
+./.conda/bin/ao-sky restart GNAO baseline \
+  --build-root /data/ao-builds \
+  --workers 3
 ```
 
 During the current migration phase, `init` also accepts `--legacy-config` to

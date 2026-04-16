@@ -101,6 +101,23 @@ def test_load_healpix_reads_existing_canonical_file(tmp_path: Path) -> None:
     assert np.allclose(loaded["ra"], expected["ra"])
 
 
+def test_load_healpix_can_return_read_only_columns(tmp_path: Path) -> None:
+    store = GaiaHealpixStore(
+        GaiaStoreConfig(root=tmp_path, release="dr3", healpix_level=6)
+    )
+    filename = store.healpix_filename(0)
+    _write_hdf5(filename, _make_table())
+
+    mutable = store.load_healpix(0)
+    mutable["ra"][0] = 42.0
+
+    read_only = store.load_healpix(0, read_only=True)
+
+    assert not read_only["ra"].flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        read_only["ra"][0] = 42.0
+
+
 def test_load_healpix_materializes_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = GaiaHealpixStore(
         GaiaStoreConfig(root=tmp_path, release="dr3", healpix_level=6)

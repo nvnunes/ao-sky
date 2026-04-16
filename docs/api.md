@@ -109,7 +109,7 @@ The current package-supported build API exposes:
 
 Return the canonical HDF5 filename for one outer nested HEALPix pixel.
 
-### `GaiaHealpixStore.load_healpix(outer_pix: int, *, force_reload: bool = False) -> Table`
+### `GaiaHealpixStore.load_healpix(outer_pix: int, *, force_reload: bool = False, read_only: bool = False) -> Table`
 
 Load one raw Gaia table for an outer pixel.
 
@@ -118,6 +118,8 @@ Behavior:
 - if the canonical HDF5 file already exists and `force_reload=False`, read it
 - otherwise query the Gaia archive seam, write the canonical file, then return
   the canonical table
+- when `read_only=True`, mark existing table columns as non-writeable; callers
+  that need to derive or mutate working columns should copy first
 
 ### `GaiaSummaryStore.summary_filename() -> Path`
 
@@ -153,7 +155,7 @@ Return the empirical Gaia-to-`R` magnitude estimate used by the legacy guide-sta
 workflow. This is an in-memory Gaia-domain helper and is not part of the raw
 canonical HDF5 contract.
 
-### `load_asterism_stars(store, outer_pix, *, neighbour_level=None, epoch=None, dt_years=None, include_locality=False) -> Table`
+### `load_asterism_stars(store, outer_pix, *, neighbour_level=None, boundary_rings=2, epoch=None, dt_years=None, include_locality=False) -> Table`
 
 Return the Gaia rows needed to search one outer pixel for asterisms.
 
@@ -161,7 +163,11 @@ Behavior:
 
 - load the local outer pixel fully
 - when `neighbour_level` is set, include only the border-trimmed neighbour rows
+  from `boundary_rings` fine-HEALPix rings around the target outer pixel
 - optionally apply Gaia proper motion in-memory
+- the default two-ring boundary provides edge completeness headroom before
+  proper-motion shifting, so stars just outside the raw boundary can still
+  contribute after epoch shifting
 - add the legacy empirical `R` magnitude used by the current asterism search
 - return Gaia-schema rows, optionally enriched with locality columns
 
@@ -214,15 +220,25 @@ Behavior:
 - fail on differing existing files unless `force=True`
 - fail once Traversal has started
 
-### `run_build(build_path, *, workers=1) -> Path`
+### `run_build(build_path, *, workers=1, gaia_cache_entries=None, gaia_cache_mb=None, region_level=None, aosky_conf=None) -> Path`
 
 Run one initialized build through its unfinished outer-pixel work and write
 `outer.h5` artifact containers.
 
-`workers` controls Traversal process parallelism at execution time. It defaults
-to `1` and is not persisted in the build definition or build metadata.
+`workers` controls Traversal execution parallelism at execution time. The
+single-worker default uses a long-lived in-process Traversal worker so runtime
+setup, model caches, and Gaia table caches are reused across outer pixels.
+Multi-worker runs use long-lived regional process workers. Cache-aware
+Traversal uses a worker-local runtime Gaia table cache controlled by
+`gaia_cache_entries`, `gaia_cache_mb`, and `region_level`. Cached runtime Gaia
+rows are derived from raw canonical Gaia files, shifted to the build epoch,
+enriched with `R` and `hpx14`, and marked read-only. These settings and derived
+columns are runtime execution details only; they are not persisted in the build
+definition, build metadata, or canonical Gaia files. Native build Traversal
+expects these runtime rows; raw canonical-row fallback is kept at lower-level
+loader APIs only.
 
-### `restart_build(..., workers=1) -> Path`
+### `restart_build(..., workers=1, gaia_cache_entries=None, gaia_cache_mb=None, region_level=None) -> Path`
 
 Resume the latest build in one AO-system/config lineage, using the same
 execution-time worker-count contract as `run_build`.

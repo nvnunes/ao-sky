@@ -49,6 +49,7 @@ from ao_sky.build.config import (
     resolve_dust_root_only,
     resolve_gaia_root_only,
     resolve_runtime_root_candidates,
+    resolve_traversal_execution_config,
 )
 from ao_sky.build.control import (
     load_build_definition,
@@ -61,9 +62,10 @@ from ao_sky.build.control import (
     update_state_row,
 )
 from ao_sky.build.scheduler import OuterPixelScheduler
+from ao_sky.build.regional import build_regional_worker_plans, order_region_outer_pixs
 from ao_sky.build.artifacts import write_outer_artifact
-from ao_sky.build._models import TraversalTaskResult
-from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
+from ao_sky.build._models import TraversalExecutionConfig, TraversalTaskResult
+from ao_sky.gaia import CachedGaiaHealpixStore, GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore
 
 
 class _ImmediateExecutor:
@@ -99,6 +101,39 @@ class _FailingSubmitExecutor:
 
     def submit(self, fn, context, outer_pix: int) -> Future:
         raise RuntimeError("pool submit broke")
+
+
+class _FakeGaiaStore:
+    def __init__(self) -> None:
+        self.config = GaiaStoreConfig(root="data", release="dr3", healpix_level=0)
+        self.loads: list[int] = []
+        self.tables: dict[int, Table] = {}
+
+    def healpix_filename(self, outer_pix: int) -> Path:
+        return Path(f"{outer_pix}/gaia.h5")
+
+    def load_healpix(
+        self,
+        outer_pix: int,
+        *,
+        force_reload: bool = False,
+        read_only: bool = False,
+    ) -> Table:
+        self.loads.append(int(outer_pix))
+        table = self.tables.get(int(outer_pix))
+        if table is not None:
+            result = table.copy(copy_data=True)
+            if read_only:
+                for name in result.colnames:
+                    result[name].flags.writeable = False
+            return result
+        result = Table()
+        result["source_id"] = np.arange(int(outer_pix) + 1, dtype=np.int64)
+        result["ra"] = np.zeros(int(outer_pix) + 1, dtype=np.float64)
+        if read_only:
+            for name in result.colnames:
+                result[name].flags.writeable = False
+        return result
 
 
 def _write_build_definition(
@@ -657,6 +692,165 @@ def test_fetch_gaia_data_propagates_force_flag(tmp_path: Path, monkeypatch: pyte
     }
 
 
+def test_resolve_traversal_execution_config_uses_defaults_and_aosky_conf(
+    tmp_path: Path,
+) -> None:
+    conf = tmp_path / "aosky.conf"
+    conf.write_text(
+        "\n".join(
+            (
+                "workers: 5",
+                "gaia_cache_entries: 128",
+                "gaia_cache_mb: 4096",
+                "region_level: 3",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = resolve_traversal_execution_config(outer_level=6, aosky_conf=conf)
+
+    assert config == TraversalExecutionConfig(
+        workers=5,
+        gaia_cache_entries=128,
+        gaia_cache_mb=4096,
+        region_level=3,
+    )
+    override = resolve_traversal_execution_config(
+        outer_level=6,
+        workers=3,
+        gaia_cache_entries=64,
+        gaia_cache_mb=2048,
+        region_level=4,
+        aosky_conf=conf,
+    )
+    assert override == TraversalExecutionConfig(
+        workers=3,
+        gaia_cache_entries=64,
+        gaia_cache_mb=2048,
+        region_level=4,
+    )
+
+
+def test_resolve_traversal_execution_config_validates_values() -> None:
+    with pytest.raises(BuildError, match="workers must be at least 1"):
+        resolve_traversal_execution_config(outer_level=2, workers=0)
+    with pytest.raises(BuildError, match="gaia_cache_entries must be non-negative"):
+        resolve_traversal_execution_config(outer_level=2, gaia_cache_entries=-1)
+    with pytest.raises(BuildError, match="region_level must be between 0 and outer_level"):
+        resolve_traversal_execution_config(outer_level=2, region_level=3)
+
+
+def test_cached_gaia_store_hits_misses_and_read_only_reuse() -> None:
+    store = _FakeGaiaStore()
+    cached = CachedGaiaHealpixStore(store, max_entries=4, max_bytes=1024 * 1024)
+
+    first = cached.load_healpix(1)
+    second = cached.load_healpix(1)
+    mutable = cached.load_healpix(1, read_only=False)
+    mutable["ra"][0] = 99.0
+    third = cached.load_healpix(1)
+
+    assert store.loads == [1]
+    assert first is second
+    assert second is third
+    with pytest.raises(ValueError, match="read-only"):
+        first["ra"][0] = 99.0
+    assert float(third["ra"][0]) == 0.0
+    stats = cached.stats()
+    assert stats.hits == 3
+    assert stats.misses == 1
+    assert stats.evictions == 0
+    assert stats.entries == 1
+
+
+def test_cached_gaia_store_force_reload_replaces_cached_table() -> None:
+    store = _FakeGaiaStore()
+    cached = CachedGaiaHealpixStore(store, max_entries=4, max_bytes=1024 * 1024)
+
+    first = cached.load_healpix(1)
+    updated = Table()
+    updated["source_id"] = np.array([42], dtype=np.int64)
+    updated["ra"] = np.array([42.0], dtype=np.float64)
+    store.tables[1] = updated
+    refreshed = cached.load_healpix(1, force_reload=True)
+    again = cached.load_healpix(1)
+
+    assert store.loads == [1, 1]
+    assert first is not refreshed
+    assert refreshed is again
+    assert float(again["ra"][0]) == pytest.approx(42.0)
+
+
+def test_cached_gaia_store_evicts_by_entries_and_bytes() -> None:
+    store = _FakeGaiaStore()
+    by_entries = CachedGaiaHealpixStore(store, max_entries=1, max_bytes=1024 * 1024)
+    by_entries.load_healpix(0)
+    by_entries.load_healpix(1)
+    by_entries.load_healpix(0)
+
+    assert store.loads == [0, 1, 0]
+    assert by_entries.stats().evictions == 2
+
+    byte_store = _FakeGaiaStore()
+    byte_limited = CachedGaiaHealpixStore(byte_store, max_entries=10, max_bytes=16)
+    byte_limited.load_healpix(2)
+    assert byte_limited.stats().entries == 0
+    assert byte_limited.stats().evictions == 1
+
+
+def test_cached_gaia_store_can_be_disabled() -> None:
+    store = _FakeGaiaStore()
+    cached = CachedGaiaHealpixStore(store, max_entries=0, max_bytes=1024)
+
+    cached.load_healpix(1)
+    cached.load_healpix(1)
+
+    assert store.loads == [1, 1]
+    assert cached.stats().entries == 0
+
+
+def test_regional_worker_plans_balance_regions_by_star_count() -> None:
+    state = _make_scheduler_state([WORK_STATUS_PENDING] * 16)
+    star_counts = np.arange(16, dtype=np.int64)
+
+    plans = build_regional_worker_plans(
+        state=state,
+        outer_level=1,
+        region_level=0,
+        workers=3,
+        status_field="traversal_status",
+        star_counts=star_counts,
+    )
+
+    assert len(plans) == 3
+    assert sorted(pix for plan in plans for pix in plan.outer_pixs) == list(range(16))
+    assert sorted(pix for plan in plans for pix in plan.region_pixs) == [0, 1, 2, 3]
+    assert [plan.estimated_star_count for plan in plans] == [54, 38, 28]
+
+
+def test_order_region_outer_pixs_prefers_neighbours(monkeypatch: pytest.MonkeyPatch) -> None:
+    graph = {
+        3: np.asarray([2], dtype=np.int64),
+        2: np.asarray([1], dtype=np.int64),
+        1: np.asarray([0], dtype=np.int64),
+        0: np.asarray([], dtype=np.int64),
+    }
+    monkeypatch.setattr(
+        "ao_sky.build.regional.get_pixel_neighbours",
+        lambda level, pix: graph[pix],
+    )
+    star_counts = np.asarray([1, 2, 3, 4], dtype=np.int64)
+
+    assert order_region_outer_pixs([0, 1, 2, 3], outer_level=0, star_counts=star_counts) == (
+        3,
+        2,
+        1,
+        0,
+    )
+
+
 def test_fetch_model_data_copies_configured_model_bundle_and_updates_metadata(
     tmp_path: Path,
 ) -> None:
@@ -1101,11 +1295,13 @@ def test_run_build_uses_gaia_summary_star_counts_for_initial_seed(
     )
     visited: list[int] = []
 
-    def fake_build_outer(build_path: Path, outer_pix: int) -> None:
+    def fake_materialize(context, outer_pix: int, **kwargs: object) -> None:
         visited.append(int(outer_pix))
-        update_state_row(build_path, int(outer_pix), traversal_status=WORK_STATUS_DONE)
 
-    monkeypatch.setattr("ao_sky.build.runner.build_outer_pixel_products", fake_build_outer)
+    monkeypatch.setattr(
+        "ao_sky.build.runner._materialize_outer_pixel_products",
+        fake_materialize,
+    )
     monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
 
     run_build(build_path)
@@ -1146,8 +1342,9 @@ def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_s
     monkeypatch.setattr("ao_sky.build.runner._create_traversal_executor", fake_executor)
     monkeypatch.setattr("ao_sky.build.runner._run_outer_pixel_traversal_task", fake_task)
     monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
+    monkeypatch.setattr("ao_sky.build.runner.TRAVERSAL_PROGRESS_LOG_INTERVAL", 5)
 
-    run_build(build_path, workers=3)
+    run_build(build_path, workers=3, gaia_cache_entries=0)
 
     assert executors[0].workers == 3
     assert sorted(executors[0].submitted) == list(range(12))
@@ -1159,8 +1356,9 @@ def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_s
     assert summary["current_phase"] == BUILD_PHASE_AGGREGATION
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
     assert "run start phase=traversal repaired_stale_running=0 workers=3" in log_text
-    assert "phase=traversal outer_pix=0 dispatched" in log_text
-    assert "phase=traversal outer_pix=0 completed" in log_text
+    assert "phase=traversal progress completed=5" in log_text
+    assert "phase=traversal outer_pix=0 dispatched" not in log_text
+    assert "phase=traversal outer_pix=0 completed" not in log_text
 
 
 def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
@@ -1192,7 +1390,7 @@ def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
 
     monkeypatch.setattr("ao_sky.build.runner._run_outer_pixel_traversal_task", fake_task)
 
-    run_build(build_path, workers=3)
+    run_build(build_path, workers=3, gaia_cache_entries=0)
 
     state = load_state(build_path)
     assert int(state["traversal_status"][0]) == WORK_STATUS_FAILED
@@ -1203,6 +1401,113 @@ def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
     assert "phase=traversal outer_pix=0 failed: boom" in log_text
     assert "run complete phase=traversal status=failed" in log_text
+
+
+def test_run_build_truncates_overlong_traversal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    state = load_state(build_path)
+    for outer_pix in range(1, len(state)):
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
+
+    def fail_build(*args: object, **kwargs: object) -> tuple[Table, Table]:
+        raise RuntimeError("x" * 2000)
+
+    monkeypatch.setattr("ao_sky.build.runner.build_traversal_products", fail_build)
+
+    run_build(build_path)
+
+    state = load_state(build_path)
+    assert int(state["traversal_status"][0]) == WORK_STATUS_FAILED
+    message = state["traversal_last_error_message"][0].decode("utf-8")
+    assert len(message.encode("utf-8")) <= 1024
+    assert message.endswith("[truncated]")
+    assert summarize_build(build_path)["build_status"] == "failed"
+
+
+def test_run_build_regional_cache_path_updates_parent_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    state = load_state(build_path)
+    for outer_pix in range(3, len(state)):
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
+    seen_configs: list[TraversalExecutionConfig] = []
+
+    def fake_regional_workers(
+        *,
+        build_path: Path,
+        context,
+        state: np.ndarray,
+        plans,
+        execution_config: TraversalExecutionConfig,
+    ) -> bool:
+        seen_configs.append(execution_config)
+        for plan in plans:
+            for outer_pix in plan.outer_pixs:
+                runner_module._handle_regional_worker_message(
+                    build_path=build_path,
+                    state=state,
+                    message=runner_module.TraversalWorkerMessage(
+                        worker_id=plan.worker_id,
+                        kind="started",
+                        outer_pix=outer_pix,
+                    ),
+                )
+                runner_module._handle_regional_worker_message(
+                    build_path=build_path,
+                    state=state,
+                    message=runner_module.TraversalWorkerMessage(
+                        worker_id=plan.worker_id,
+                        kind="completed",
+                        outer_pix=outer_pix,
+                        result=TraversalTaskResult(outer_pix=outer_pix, success=True),
+                    ),
+                )
+        return False
+
+    monkeypatch.setattr(
+        "ao_sky.build.runner._run_regional_traversal_workers",
+        fake_regional_workers,
+    )
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
+
+    run_build(build_path, workers=3, gaia_cache_entries=64, gaia_cache_mb=2048)
+
+    assert seen_configs == [
+        TraversalExecutionConfig(
+            workers=3,
+            gaia_cache_entries=64,
+            gaia_cache_mb=2048,
+            region_level=0,
+        )
+    ]
+    state = load_state(build_path)
+    assert int(state["traversal_status"][0]) == WORK_STATUS_DONE
+    assert int(state["traversal_attempt_count"][0]) == 1
+    assert np.all(state["traversal_status"] == WORK_STATUS_DONE)
+    assert summarize_build(build_path)["build_status"] == "completed"
 
 
 def test_run_build_parallel_executor_creation_failure_marks_build_failed(
@@ -1225,7 +1530,7 @@ def test_run_build_parallel_executor_creation_failure_marks_build_failed(
     monkeypatch.setattr("ao_sky.build.runner._create_traversal_executor", fail_create)
 
     with pytest.raises(RuntimeError, match="semaphore denied"):
-        run_build(build_path, workers=3)
+        run_build(build_path, workers=3, gaia_cache_entries=0)
 
     summary = summarize_build(build_path)
     assert summary["build_status"] == "failed"
@@ -1259,7 +1564,7 @@ def test_run_build_parallel_submit_failure_resets_running_rows(
     )
 
     with pytest.raises(RuntimeError, match="pool submit broke"):
-        run_build(build_path, workers=3)
+        run_build(build_path, workers=3, gaia_cache_entries=0)
 
     assert executor.shutdown_calls == [(False, True)]
     state = load_state(build_path)
@@ -1353,8 +1658,20 @@ def test_restart_build_uses_latest_lineage_version(
 
     captured: dict[str, object] = {}
 
-    def fake_run_build(build_path: Path, *, workers: int = 1) -> Path:
+    def fake_run_build(
+        build_path: Path,
+        *,
+        workers: int | None = 1,
+        gaia_cache_entries: int | None = None,
+        gaia_cache_mb: int | None = None,
+        region_level: int | None = None,
+        aosky_conf: Path | None = None,
+    ) -> Path:
         captured["workers"] = workers
+        captured["gaia_cache_entries"] = gaia_cache_entries
+        captured["gaia_cache_mb"] = gaia_cache_mb
+        captured["region_level"] = region_level
+        captured["aosky_conf"] = aosky_conf
         return build_path
 
     monkeypatch.setattr("ao_sky.build.runner.run_build", fake_run_build)
@@ -1367,7 +1684,13 @@ def test_restart_build_uses_latest_lineage_version(
     )
 
     assert restarted == latest
-    assert captured == {"workers": 3}
+    assert captured == {
+        "workers": 3,
+        "gaia_cache_entries": None,
+        "gaia_cache_mb": None,
+        "region_level": None,
+        "aosky_conf": None,
+    }
 
 
 def test_run_build_repairs_stale_running_rows_and_logs_it(
@@ -1473,7 +1796,7 @@ def test_run_build_continues_after_failure_and_marks_build_failed(
     summary = summarize_build(build_path)
     assert summary["build_status"] == "failed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "phase=traversal outer_pix=0 failed: boom" in log_text
+    assert "phase=traversal worker=0 outer_pix=0 failed: boom" in log_text
     assert "run complete phase=traversal status=failed" in log_text
 
 

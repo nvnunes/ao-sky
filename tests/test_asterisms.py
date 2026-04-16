@@ -60,7 +60,9 @@ def test_load_asterism_stars_returns_local_rows_only(tmp_path: Path, monkeypatch
     monkeypatch.setattr(
         GaiaHealpixStore,
         "load_healpix",
-        lambda self, pix, force_reload=False: local if pix == 0 else _empty_gaia_table(),
+        lambda self, pix, force_reload=False, read_only=False: local
+        if pix == 0
+        else _empty_gaia_table(),
     )
 
     stars = load_asterism_stars(store, 0)
@@ -92,7 +94,18 @@ def test_load_asterism_stars_border_trims_neighbour_rows(
     bordering_coord = get_pixel_skycoord(neighbour_level, int(bordering[0]))
     interior_coord = get_pixel_skycoord(neighbour_level, interior_subpixel)
 
-    local = _gaia_table([(101, float(local_coord.ra.degree), float(local_coord.dec.degree), 12.0, 0.0, 0.0)])
+    local = _gaia_table(
+        [
+            (
+                101,
+                float(local_coord.ra.degree),
+                float(local_coord.dec.degree),
+                12.0,
+                0.0,
+                0.0,
+            )
+        ]
+    )
     neighbour = _gaia_table(
         [
             (202, float(bordering_coord.ra.degree), float(bordering_coord.dec.degree), 13.0, 0.0, 0.0),
@@ -100,7 +113,12 @@ def test_load_asterism_stars_border_trims_neighbour_rows(
         ]
     )
 
-    def fake_load(self: GaiaHealpixStore, pix: int, force_reload: bool = False) -> Table:
+    def fake_load(
+        self: GaiaHealpixStore,
+        pix: int,
+        force_reload: bool = False,
+        read_only: bool = False,
+    ) -> Table:
         if pix == outer_pix:
             return local
         if pix == neighbour_outer_pix:
@@ -108,17 +126,164 @@ def test_load_asterism_stars_border_trims_neighbour_rows(
         return _empty_gaia_table()
 
     monkeypatch.setattr(GaiaHealpixStore, "load_healpix", fake_load)
+    copy_lengths: list[int] = []
+    real_copy = Table.copy
+
+    def tracking_copy(self: Table, *args: object, **kwargs: object) -> Table:
+        copy_lengths.append(len(self))
+        return real_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(Table, "copy", tracking_copy)
 
     stars = load_asterism_stars(
         store,
         outer_pix,
         neighbour_level=neighbour_level,
+        boundary_rings=1,
         include_locality=True,
     )
 
     assert stars["source_id"].tolist() == [101, 202]
     assert stars["is_local"].tolist() == [True, False]
     assert stars["source_outer_pix"].tolist() == [outer_pix, neighbour_outer_pix]
+    assert len(neighbour) not in copy_lengths
+
+
+def test_load_asterism_stars_uses_runtime_hpx14_for_neighbour_trim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer_level = 1
+    neighbour_level = 2
+    outer_pix = 0
+    store = GaiaHealpixStore(GaiaStoreConfig(root=tmp_path, release="dr3", healpix_level=outer_level))
+
+    local_subpixels = get_subpixels(outer_level, outer_pix, neighbour_level)
+    bordering = np.setdiff1d(
+        np.unique(np.concatenate([get_pixel_neighbours(neighbour_level, int(pixel)) for pixel in local_subpixels])),
+        local_subpixels,
+    )
+    neighbour_outer_pix = int(get_parent_pixel(neighbour_level, int(bordering[0]), outer_level))
+    local_coord = get_pixel_skycoord(neighbour_level, int(local_subpixels[0]))
+    bordering_coord = get_pixel_skycoord(neighbour_level, int(bordering[0]))
+    local = _gaia_table(
+        [(101, float(local_coord.ra.degree), float(local_coord.dec.degree), 12.0, 0.0, 0.0)]
+    )
+    neighbour = _gaia_table(
+        [
+            (202, float(bordering_coord.ra.degree), float(bordering_coord.dec.degree), 13.0, 0.0, 0.0),
+            (303, np.nan, float(bordering_coord.dec.degree), 14.0, 0.0, 0.0),
+        ]
+    )
+    local["hpx14"] = np.asarray([int(local_subpixels[0]) * 4 ** (14 - neighbour_level)])
+    neighbour["hpx14"] = np.asarray([int(bordering[0]) * 4 ** (14 - neighbour_level), -1])
+
+    def fake_load(
+        self: GaiaHealpixStore,
+        pix: int,
+        force_reload: bool = False,
+        read_only: bool = False,
+    ) -> Table:
+        if pix == outer_pix:
+            return local
+        if pix == neighbour_outer_pix:
+            return neighbour
+        return _empty_gaia_table()
+
+    monkeypatch.setattr(GaiaHealpixStore, "load_healpix", fake_load)
+    monkeypatch.setattr(
+        "ao_sky.asterisms.loader.get_pixel_from_skycoord",
+        lambda *args, **kwargs: pytest.fail("hpx14 was not used for neighbour trim"),
+    )
+
+    stars = load_asterism_stars(
+        store,
+        outer_pix,
+        neighbour_level=neighbour_level,
+        boundary_rings=1,
+        include_locality=True,
+    )
+
+    assert stars["source_id"].tolist() == [101, 202]
+
+
+def test_load_asterism_stars_defaults_to_two_boundary_rings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer_level = 1
+    neighbour_level = 3
+    outer_pix = 0
+    store = GaiaHealpixStore(GaiaStoreConfig(root=tmp_path, release="dr3", healpix_level=outer_level))
+
+    local_subpixels = set(
+        int(pixel)
+        for pixel in get_subpixels(outer_level, outer_pix, neighbour_level)
+    )
+    first_ring = set(
+        int(neighbour)
+        for pixel in local_subpixels
+        for neighbour in get_pixel_neighbours(neighbour_level, int(pixel))
+        if int(neighbour) not in local_subpixels
+    )
+    second_ring = set(
+        int(neighbour)
+        for pixel in first_ring
+        for neighbour in get_pixel_neighbours(neighbour_level, int(pixel))
+        if int(neighbour) not in local_subpixels and int(neighbour) not in first_ring
+    )
+    second_ring_subpixel = min(second_ring)
+    second_ring_outer_pix = int(
+        get_parent_pixel(neighbour_level, second_ring_subpixel, outer_level)
+    )
+
+    local_coord = get_pixel_skycoord(neighbour_level, min(local_subpixels))
+    second_ring_coord = get_pixel_skycoord(neighbour_level, second_ring_subpixel)
+    local = _gaia_table([(101, float(local_coord.ra.degree), float(local_coord.dec.degree), 12.0, 0.0, 0.0)])
+    neighbour = _gaia_table(
+        [
+            (
+                202,
+                float(second_ring_coord.ra.degree),
+                float(second_ring_coord.dec.degree),
+                13.0,
+                0.0,
+                0.0,
+            )
+        ]
+    )
+
+    def fake_load(
+        self: GaiaHealpixStore,
+        pix: int,
+        force_reload: bool = False,
+        read_only: bool = False,
+    ) -> Table:
+        if pix == outer_pix:
+            return local
+        if pix == second_ring_outer_pix:
+            return neighbour
+        return _empty_gaia_table()
+
+    monkeypatch.setattr(GaiaHealpixStore, "load_healpix", fake_load)
+
+    one_ring = load_asterism_stars(
+        store,
+        outer_pix,
+        neighbour_level=neighbour_level,
+        boundary_rings=1,
+        include_locality=True,
+    )
+    two_rings = load_asterism_stars(
+        store,
+        outer_pix,
+        neighbour_level=neighbour_level,
+        include_locality=True,
+    )
+
+    assert one_ring["source_id"].tolist() == [101]
+    assert two_rings["source_id"].tolist() == [101, 202]
+    assert two_rings["source_outer_pix"].tolist() == [outer_pix, second_ring_outer_pix]
 
 
 def test_load_asterism_stars_applies_proper_motion(
@@ -130,7 +295,9 @@ def test_load_asterism_stars_applies_proper_motion(
     monkeypatch.setattr(
         GaiaHealpixStore,
         "load_healpix",
-        lambda self, pix, force_reload=False: local if pix == 0 else _empty_gaia_table(),
+        lambda self, pix, force_reload=False, read_only=False: local
+        if pix == 0
+        else _empty_gaia_table(),
     )
 
     stars = load_asterism_stars(store, 0, epoch=2017.0)

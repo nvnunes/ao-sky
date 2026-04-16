@@ -53,6 +53,8 @@ commands:
 ./.conda/bin/ao-sky fetch-dust --help
 ./.conda/bin/ao-sky fetch-gaia --help
 ./.conda/bin/ao-sky fetch-model --help
+./.conda/bin/ao-sky run --help
+./.conda/bin/ao-sky restart --help
 ```
 
 When the public build surface changes, also smoke-check the build lifecycle.

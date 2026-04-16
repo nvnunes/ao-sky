@@ -135,6 +135,13 @@ def test_module_cli_help_lists_run_worker_options() -> None:
 
     assert "--workers" in run_result.stdout
     assert "--workers" in restart_result.stdout
+    assert "--gaia-cache-entries" in run_result.stdout
+    assert "--gaia-cache-entries" in restart_result.stdout
+    assert "--gaia-cache-mb" in run_result.stdout
+    assert "--gaia-cache-mb" in restart_result.stdout
+    assert "--region-level" in run_result.stdout
+    assert "--region-level" in restart_result.stdout
+    assert "--aosky-conf" in run_result.stdout
 
 
 def test_module_cli_run_rejects_invalid_worker_count(tmp_path: Path) -> None:
