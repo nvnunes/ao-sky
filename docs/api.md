@@ -196,14 +196,18 @@ Behavior:
 - resolve `gaia_root`, `build_root`, and `dust_root` from explicit arguments or `aosky.conf`
 - persist the resolved roots into `build.h5`
 
-### `run_build(build_path) -> Path`
+### `run_build(build_path, *, workers=1) -> Path`
 
 Run one initialized build through its unfinished outer-pixel work and write
 `outer.h5` artifact containers.
 
-### `restart_build(...) -> Path`
+`workers` controls Traversal process parallelism at execution time. It defaults
+to `1` and is not persisted in the build definition or build metadata.
 
-Resume the latest build in one AO-system/config lineage.
+### `restart_build(..., workers=1) -> Path`
+
+Resume the latest build in one AO-system/config lineage, using the same
+execution-time worker-count contract as `run_build`.
 
 ### `show_build(build_path) -> str`
 

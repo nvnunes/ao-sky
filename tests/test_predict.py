@@ -25,7 +25,7 @@ from ao_sky.gaia._constants import GAIA_SCHEMA_COLUMNS
 from ao_sky.predict import PredictError
 from ao_sky.predict import backend as predict_backend
 from ao_sky.predict import service as predict_service
-from ao_sky.predict._models import PointPredictionBatch
+from ao_sky.predict._models import AOSystemRuntime, PointPredictionBatch, PredictRuntime
 
 
 def _write_legacy_config(path: Path) -> Path:
@@ -224,8 +224,104 @@ def test_clear_backend_cache_releases_loaded_backend_models(
     predict_service.clear_backend_cache()
 
     assert cleared == [point_model, mean_model]
-    assert predict_service._POINT_MODEL_CACHE == {}
-    assert predict_service._MEAN_MODEL_CACHE == {}
+    assert predict_service._POINT_MODEL_CACHE == {"point:test:2star": point_model}
+    assert predict_service._MEAN_MODEL_CACHE == {"mean:test:3star": mean_model}
+
+
+def _make_predict_runtime(
+    *,
+    model_root: Path,
+    point_model: str = "point-a.pt",
+    mean_model: str = "mean-a.pt",
+) -> PredictRuntime:
+    ao_system = AOSystemRuntime(
+        name="GNAO",
+        band="R",
+        fov=120.0 * u.arcsec,
+        fov_1ngs=120.0 * u.arcsec,
+        lgs=(),
+        min_wfs=2,
+        max_wfs=2,
+        min_mag=8.0,
+        nom_mag=12.0,
+        max_mag=18.5,
+        min_sep=5.0 * u.arcsec,
+        max_sep=120.0 * u.arcsec,
+        min_rel_sep=0.0,
+        max_rel_sep=0.0,
+        min_rel_area=0.0,
+        max_rel_area=0.0,
+        point_models={"2star": point_model},
+        mean_models={"2star": mean_model},
+        rot_range=None,
+        rot_step=None,
+    )
+    return PredictRuntime(
+        ao_system=ao_system,
+        outer_level=0,
+        inner_level=1,
+        epoch=2028.0,
+        min_galactic_latitude=None,
+        max_star_density=None,
+        max_bright_star_mag=None,
+        max_overlap=None,
+        prediction_wavelength=1.654 * u.micron,
+        seeing_reference_wavelength=0.5 * u.micron,
+        seeing_reference_sr=0.0,
+        seeing_reference_ee=0.0,
+        seeing_reference_fwhm=0.0,
+        coverage_ee_threshold_resolved=0.25,
+        coverage_ee_threshold_mean=0.25,
+        model_root=model_root,
+        legacy_config_path=model_root / "legacy.yaml",
+    )
+
+
+def test_model_cache_key_includes_model_root_and_model_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predict_service._POINT_MODEL_CACHE.clear()
+    predict_service._MEAN_MODEL_CACHE.clear()
+    loaded: list[tuple[Path, str]] = []
+
+    def fake_load_model(model_root: Path, model_name: str, force_cpu: bool = True) -> object:
+        loaded.append((Path(model_root), model_name))
+        return f"{Path(model_root).name}:{model_name}"
+
+    monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
+    runtime_a = _make_predict_runtime(model_root=tmp_path / "models-a")
+    runtime_b = _make_predict_runtime(model_root=tmp_path / "models-b")
+    runtime_c = _make_predict_runtime(
+        model_root=tmp_path / "models-a",
+        point_model="point-c.pt",
+    )
+
+    assert predict_service.get_point_model(runtime_a, 2) == "models-a:point-a.pt"
+    assert predict_service.get_point_model(runtime_b, 2) == "models-b:point-a.pt"
+    assert predict_service.get_point_model(runtime_c, 2) == "models-a:point-c.pt"
+    assert predict_service.get_point_model(runtime_a, 2) == "models-a:point-a.pt"
+
+    assert loaded == [
+        (tmp_path / "models-a", "point-a.pt"),
+        (tmp_path / "models-b", "point-a.pt"),
+        (tmp_path / "models-a", "point-c.pt"),
+    ]
+
+
+def test_configure_inference_threads_sets_backend_thread_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(
+        predict_service.backend,
+        "configure_inference_threads",
+        lambda num_threads: calls.append(num_threads),
+    )
+
+    predict_service.configure_inference_threads(1)
+
+    assert calls == [1]
 
 
 def test_winner_fields_remain_local_when_neighbour_has_better_best_ee(

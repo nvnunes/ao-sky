@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 from importlib import import_module
+import os
 from pathlib import Path
 import sys
 
 from ._exceptions import PredictError
+
+INFERENCE_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
 
 
 def _get_training_module():
@@ -89,3 +98,19 @@ def clear_cache(model) -> None:
 
     training = _get_training_module()
     training.clear_cache(model)
+
+
+def configure_inference_threads(num_threads: int) -> None:
+    """Pin backend inference libraries to a bounded thread count."""
+
+    resolved = max(1, int(num_threads))
+    for env_var in INFERENCE_THREAD_ENV_VARS:
+        os.environ[env_var] = str(resolved)
+
+    try:
+        import torch
+
+        torch.set_num_threads(resolved)
+        torch.set_num_interop_threads(1)
+    except (ImportError, RuntimeError):
+        pass

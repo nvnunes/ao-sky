@@ -196,6 +196,9 @@ Build execution is organized around restartable outer-pixel work.
 - Traversal should prefer neighbouring unfinished outer pixels whenever
   possible.
 - Work balancing should use star count or another practical work proxy.
+- Traversal can run with multiple joblib/loky process workers as an
+  execution-time option; worker count is not part of the persisted build
+  contract.
 - Build creation depends on a shared Gaia summary for the configured Gaia
   release and outer level.
 - Build state should record:

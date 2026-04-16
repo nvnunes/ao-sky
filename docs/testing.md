@@ -129,13 +129,24 @@ For live migration comparisons against `survey_tools`, use the repo helper:
 ./.conda/bin/python scripts/compare_legacy_asterisms.py --sample smoke --model-root ../survey_tools/data/models
 ```
 
-The default `smoke` sample intentionally avoids the slower pathological outer
-pixels so routine phase work does not spend most of its time in a few crowded
-regions. Use the broader sample only when you want a heavier check:
+The default `smoke` sample intentionally uses low-density loaded outer pixels
+so routine phase work does not spend most of its time in a few crowded regions.
+Use the broader low-density 12-pixel sample when you want a heavier check:
 
 ```bash
 ./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full --model-root ../survey_tools/data/models
 ```
+
+When validating parallel Traversal changes, run the broader comparison through
+the `ao-sky` runner with three workers:
+
+```bash
+./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full --workers 3 --allow-local-winner-divergence --model-root ../survey_tools/data/models
+```
+
+The local-winner divergence flag preserves strict comparison for retained
+asterisms and non-winner inner fields while allowing the intentional `ao-sky`
+contract difference that only traceable local winners are persisted.
 
 For sparse all-sky aggregation comparisons against legacy, use the same helper
 with `--maps`:

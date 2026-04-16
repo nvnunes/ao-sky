@@ -169,8 +169,8 @@ Example CLI flow with explicit roots:
   --model-root /data/models
 
 ./.conda/bin/ao-sky show /data/ao-builds/GNAO-baseline-v1
-./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1
-./.conda/bin/ao-sky restart GNAO baseline --build-root /data/ao-builds
+./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1 --workers 3
+./.conda/bin/ao-sky restart GNAO baseline --build-root /data/ao-builds --workers 3
 ```
 
 During the current migration phase, `init` also accepts `--legacy-config` to

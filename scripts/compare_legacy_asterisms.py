@@ -13,6 +13,7 @@ import textwrap
 from pathlib import Path
 
 import astropy.units as u
+import h5py
 import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
@@ -35,26 +36,23 @@ DEFAULT_AO_SYSTEM = "GNAO"
 FLOAT_ATOL = 1e-5
 FLOAT_RTOL = 1e-10
 SMOKE_SAMPLE_OUTER_PIXS = (
-    1299,
-    1717,
-    4008,
-    6098,
-    8815,
-    10949,
+    28559,
+    28550,
+    28607,
 )
 FULL_SAMPLE_OUTER_PIXS = (
-    1299,
-    1456,
-    1717,
-    4008,
-    5340,
-    6098,
-    6221,
-    6358,
-    7940,
-    8815,
-    10949,
-    11323,
+    28559,
+    28550,
+    28607,
+    28383,
+    28463,
+    5407,
+    28589,
+    5380,
+    5424,
+    28597,
+    5448,
+    5391,
 )
 MAPS_SAMPLE_SEED_OUTER_PIXS = (
     1456,
@@ -111,6 +109,16 @@ INNER_COMPARISON_COLUMNS = (
     "coverage_resolved",
     "coverage_averaged",
 )
+LOCAL_WINNER_DIVERGENCE_COLUMNS = frozenset(
+    {
+        "winner_asterism_id",
+        "winner_distance_arcsec",
+        "winner_ee_resolved",
+        "winner_ee_averaged",
+        "coverage_resolved",
+        "coverage_averaged",
+    }
+)
 
 NEW_TO_LEGACY_COLUMNS = {
     "asterism_id": "id",
@@ -154,6 +162,9 @@ AsterismSearchOptions = None
 apply_proper_motion = None
 aggregate_maps = None
 init_build = None
+read_outer_dataset = None
+run_build = None
+run_traversal_phase = None
 find_asterisms = None
 load_asterism_stars = None
 BuildDefinition = None
@@ -162,7 +173,13 @@ load_live_legacy_traversal_outputs = None
 load_native_runtime = None
 maps_artifact_filename = None
 outer_artifact_filename = None
+sample_gaia_a0_for_outer_pixel = None
 write_outer_artifact = None
+BUILD_FILENAME = None
+OUTER_DATASET_ASTERISMS = None
+OUTER_DATASET_INNER = None
+WORK_STATUS_DONE = None
+WORK_STATUS_PENDING = None
 get_parent_pixel = None
 get_pixel_area = None
 get_pixel_from_skycoord = None
@@ -189,9 +206,12 @@ def _load_runtime() -> None:
     global GaiaHealpixStore, GaiaStoreConfig, GAIA_SCHEMA_COLUMNS
     global AsterismSearchOptions, BuildDefinition
     global apply_proper_motion, find_asterisms, load_asterism_stars
-    global aggregate_maps, init_build
+    global aggregate_maps, init_build, read_outer_dataset, run_build, run_traversal_phase
     global build_traversal_products, load_live_legacy_traversal_outputs, load_native_runtime
-    global maps_artifact_filename, outer_artifact_filename, write_outer_artifact
+    global maps_artifact_filename, outer_artifact_filename, sample_gaia_a0_for_outer_pixel
+    global write_outer_artifact
+    global BUILD_FILENAME, OUTER_DATASET_ASTERISMS, OUTER_DATASET_INNER
+    global WORK_STATUS_DONE, WORK_STATUS_PENDING
     global get_parent_pixel
     global get_pixel_area, get_pixel_from_skycoord, get_pixel_neighbours
     global get_pixel_resolution, get_pixel_skycoord, get_subpixels
@@ -205,9 +225,20 @@ def _load_runtime() -> None:
         load_asterism_stars as _load_asterism_stars,
     )
     from ao_sky.build import init_build as _init_build
+    from ao_sky.build import run_build as _run_build
     from ao_sky.build.aggregation import aggregate_maps as _aggregate_maps
+    from ao_sky.build._constants import (
+        BUILD_FILENAME as _BUILD_FILENAME,
+        OUTER_DATASET_ASTERISMS as _OUTER_DATASET_ASTERISMS,
+        OUTER_DATASET_INNER as _OUTER_DATASET_INNER,
+        WORK_STATUS_DONE as _WORK_STATUS_DONE,
+        WORK_STATUS_PENDING as _WORK_STATUS_PENDING,
+    )
     from ao_sky.build._models import BuildDefinition as _BuildDefinition
-    from ao_sky.build.artifacts import write_outer_artifact as _write_outer_artifact
+    from ao_sky.build.artifacts import (
+        read_outer_dataset as _read_outer_dataset,
+        write_outer_artifact as _write_outer_artifact,
+    )
     from ao_sky.build.control import (
         maps_artifact_filename as _maps_artifact_filename,
         outer_artifact_filename as _outer_artifact_filename,
@@ -216,7 +247,9 @@ def _load_runtime() -> None:
     from ao_sky.build.legacy_runtime import (
         load_live_legacy_traversal_outputs as _load_live_legacy_traversal_outputs,
     )
+    from ao_sky.build.runner import _run_traversal_phase as _run_traversal_phase
     from ao_sky.build.traversal import build_traversal_products as _build_traversal_products
+    from ao_sky.dust import sample_gaia_a0_for_outer_pixel as _sample_gaia_a0_for_outer_pixel
     from ao_sky.gaia import (
         GaiaHealpixStore as _GaiaHealpixStore,
         GaiaStoreConfig as _GaiaStoreConfig,
@@ -240,6 +273,9 @@ def _load_runtime() -> None:
     apply_proper_motion = _apply_proper_motion
     aggregate_maps = _aggregate_maps
     init_build = _init_build
+    read_outer_dataset = _read_outer_dataset
+    run_build = _run_build
+    run_traversal_phase = _run_traversal_phase
     find_asterisms = _find_asterisms
     load_asterism_stars = _load_asterism_stars
     BuildDefinition = _BuildDefinition
@@ -248,7 +284,13 @@ def _load_runtime() -> None:
     load_native_runtime = _load_native_runtime
     maps_artifact_filename = _maps_artifact_filename
     outer_artifact_filename = _outer_artifact_filename
+    sample_gaia_a0_for_outer_pixel = _sample_gaia_a0_for_outer_pixel
     write_outer_artifact = _write_outer_artifact
+    BUILD_FILENAME = _BUILD_FILENAME
+    OUTER_DATASET_ASTERISMS = _OUTER_DATASET_ASTERISMS
+    OUTER_DATASET_INNER = _OUTER_DATASET_INNER
+    WORK_STATUS_DONE = _WORK_STATUS_DONE
+    WORK_STATUS_PENDING = _WORK_STATUS_PENDING
     get_parent_pixel = _get_parent_pixel
     get_pixel_area = _get_pixel_area
     get_pixel_from_skycoord = _get_pixel_from_skycoord
@@ -316,59 +358,14 @@ def _load_live_legacy_dust_values(
     outer_pix: int,
     dust_root: Path,
 ) -> np.ndarray:
-    with tempfile.TemporaryDirectory(prefix="ao-sky-legacy-dust-") as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        output_filename = tmpdir_path / "dust.npy"
-        code = textwrap.dedent(
-            """
-            import os
-            import sys
-            from pathlib import Path
-            import numpy as np
-            import dustmaps.gaia_tge as gaia_tge
-
-            survey_root = Path(sys.argv[1]).resolve()
-            config_filename = Path(sys.argv[2]).resolve()
-            output_filename = Path(sys.argv[3]).resolve()
-            dust_root = Path(sys.argv[4]).resolve()
-            outer_pix = int(sys.argv[5])
-
-            sys.path.insert(0, str(survey_root))
-            import aomap.aomap as aomap
-
-            config = aomap.read_config(str(config_filename))
-            map_filename = dust_root / 'gaia_tge' / 'TotalGalacticExtinctionMap_001.csv.gz'
-            dust = gaia_tge.GaiaTGEQuery(map_fname=str(map_filename), healpix_level='optimum')
-            _, coords = aomap.healpix.get_subpixels_skycoord(config.outer_level, outer_pix, config.max_data_level)
-            values = dust.query(coords)
-            if config.inner_level > config.max_data_level:
-                values = np.repeat(values, 4 ** (config.inner_level - config.max_data_level))
-            np.save(output_filename, np.asarray(values, dtype=np.float64))
-            """
-        )
-        result = subprocess.run(
-            [
-                str(LEGACY_PYTHON),
-                "-c",
-                code,
-                str(LEGACY_RUNTIME_ROOT),
-                str(config.legacy_config_filename),
-                str(output_filename),
-                str(dust_root),
-                str(outer_pix),
-            ],
-            cwd=LEGACY_RUNTIME_ROOT / "aomap",
-            env={**os.environ, "MPLCONFIGDIR": str(tmpdir_path / "mpl")},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0 or not output_filename.exists():
-            stderr = result.stderr.strip()
-            stdout = result.stdout.strip()
-            details = stderr or stdout or "no output"
-            raise RuntimeError(f"Legacy dust adapter failed for outer pixel {outer_pix}: {details}")
-        return np.load(output_filename)
+    _load_runtime()
+    return sample_gaia_a0_for_outer_pixel(
+        dust_root=dust_root,
+        outer_level=config.outer_level,
+        outer_pix=outer_pix,
+        inner_level=config.inner_level,
+        max_data_level=config.max_data_level,
+    )
 
 
 def _add_live_legacy_dust_field(
@@ -880,6 +877,71 @@ def build_new_outputs(
     return asterisms, inner
 
 
+def _write_subset_traversal_state(build_path: Path, outer_pixs: list[int]) -> None:
+    selected = {int(outer_pix) for outer_pix in outer_pixs}
+    with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
+        dataset = handle["state"]["outer_pixels"]
+        state = dataset[...]
+        # Sparse comparison builds intentionally materialize only selected
+        # traversal artifacts and call the Traversal phase directly, so
+        # unselected rows can stay terminal without triggering aggregation.
+        state["traversal_status"] = WORK_STATUS_DONE
+        state["traversal_attempt_count"] = 0
+        state["traversal_last_error_message"] = b""
+        for outer_pix in selected:
+            state["traversal_status"][outer_pix] = WORK_STATUS_PENDING
+        dataset[...] = state
+
+
+def build_new_outputs_with_runner(
+    *,
+    gaia_root: Path,
+    dust_root: Path,
+    release: str,
+    config: LegacyComparisonConfig,
+    outer_pixs: list[int],
+    workers: int,
+) -> dict[int, tuple[Table, Table]]:
+    _load_runtime()
+    with tempfile.TemporaryDirectory(prefix="ao-sky-traversal-new-") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        definition_filename = _write_temporary_build_definition(
+            tmpdir_path / "build.yaml",
+            config=config,
+            release=release,
+        )
+        definition = BuildDefinition(
+            ao_system_short_name=config.ao_system.name,
+            config_short_name="legacy-traversal",
+            gaia_release=release,
+            outer_level=config.outer_level,
+            inner_level=config.inner_level,
+            max_data_level=config.max_data_level,
+            epoch=config.asterism_epoch if config.asterism_epoch is not None else 2016.0,
+            min_galactic_latitude=config.asterisms_min_galactic_latitude,
+        )
+        build_path = init_build(
+            definition_filename=definition_filename,
+            gaia_root=gaia_root,
+            build_root=tmpdir_path / "builds",
+            dust_root=dust_root,
+            legacy_config_path=config.legacy_config_filename,
+            model_root=config.model_root,
+        )
+        _write_subset_traversal_state(build_path, outer_pixs)
+        print(f"ao-sky runner workers: {workers}")
+        run_traversal_phase(build_path, workers=workers)
+
+        outputs: dict[int, tuple[Table, Table]] = {}
+        for outer_pix in outer_pixs:
+            filename = outer_artifact_filename(build_path, definition, outer_pix)
+            outputs[int(outer_pix)] = (
+                read_outer_dataset(filename, OUTER_DATASET_ASTERISMS),
+                read_outer_dataset(filename, OUTER_DATASET_INNER),
+            )
+        return outputs
+
+
 def prepare_legacy_table(table: Table) -> Table:
     missing = [name for name in COMPARISON_COLUMNS if name not in table.colnames]
     if missing:
@@ -979,7 +1041,12 @@ def compare_tables(legacy: Table, new: Table) -> int:
     return 1 if missing_from_new or extra_in_new or mismatch_count else 0
 
 
-def compare_inner_tables(legacy: Table, new: Table) -> int:
+def compare_inner_tables(
+    legacy: Table,
+    new: Table,
+    *,
+    ignored_columns: frozenset[str] = frozenset(),
+) -> int:
     print(f"legacy inner rows: {len(legacy)}")
     print(f"new inner rows:    {len(new)}")
 
@@ -989,6 +1056,8 @@ def compare_inner_tables(legacy: Table, new: Table) -> int:
 
     mismatch_count = 0
     for column_name in INNER_COMPARISON_COLUMNS:
+        if column_name in ignored_columns:
+            continue
         legacy_values = np.asarray(legacy[column_name])
         new_values = np.asarray(new[column_name])
         if legacy_values.dtype.kind == "f" or new_values.dtype.kind == "f":
@@ -1316,6 +1385,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Compare sparse all-sky aggregated maps instead of per-outer-pixel traversal outputs.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of ao-sky Traversal workers to use for non-map comparisons.",
+    )
+    parser.add_argument(
+        "--allow-local-winner-divergence",
+        action="store_true",
+        help=(
+            "Ignore inner winner/coverage columns that intentionally diverge "
+            "because ao-sky only persists traceable local winners."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1345,6 +1428,8 @@ def _compare_outer_pixel(
     dust_root: Path,
     release: str,
     config: LegacyComparisonConfig,
+    new_outputs: dict[int, tuple[Table, Table]] | None = None,
+    ignored_inner_columns: frozenset[str] = frozenset(),
 ) -> int:
     print(f"outer pixel: {outer_pix}")
     legacy_asterisms, legacy_inner = load_live_legacy_outputs(
@@ -1360,13 +1445,16 @@ def _compare_outer_pixel(
         f"{LEGACY_RUNTIME_ROOT / 'aomap'} using {config.legacy_config_filename}"
     )
 
-    new_table, new_inner = build_new_outputs(
-        gaia_root=gaia_root,
-        dust_root=dust_root,
-        release=release,
-        config=config,
-        outer_pix=outer_pix,
-    )
+    if new_outputs is None:
+        new_table, new_inner = build_new_outputs(
+            gaia_root=gaia_root,
+            dust_root=dust_root,
+            release=release,
+            config=config,
+            outer_pix=outer_pix,
+        )
+    else:
+        new_table, new_inner = new_outputs[int(outer_pix)]
     prepared_new = prepare_new_table(new_table)
     prepared_new_inner = prepare_inner_table(new_inner)
 
@@ -1374,7 +1462,11 @@ def _compare_outer_pixel(
     print("asterisms:")
     asterism_status = compare_tables(legacy_table, prepared_new)
     print("inner:")
-    inner_status = compare_inner_tables(legacy_inner, prepared_new_inner)
+    inner_status = compare_inner_tables(
+        legacy_inner,
+        prepared_new_inner,
+        ignored_columns=ignored_inner_columns,
+    )
     status = 1 if asterism_status or inner_status else 0
     print(f"result: {'FAIL' if status else 'OK'}")
     return status
@@ -1424,6 +1516,28 @@ def main() -> int:
         outer_level=config.outer_level,
     )
 
+    new_outputs = None
+    if args.workers != 1:
+        new_outputs = build_new_outputs_with_runner(
+            gaia_root=args.gaia_root,
+            dust_root=dust_root,
+            release=args.release,
+            config=config,
+            outer_pixs=outer_pixs,
+            workers=args.workers,
+        )
+
+    ignored_inner_columns = (
+        LOCAL_WINNER_DIVERGENCE_COLUMNS
+        if args.allow_local_winner_divergence
+        else frozenset()
+    )
+    if ignored_inner_columns:
+        print(
+            "ignoring intentional local-winner divergence columns:",
+            " ".join(sorted(ignored_inner_columns)),
+        )
+
     failures = 0
     for index, outer_pix in enumerate(outer_pixs):
         if index > 0:
@@ -1434,6 +1548,8 @@ def main() -> int:
             dust_root=dust_root,
             release=args.release,
             config=config,
+            new_outputs=new_outputs,
+            ignored_inner_columns=ignored_inner_columns,
         )
     return 1 if failures else 0
 

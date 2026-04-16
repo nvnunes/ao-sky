@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one initialized build to completion.",
     )
     run_parser.add_argument("build", type=Path, help="Build directory to run.")
+    run_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of Traversal worker processes to use.",
+    )
     run_parser.set_defaults(handler=_handle_run)
 
     restart_parser = subparsers.add_parser(
@@ -83,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
     restart_parser.add_argument("ao_system_short_name", help="AO-system lineage name.")
     restart_parser.add_argument("config_short_name", help="Config lineage name.")
     restart_parser.add_argument("--build-root", type=Path, default=None, help="Resolved build root.")
+    restart_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of Traversal worker processes to use.",
+    )
     restart_parser.add_argument(
         "--aosky-conf",
         type=Path,
@@ -162,7 +174,7 @@ def _handle_init(args: argparse.Namespace) -> int:
 def _handle_run(args: argparse.Namespace) -> int:
     from .build import run_build
 
-    print(run_build(args.build))
+    print(run_build(args.build, workers=args.workers))
     return 0
 
 
@@ -175,6 +187,7 @@ def _handle_restart(args: argparse.Namespace) -> int:
             config_short_name=args.config_short_name,
             build_root=args.build_root,
             aosky_conf=args.aosky_conf,
+            workers=args.workers,
         )
     )
     return 0

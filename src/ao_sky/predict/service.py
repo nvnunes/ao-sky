@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Final
 
 import astropy.units as u
@@ -10,13 +11,26 @@ import numpy as np
 from . import backend
 from ._models import PointPredictionBatch, PredictRuntime, SeeingBaselinePerformance
 
-_POINT_MODEL_CACHE: dict[str, object] = {}
-_MEAN_MODEL_CACHE: dict[str, object] = {}
+_ModelCacheKey = tuple[str, str, str, str, int]
+_POINT_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
+_MEAN_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
 _ZERO_ROTATION_ANGLES: Final[tuple[float, ...]] = (0.0,)
 
 
-def _get_model_cache_key(prefix: str, ao_system_name: str, num_stars: int) -> str:
-    return f"{prefix}:{ao_system_name}:{int(num_stars)}star"
+def _get_model_cache_key(
+    prefix: str,
+    runtime: PredictRuntime,
+    *,
+    model_name: str,
+    num_stars: int,
+) -> _ModelCacheKey:
+    return (
+        prefix,
+        runtime.ao_system.name,
+        str(Path(runtime.model_root).expanduser().resolve()),
+        model_name,
+        int(num_stars),
+    )
 
 
 def clear_backend_cache() -> None:
@@ -29,8 +43,12 @@ def clear_backend_cache() -> None:
             continue
         backend.clear_cache(model)
         cleared_models.add(model_id)
-    _POINT_MODEL_CACHE.clear()
-    _MEAN_MODEL_CACHE.clear()
+
+
+def configure_inference_threads(num_threads: int) -> None:
+    """Pin backend inference libraries to a bounded thread count."""
+
+    backend.configure_inference_threads(num_threads)
 
 
 def get_point_model(runtime: PredictRuntime, num_stars: int):
@@ -41,7 +59,12 @@ def get_point_model(runtime: PredictRuntime, num_stars: int):
     if model_name is None:
         return None
 
-    cache_key = _get_model_cache_key("point", runtime.ao_system.name, num_stars)
+    cache_key = _get_model_cache_key(
+        "point",
+        runtime,
+        model_name=model_name,
+        num_stars=num_stars,
+    )
     if cache_key not in _POINT_MODEL_CACHE:
         _POINT_MODEL_CACHE[cache_key] = backend.load_model(
             runtime.model_root,
@@ -59,7 +82,12 @@ def get_mean_model(runtime: PredictRuntime, num_stars: int):
     if model_name is None:
         return None
 
-    cache_key = _get_model_cache_key("mean", runtime.ao_system.name, num_stars)
+    cache_key = _get_model_cache_key(
+        "mean",
+        runtime,
+        model_name=model_name,
+        num_stars=num_stars,
+    )
     if cache_key not in _MEAN_MODEL_CACHE:
         _MEAN_MODEL_CACHE[cache_key] = backend.load_model(
             runtime.model_root,
@@ -67,6 +95,14 @@ def get_mean_model(runtime: PredictRuntime, num_stars: int):
             force_cpu=True,
         )
     return _MEAN_MODEL_CACHE[cache_key]
+
+
+def warm_model_cache(runtime: PredictRuntime) -> None:
+    """Load all configured temporary backend models for one AO runtime."""
+
+    for num_stars in range(runtime.ao_system.min_wfs, runtime.ao_system.max_wfs + 1):
+        get_point_model(runtime, num_stars)
+        get_mean_model(runtime, num_stars)
 
 
 def _get_ao_lgs_xy(lgs: tuple[dict[str, float], ...]) -> list[dict[str, float]]:

@@ -98,6 +98,36 @@ def test_module_cli_help_lists_check_command() -> None:
     assert "--model-root" in result.stdout
 
 
+def test_module_cli_help_lists_run_worker_options() -> None:
+    run_result = subprocess.run(
+        [sys.executable, "-m", "ao_sky", "run", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    restart_result = subprocess.run(
+        [sys.executable, "-m", "ao_sky", "restart", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--workers" in run_result.stdout
+    assert "--workers" in restart_result.stdout
+
+
+def test_module_cli_run_rejects_invalid_worker_count(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "ao_sky", "run", str(tmp_path), "--workers", "0"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "workers must be at least 1" in result.stderr
+
+
 def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
     definition = tmp_path / "build.yaml"
     definition.write_text(

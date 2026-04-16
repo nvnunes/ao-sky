@@ -1,4 +1,4 @@
-"""Typed build-definition and filesystem records."""
+"""Typed build-definition, filesystem, and execution records."""
 
 from __future__ import annotations
 
@@ -31,3 +31,22 @@ class BuildPaths:
     build_root: Path
     dust_root: Path
     model_root: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalTaskContext:
+    """Pickle-safe worker context for one Traversal run."""
+
+    build_path: Path
+    definition: BuildDefinition
+    roots: BuildPaths
+    legacy_config_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalTaskResult:
+    """Serialized result for one worker-owned Traversal outer-pixel task."""
+
+    outer_pix: int
+    success: bool
+    error_message: str = ""

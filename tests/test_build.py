@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 import io
 from pathlib import Path
 from gzip import open as gzip_open
@@ -58,7 +59,43 @@ from ao_sky.build.control import (
 )
 from ao_sky.build.scheduler import OuterPixelScheduler
 from ao_sky.build.artifacts import write_outer_artifact
+from ao_sky.build._models import TraversalTaskResult
 from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
+
+
+class _ImmediateExecutor:
+    def __init__(self, workers: int) -> None:
+        self.workers = workers
+        self.submitted: list[int] = []
+
+    def __enter__(self) -> "_ImmediateExecutor":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def shutdown(self, *, wait: bool = True, kill_workers: bool = False) -> None:
+        return None
+
+    def submit(self, fn, context, outer_pix: int) -> Future:
+        self.submitted.append(int(outer_pix))
+        future: Future = Future()
+        try:
+            future.set_result(fn(context, outer_pix))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+
+class _FailingSubmitExecutor:
+    def __init__(self) -> None:
+        self.shutdown_calls: list[tuple[bool, bool]] = []
+
+    def shutdown(self, *, wait: bool = True, kill_workers: bool = False) -> None:
+        self.shutdown_calls.append((wait, kill_workers))
+
+    def submit(self, fn, context, outer_pix: int) -> Future:
+        raise RuntimeError("pool submit broke")
 
 
 def _write_build_definition(
@@ -858,6 +895,200 @@ def test_run_build_uses_gaia_summary_star_counts_for_initial_seed(
     assert visited[0] == 3
 
 
+def test_run_build_rejects_invalid_worker_count(tmp_path: Path) -> None:
+    build_path = tmp_path / "missing"
+
+    with pytest.raises(BuildError, match="workers must be at least 1"):
+        run_build(build_path, workers=0)
+
+
+def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    executors: list[_ImmediateExecutor] = []
+
+    def fake_executor(workers: int) -> _ImmediateExecutor:
+        executor = _ImmediateExecutor(workers)
+        executors.append(executor)
+        return executor
+
+    def fake_task(context, outer_pix: int) -> TraversalTaskResult:
+        return TraversalTaskResult(outer_pix=int(outer_pix), success=True)
+
+    monkeypatch.setattr("ao_sky.build.runner._create_traversal_executor", fake_executor)
+    monkeypatch.setattr("ao_sky.build.runner._run_outer_pixel_traversal_task", fake_task)
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
+
+    run_build(build_path, workers=3)
+
+    assert executors[0].workers == 3
+    assert sorted(executors[0].submitted) == list(range(12))
+    state = load_state(build_path)
+    assert np.all(state["traversal_status"] == WORK_STATUS_DONE)
+    assert np.all(np.asarray(state["traversal_attempt_count"], dtype=np.int64) == 1)
+    summary = summarize_build(build_path)
+    assert summary["build_status"] == "completed"
+    assert summary["current_phase"] == BUILD_PHASE_AGGREGATION
+    log_text = (build_path / "build.log").read_text(encoding="utf-8")
+    assert "run start phase=traversal repaired_stale_running=0 workers=3" in log_text
+    assert "phase=traversal outer_pix=0 dispatched" in log_text
+    assert "phase=traversal outer_pix=0 completed" in log_text
+
+
+def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    state = load_state(build_path)
+    for outer_pix in range(3, len(state)):
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
+
+    monkeypatch.setattr(
+        "ao_sky.build.runner._create_traversal_executor",
+        lambda workers: _ImmediateExecutor(workers),
+    )
+
+    def fake_task(context, outer_pix: int) -> TraversalTaskResult:
+        if outer_pix == 0:
+            return TraversalTaskResult(outer_pix=outer_pix, success=False, error_message="boom")
+        return TraversalTaskResult(outer_pix=outer_pix, success=True)
+
+    monkeypatch.setattr("ao_sky.build.runner._run_outer_pixel_traversal_task", fake_task)
+
+    run_build(build_path, workers=3)
+
+    state = load_state(build_path)
+    assert int(state["traversal_status"][0]) == WORK_STATUS_FAILED
+    assert int(state["traversal_status"][1]) == WORK_STATUS_DONE
+    assert int(state["traversal_status"][2]) == WORK_STATUS_DONE
+    summary = summarize_build(build_path)
+    assert summary["build_status"] == "failed"
+    log_text = (build_path / "build.log").read_text(encoding="utf-8")
+    assert "phase=traversal outer_pix=0 failed: boom" in log_text
+    assert "run complete phase=traversal status=failed" in log_text
+
+
+def test_run_build_parallel_executor_creation_failure_marks_build_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+
+    def fail_create(workers: int):
+        raise RuntimeError("semaphore denied")
+
+    monkeypatch.setattr("ao_sky.build.runner._create_traversal_executor", fail_create)
+
+    with pytest.raises(RuntimeError, match="semaphore denied"):
+        run_build(build_path, workers=3)
+
+    summary = summarize_build(build_path)
+    assert summary["build_status"] == "failed"
+    state = load_state(build_path)
+    assert not np.any(state["traversal_status"] == WORK_STATUS_RUNNING)
+    log_text = (build_path / "build.log").read_text(encoding="utf-8")
+    assert "phase=traversal infrastructure failed: semaphore denied" in log_text
+    assert "run complete phase=traversal status=failed reset_running=0" in log_text
+
+
+def test_run_build_parallel_submit_failure_resets_running_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    state = load_state(build_path)
+    for outer_pix in range(1, len(state)):
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
+    executor = _FailingSubmitExecutor()
+    monkeypatch.setattr(
+        "ao_sky.build.runner._create_traversal_executor",
+        lambda workers: executor,
+    )
+
+    with pytest.raises(RuntimeError, match="pool submit broke"):
+        run_build(build_path, workers=3)
+
+    assert executor.shutdown_calls == [(False, True)]
+    state = load_state(build_path)
+    assert int(state["traversal_status"][0]) == WORK_STATUS_PENDING
+    assert int(state["traversal_attempt_count"][0]) == 1
+    assert not np.any(state["traversal_status"] == WORK_STATUS_RUNNING)
+    summary = summarize_build(build_path)
+    assert summary["build_status"] == "failed"
+    log_text = (build_path / "build.log").read_text(encoding="utf-8")
+    assert "phase=traversal infrastructure failed: pool submit broke" in log_text
+    assert "run complete phase=traversal status=failed reset_running=1" in log_text
+
+
+def test_outer_pixel_worker_task_writes_artifact_without_mutating_build_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    monkeypatch.setattr(
+        "ao_sky.build.runner.build_traversal_products",
+        lambda store, runtime, outer_pix, **kwargs: (_make_asterisms(empty=True), _make_inner()),
+    )
+
+    context = runner_module._load_traversal_task_context(build_path)
+    result = runner_module._run_outer_pixel_traversal_task(context, 0)
+
+    assert result == TraversalTaskResult(outer_pix=0, success=True)
+    state = load_state(build_path)
+    assert int(state["traversal_status"][0]) == WORK_STATUS_PENDING
+    assert int(state["traversal_attempt_count"][0]) == 0
+    assert outer_artifact_filename(
+        build_path,
+        load_build_definition(build_path),
+        0,
+    ).is_file()
+
+
 def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -902,15 +1133,23 @@ def test_restart_build_uses_latest_lineage_version(
     latest = build_root / "GNAO-baseline-v2"
     latest.mkdir(parents=True)
 
-    monkeypatch.setattr("ao_sky.build.runner.run_build", lambda build_path: build_path)
+    captured: dict[str, object] = {}
+
+    def fake_run_build(build_path: Path, *, workers: int = 1) -> Path:
+        captured["workers"] = workers
+        return build_path
+
+    monkeypatch.setattr("ao_sky.build.runner.run_build", fake_run_build)
 
     restarted = restart_build(
         ao_system_short_name="GNAO",
         config_short_name="baseline",
         build_root=build_root,
+        workers=3,
     )
 
     assert restarted == latest
+    assert captured == {"workers": 3}
 
 
 def test_run_build_repairs_stale_running_rows_and_logs_it(
