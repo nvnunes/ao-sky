@@ -256,6 +256,15 @@ def load_build_roots(build_path: Path) -> BuildPaths:
         )
 
 
+def set_model_root(build_path: Path, model_root: Path) -> None:
+    """Update the persisted model root for one build."""
+
+    resolved = Path(model_root).expanduser().resolve()
+    with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
+        dataset = handle["metadata"]["config"]["model_root"]
+        dataset[()] = np.asarray(str(resolved), dtype=h5py.string_dtype("utf-8"))
+
+
 def load_legacy_config_path(build_path: Path) -> Path:
     """Load the persisted legacy-config path for one build."""
 

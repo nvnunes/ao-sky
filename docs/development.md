@@ -142,8 +142,8 @@ model_root: /data/models
 ```
 
 If `aosky.conf` is present in the working project root, `init`, `restart`,
-`check`, `fetch-dust`, and `fetch-gaia` can use it automatically. Otherwise
-pass the root flags explicitly.
+`check`, `fetch-dust`, `fetch-gaia`, and `fetch-model` can use it
+automatically. Otherwise pass the root flags explicitly.
 
 Example CLI flow with explicit roots:
 
@@ -168,6 +168,9 @@ Example CLI flow with explicit roots:
   --dust-root /data/dust \
   --model-root /data/models
 
+./.conda/bin/ao-sky fetch-model /data/ao-builds/GNAO-baseline-v1 \
+  --model-root /data/models
+
 ./.conda/bin/ao-sky show /data/ao-builds/GNAO-baseline-v1
 ./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1 --workers 3
 ./.conda/bin/ao-sky restart GNAO baseline --build-root /data/ao-builds --workers 3
@@ -178,3 +181,6 @@ override the temporary legacy `survey_tools/aomap/config.yaml` runtime-policy
 source. Normal repo usage should rely on the default unless a task explicitly
 needs a different legacy config. When `model_root` is omitted, `init` falls
 back to the sibling legacy models cache under `../survey_tools/data/models`.
+`aosky.conf` remains path-only configuration; `fetch-model` is the explicit
+step that snapshots the configured model files into one build under
+`<build>/models` and updates that build to use the snapshot.

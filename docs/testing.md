@@ -52,6 +52,7 @@ commands:
 ./.conda/bin/ao-sky check --help
 ./.conda/bin/ao-sky fetch-dust --help
 ./.conda/bin/ao-sky fetch-gaia --help
+./.conda/bin/ao-sky fetch-model --help
 ```
 
 When the public build surface changes, also smoke-check the build lifecycle.

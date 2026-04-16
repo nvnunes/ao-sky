@@ -94,6 +94,7 @@ The current package-supported build API exposes:
 - `BuildError`
 - `load_build_definition`
 - `fetch_gaia_data`
+- `fetch_model_data`
 - `resolve_gaia_root_only`
 - `resolve_build_roots`
 - `resolve_build_root_only`
@@ -195,6 +196,23 @@ Behavior:
   release and outer level
 - resolve `gaia_root`, `build_root`, and `dust_root` from explicit arguments or `aosky.conf`
 - persist the resolved roots into `build.h5`
+
+### `fetch_model_data(build_path, *, model_root=None, aosky_conf=None, force=False) -> Path`
+
+Copy the AO prediction model bundle configured for one initialized build into
+`<build>/models`, write `manifest.json`, and update the persisted `model_root`
+so later build runs use the build-local copy.
+
+Behavior:
+
+- resolve the source model root from `model_root`, then `aosky.conf`, then the
+  build metadata
+- copy required `.pt` and `_metadata.pkl` files for configured point and mean
+  models
+- copy optional `_data.pkl` files when present
+- skip identical existing files
+- fail on differing existing files unless `force=True`
+- fail once Traversal has started
 
 ### `run_build(build_path, *, workers=1) -> Path`
 

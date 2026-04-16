@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 import io
+import json
 from pathlib import Path
 from gzip import open as gzip_open
 
@@ -18,6 +19,7 @@ from ao_sky.build import (
     check_runtime_roots,
     fetch_dust_data,
     fetch_gaia_data,
+    fetch_model_data,
     init_build as real_init_build,
     restart_build,
     run_build,
@@ -50,6 +52,7 @@ from ao_sky.build.config import (
 )
 from ao_sky.build.control import (
     load_build_definition,
+    load_build_roots,
     load_state,
     maps_artifact_filename,
     outer_artifact_filename,
@@ -149,6 +152,52 @@ asterisms_max_overlap: 0.66
     return path
 
 
+def _write_legacy_config_with_models(path: Path) -> Path:
+    path.write_text(
+        """
+ao_systems:
+  - name: GNAO
+    band: R
+    fov: 120.0
+    fov_1ngs: 60.0
+    min_wfs: 2
+    max_wfs: 3
+    min_mag: 8.0
+    nom_mag: 16.0
+    max_mag: 18.5
+    min_sep: 5.0
+    max_sep: 120.0
+    point_models:
+      2star: point_two
+      3star: shared_three
+    models:
+      2star: mean_two
+      3star: shared_three
+asterisms_max_star_density: 6.0
+asterisms_max_bright_star_mag: 8.0
+asterisms_max_overlap: 0.66
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_model_bundle(
+    model_root: Path,
+    model_name: str,
+    *,
+    include_data: bool = True,
+    payload: bytes | None = None,
+) -> None:
+    model_root.mkdir(parents=True, exist_ok=True)
+    content = payload if payload is not None else model_name.encode("utf-8")
+    (model_root / f"{model_name}.pt").write_bytes(content + b":pt")
+    (model_root / f"{model_name}_metadata.pkl").write_bytes(content + b":metadata")
+    if include_data:
+        (model_root / f"{model_name}_data.pkl").write_bytes(content + b":data")
+
+
 def _write_gaia_summary(
     gaia_root: Path,
     *,
@@ -206,6 +255,19 @@ def init_build(
         legacy_config_path=legacy_config_path,
         model_root=model_root,
         aosky_conf=aosky_conf,
+    )
+
+
+def _init_model_snapshot_build(tmp_path: Path, model_root: Path | None = None) -> Path:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config_with_models(tmp_path / "legacy.yaml")
+    return init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        model_root=model_root or tmp_path / "source-models",
+        legacy_config_path=legacy,
     )
 
 
@@ -593,6 +655,162 @@ def test_fetch_gaia_data_propagates_force_flag(tmp_path: Path, monkeypatch: pyte
         "force_reload": True,
         "output": output,
     }
+
+
+def test_fetch_model_data_copies_configured_model_bundle_and_updates_metadata(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-models"
+    _write_model_bundle(source_root, "point_two")
+    _write_model_bundle(source_root, "mean_two", include_data=False)
+    _write_model_bundle(source_root, "shared_three")
+    build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
+
+    manifest_path = fetch_model_data(build_path)
+
+    destination_root = (build_path / "models").resolve()
+    assert manifest_path == destination_root / "manifest.json"
+    assert load_build_roots(build_path).model_root == destination_root
+    assert (destination_root / "point_two.pt").is_file()
+    assert (destination_root / "point_two_metadata.pkl").is_file()
+    assert (destination_root / "point_two_data.pkl").is_file()
+    assert (destination_root / "mean_two.pt").is_file()
+    assert (destination_root / "mean_two_metadata.pkl").is_file()
+    assert not (destination_root / "mean_two_data.pkl").exists()
+    assert (destination_root / "shared_three.pt").is_file()
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["source_model_root"] == str(source_root.resolve())
+    assert manifest["model_root"] == str(destination_root)
+    assert manifest["ao_system"] == "GNAO"
+    models = {item["name"]: item for item in manifest["models"]}
+    assert set(models) == {"point_two", "mean_two", "shared_three"}
+    assert models["shared_three"]["roles"] == ["mean:3star", "point:3star"]
+    assert all(
+        len(file_info["sha256"]) == 64
+        for model_info in models.values()
+        for file_info in model_info["files"]
+    )
+
+
+def test_fetch_model_data_uses_aosky_conf_model_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted_root = tmp_path / "persisted-models"
+    source_root = tmp_path / "conf-models"
+    for model_name in ("point_two", "mean_two", "shared_three"):
+        _write_model_bundle(source_root, model_name)
+    build_path = _init_model_snapshot_build(tmp_path, model_root=persisted_root)
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "aosky.conf").write_text(
+        f"model_root: {source_root}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project_root)
+
+    manifest_path = fetch_model_data(build_path)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_model_root"] == str(source_root.resolve())
+
+
+def test_fetch_model_data_fails_when_required_model_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-models"
+    _write_model_bundle(source_root, "point_two")
+    _write_model_bundle(source_root, "shared_three")
+    (source_root / "mean_two.pt").write_bytes(b"missing metadata")
+    build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
+
+    with pytest.raises(BuildError, match="Required model file is missing"):
+        fetch_model_data(build_path)
+
+    assert load_build_roots(build_path).model_root == source_root.resolve()
+
+
+def test_fetch_model_data_requires_force_for_differing_existing_files(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-models"
+    for model_name in ("point_two", "mean_two", "shared_three"):
+        _write_model_bundle(source_root, model_name)
+    build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
+    fetch_model_data(build_path)
+    destination_file = build_path / "models" / "point_two.pt"
+    original_bytes = destination_file.read_bytes()
+
+    _write_model_bundle(source_root, "point_two", payload=b"new")
+    with pytest.raises(BuildError, match="rerun with --force"):
+        fetch_model_data(build_path, model_root=source_root)
+    assert destination_file.read_bytes() == original_bytes
+
+    fetch_model_data(build_path, model_root=source_root, force=True)
+    assert destination_file.read_bytes() == b"new:pt"
+
+
+def test_fetch_model_data_rerun_against_local_snapshot_is_noop(tmp_path: Path) -> None:
+    source_root = tmp_path / "source-models"
+    for model_name in ("point_two", "mean_two", "shared_three"):
+        _write_model_bundle(source_root, model_name)
+    build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
+    manifest_path = fetch_model_data(build_path)
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+
+    assert fetch_model_data(build_path) == manifest_path
+
+    assert manifest_path.read_text(encoding="utf-8") == original_manifest
+
+
+def test_fetch_model_data_rejects_build_after_traversal_started(tmp_path: Path) -> None:
+    source_root = tmp_path / "source-models"
+    for model_name in ("point_two", "mean_two", "shared_three"):
+        _write_model_bundle(source_root, model_name)
+    build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
+    update_state_row(build_path, 0, traversal_status=WORK_STATUS_DONE)
+
+    with pytest.raises(BuildError, match="before Traversal has started"):
+        fetch_model_data(build_path)
+
+    assert not (build_path / "models").exists()
+
+
+def test_run_build_uses_build_local_model_root_after_fetch_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build.legacy_config import load_native_runtime as real_load_native_runtime
+
+    source_root = tmp_path / "source-models"
+    for model_name in ("point_two", "mean_two", "shared_three"):
+        _write_model_bundle(source_root, model_name)
+    build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
+    fetch_model_data(build_path)
+    seen_model_roots: list[Path] = []
+
+    def capture_runtime(definition, *, legacy_config_path: Path, model_root: Path):
+        seen_model_roots.append(Path(model_root).resolve())
+        return real_load_native_runtime(
+            definition,
+            legacy_config_path=legacy_config_path,
+            model_root=model_root,
+        )
+
+    monkeypatch.setattr("ao_sky.build.runner.load_native_runtime", capture_runtime)
+    monkeypatch.setattr("ao_sky.build.runner.warm_model_cache", lambda runtime: None)
+    monkeypatch.setattr(
+        "ao_sky.build.runner.build_traversal_products",
+        lambda store, runtime, outer_pix, **kwargs: (_make_asterisms(), _make_inner()),
+    )
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
+
+    run_build(build_path)
+
+    assert seen_model_roots
+    assert set(seen_model_roots) == {(build_path / "models").resolve()}
 
 
 def test_load_build_definition_parses_overlay_specs_and_resolves_relative_paths(

@@ -133,6 +133,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fetch_gaia_parser.set_defaults(handler=_handle_fetch_gaia)
 
+    fetch_model_parser = subparsers.add_parser(
+        "fetch-model",
+        help="Copy configured AO prediction models into one build root.",
+    )
+    fetch_model_parser.add_argument("build", type=Path, help="Build directory to update.")
+    fetch_model_parser.add_argument(
+        "--model-root",
+        type=Path,
+        default=None,
+        help="Source AO model root. Defaults to aosky.conf, then the build metadata.",
+    )
+    fetch_model_parser.add_argument(
+        "--aosky-conf",
+        type=Path,
+        default=None,
+        help="Optional aosky.conf YAML with model_root defaults.",
+    )
+    fetch_model_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace differing build-local model files one at a time.",
+    )
+    fetch_model_parser.set_defaults(handler=_handle_fetch_model)
+
     check_parser = subparsers.add_parser(
         "check",
         help="Validate the configured Gaia, build, dust, and model roots.",
@@ -223,6 +247,20 @@ def _handle_fetch_gaia(args: argparse.Namespace) -> int:
             force=args.force,
             aosky_conf=args.aosky_conf,
             output=sys.stdout,
+        )
+    )
+    return 0
+
+
+def _handle_fetch_model(args: argparse.Namespace) -> int:
+    from .build import fetch_model_data
+
+    print(
+        fetch_model_data(
+            args.build,
+            model_root=args.model_root,
+            aosky_conf=args.aosky_conf,
+            force=args.force,
         )
     )
     return 0

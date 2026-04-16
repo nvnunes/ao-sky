@@ -175,6 +175,8 @@ The architecture uses distinct data layers with explicit ownership.
     the build reaches `aggregation`
   - one `survey_extent` dataset inside each `maps-hpx<level>.h5` file once a
     build reaches `augmentation`, when survey overlays are configured
+  - a `models/` snapshot directory when `fetch-model` has been run for the
+    build
 - Builds are named `<ao-system-short-name>-<config-short-name>-v<N>`.
 - `build.h5` stores:
   - the original build-definition YAML
@@ -185,7 +187,8 @@ The architecture uses distinct data layers with explicit ownership.
   `max_data_level`
 - Per-outer-pixel build artifacts live under:
   - `hpx<outer-level>-<inner-level>/<hour>h/<sign><deg>/<outer_pix>/outer.h5`
-- Builds are inspectable and comparable without external context.
+- Builds that have run `fetch-model` are inspectable and comparable without
+  external model context.
 
 ## Build And Scheduling Model
 

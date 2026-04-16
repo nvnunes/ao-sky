@@ -12,7 +12,15 @@ from astropy.table import Table
 
 from ao_sky import __version__, describe_package
 from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
-from ao_sky.build import check_runtime_roots, fetch_dust_data, fetch_gaia_data, init_build, load_build_definition, show_build
+from ao_sky.build import (
+    check_runtime_roots,
+    fetch_dust_data,
+    fetch_gaia_data,
+    fetch_model_data,
+    init_build,
+    load_build_definition,
+    show_build,
+)
 from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore, apply_proper_motion, fetch_gaia_store
 
 
@@ -38,6 +46,7 @@ def test_gaia_surface_is_importable() -> None:
     assert check_runtime_roots is not None
     assert fetch_dust_data is not None
     assert fetch_gaia_data is not None
+    assert fetch_model_data is not None
     assert init_build is not None
     assert fetch_gaia_store is not None
     assert load_build_definition is not None
@@ -61,7 +70,7 @@ def test_module_cli_help_lists_build_commands() -> None:
         capture_output=True,
         text=True,
     )
-    assert "{status,init,run,restart,fetch-dust,fetch-gaia,check,show}" in result.stdout
+    assert "{status,init,run,restart,fetch-dust,fetch-gaia,fetch-model,check,show}" in result.stdout
 
 
 def test_module_cli_help_lists_fetch_dust_command() -> None:
@@ -84,6 +93,18 @@ def test_module_cli_help_lists_fetch_gaia_command() -> None:
     )
     assert "--gaia-release" in result.stdout
     assert "--outer-level" in result.stdout
+    assert "--force" in result.stdout
+
+
+def test_module_cli_help_lists_fetch_model_command() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "ao_sky", "fetch-model", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--model-root" in result.stdout
+    assert "--aosky-conf" in result.stdout
     assert "--force" in result.stdout
 
 

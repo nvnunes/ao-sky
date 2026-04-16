@@ -9,6 +9,8 @@ import numpy as np
 BUILD_LAYOUT_VERSION: Final[int] = 1
 BUILD_FILENAME: Final[str] = "build.h5"
 BUILD_LOG_FILENAME: Final[str] = "build.log"
+MODEL_SNAPSHOT_DIRNAME: Final[str] = "models"
+MODEL_SNAPSHOT_MANIFEST_FILENAME: Final[str] = "manifest.json"
 OUTER_FILENAME: Final[str] = "outer.h5"
 OUTER_DATASET_ASTERISMS: Final[str] = "asterisms"
 OUTER_DATASET_INNER: Final[str] = "inner"
