@@ -41,8 +41,9 @@ from .control import (
     summarize_build,
     update_state_row,
 )
-from .legacy_runtime import build_traversal_products, load_legacy_runtime
+from .legacy_config import load_native_runtime
 from .scheduler import OuterPixelScheduler
+from .traversal import build_traversal_products
 
 
 def init_build(
@@ -51,8 +52,9 @@ def init_build(
     gaia_root: Path | None,
     build_root: Path | None,
     dust_root: Path | None,
-    aosky_conf: Path | None = None,
     legacy_config_path: Path,
+    model_root: Path | None = None,
+    aosky_conf: Path | None = None,
 ) -> Path:
     """Create a new build root and seed its initial metadata/state."""
 
@@ -61,14 +63,20 @@ def init_build(
         gaia_root=gaia_root,
         build_root=build_root,
         dust_root=dust_root,
+        model_root=model_root,
+        default_model_root=Path(legacy_config_path).resolve().parents[1] / "data" / "models",
         aosky_conf=aosky_conf,
     )
-    legacy_runtime = load_legacy_runtime(definition, legacy_config_path)
+    load_native_runtime(
+        definition,
+        legacy_config_path=legacy_config_path,
+        model_root=roots.model_root,
+    )
     return create_build_root(
         definition=definition,
         definition_yaml=definition_yaml,
         roots=roots,
-        legacy_runtime=legacy_runtime,
+        legacy_config_path=legacy_config_path,
     )
 
 
@@ -77,7 +85,11 @@ def build_outer_pixel_products(build_path: Path, outer_pix: int) -> None:
 
     definition = load_persisted_build_definition(build_path)
     roots = load_build_roots(build_path)
-    runtime = load_legacy_runtime(definition, load_legacy_config_path(build_path))
+    runtime = load_native_runtime(
+        definition,
+        legacy_config_path=load_legacy_config_path(build_path),
+        model_root=roots.model_root,
+    )
     store = GaiaHealpixStore(
         GaiaStoreConfig(
             root=roots.gaia_root,

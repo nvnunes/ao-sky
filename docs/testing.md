@@ -82,6 +82,7 @@ build_path="$(
     --gaia-root "$tmpdir/gaia" \
     --build-root "$tmpdir/builds" \
     --dust-root "$tmpdir/dust" \
+    --model-root "$tmpdir/models" \
     --legacy-config "$tmpdir/legacy.yaml"
 )"
 ./.conda/bin/ao-sky show "$build_path"
@@ -107,7 +108,7 @@ That hook runs:
 For live migration comparisons against `survey_tools`, use the repo helper:
 
 ```bash
-./.conda/bin/python scripts/compare_legacy_asterisms.py --sample smoke
+./.conda/bin/python scripts/compare_legacy_asterisms.py --sample smoke --model-root ../survey_tools/data/models
 ```
 
 The default `smoke` sample intentionally avoids the slower pathological outer
@@ -115,14 +116,14 @@ pixels so routine phase work does not spend most of its time in a few crowded
 regions. Use the broader sample only when you want a heavier check:
 
 ```bash
-./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full
+./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full --model-root ../survey_tools/data/models
 ```
 
 For sparse all-sky aggregation comparisons against legacy, use the same helper
 with `--maps`:
 
 ```bash
-./.conda/bin/python scripts/compare_legacy_asterisms.py --maps --sample smoke
+./.conda/bin/python scripts/compare_legacy_asterisms.py --maps --sample smoke --model-root ../survey_tools/data/models
 ```
 
 If the hooks path is not active in your clone, set it with:

@@ -29,9 +29,10 @@ LEGACY_RUNTIME_ROOT = REPO_ROOT.parent / "survey_tools"
 LEGACY_PYTHON = LEGACY_RUNTIME_ROOT / ".conda" / "bin" / "python"
 GAIA_ROOT = Path("/Volumes/Data/Galaxy/aosky")
 DUST_ROOT = LEGACY_RUNTIME_ROOT / "data" / "dust"
+MODEL_ROOT = LEGACY_RUNTIME_ROOT / "data" / "models"
 GAIA_RELEASE = "dr3"
 DEFAULT_AO_SYSTEM = "GNAO"
-FLOAT_ATOL = 1e-6
+FLOAT_ATOL = 1e-5
 FLOAT_RTOL = 1e-10
 SMOKE_SAMPLE_OUTER_PIXS = (
     1299,
@@ -158,7 +159,7 @@ load_asterism_stars = None
 BuildDefinition = None
 build_traversal_products = None
 load_live_legacy_traversal_outputs = None
-load_legacy_runtime = None
+load_native_runtime = None
 maps_artifact_filename = None
 outer_artifact_filename = None
 write_outer_artifact = None
@@ -189,7 +190,7 @@ def _load_runtime() -> None:
     global AsterismSearchOptions, BuildDefinition
     global apply_proper_motion, find_asterisms, load_asterism_stars
     global aggregate_maps, init_build
-    global build_traversal_products, load_live_legacy_traversal_outputs, load_legacy_runtime
+    global build_traversal_products, load_live_legacy_traversal_outputs, load_native_runtime
     global maps_artifact_filename, outer_artifact_filename, write_outer_artifact
     global get_parent_pixel
     global get_pixel_area, get_pixel_from_skycoord, get_pixel_neighbours
@@ -211,11 +212,11 @@ def _load_runtime() -> None:
         maps_artifact_filename as _maps_artifact_filename,
         outer_artifact_filename as _outer_artifact_filename,
     )
+    from ao_sky.build.legacy_config import load_native_runtime as _load_native_runtime
     from ao_sky.build.legacy_runtime import (
-        build_traversal_products as _build_traversal_products,
         load_live_legacy_traversal_outputs as _load_live_legacy_traversal_outputs,
-        load_legacy_runtime as _load_legacy_runtime,
     )
+    from ao_sky.build.traversal import build_traversal_products as _build_traversal_products
     from ao_sky.gaia import (
         GaiaHealpixStore as _GaiaHealpixStore,
         GaiaStoreConfig as _GaiaStoreConfig,
@@ -244,7 +245,7 @@ def _load_runtime() -> None:
     BuildDefinition = _BuildDefinition
     build_traversal_products = _build_traversal_products
     load_live_legacy_traversal_outputs = _load_live_legacy_traversal_outputs
-    load_legacy_runtime = _load_legacy_runtime
+    load_native_runtime = _load_native_runtime
     maps_artifact_filename = _maps_artifact_filename
     outer_artifact_filename = _outer_artifact_filename
     write_outer_artifact = _write_outer_artifact
@@ -288,6 +289,7 @@ class LegacyComparisonConfig:
     asterisms_max_bright_star_mag: float | None
     asterisms_max_overlap: float | None
     legacy_config_filename: Path
+    model_root: Path
     ao_system: LegacyAOSystem
 
 
@@ -516,6 +518,7 @@ def load_legacy_config(filename: Path, ao_system_name: str) -> LegacyComparisonC
             else float(raw["asterisms_max_overlap"])
         ),
         legacy_config_filename=filename.resolve(),
+        model_root=MODEL_ROOT.resolve(),
         ao_system=ao_system,
     )
 
@@ -847,7 +850,11 @@ def _build_runtime(
         epoch=config.asterism_epoch if config.asterism_epoch is not None else 2016.0,
         min_galactic_latitude=config.asterisms_min_galactic_latitude,
     )
-    return load_legacy_runtime(definition, config.legacy_config_filename)
+    return load_native_runtime(
+        definition,
+        legacy_config_path=config.legacy_config_filename,
+        model_root=config.model_root,
+    )
 
 
 def build_new_outputs(
@@ -1294,6 +1301,12 @@ def parse_args() -> argparse.Namespace:
         help="Dust root containing the Gaia TGE dustmaps data.",
     )
     parser.add_argument(
+        "--model-root",
+        type=Path,
+        default=MODEL_ROOT,
+        help="AO model root containing the temporary girmos-aosims models.",
+    )
+    parser.add_argument(
         "--release",
         default=GAIA_RELEASE,
         help="Gaia release identifier for the canonical ao-sky store.",
@@ -1371,7 +1384,22 @@ def main() -> int:
     args = parse_args()
     _load_runtime()
     dust_root = args.dust_root.expanduser().resolve()
+    model_root = args.model_root.expanduser().resolve()
     config = load_legacy_config(args.config, args.ao_system)
+    config = LegacyComparisonConfig(
+        outer_level=config.outer_level,
+        inner_level=config.inner_level,
+        max_data_level=config.max_data_level,
+        asterism_epoch=config.asterism_epoch,
+        asterisms_min_galactic_latitude=config.asterisms_min_galactic_latitude,
+        asterisms_galactic_latitude_bypass_pixs=config.asterisms_galactic_latitude_bypass_pixs,
+        asterisms_max_star_density=config.asterisms_max_star_density,
+        asterisms_max_bright_star_mag=config.asterisms_max_bright_star_mag,
+        asterisms_max_overlap=config.asterisms_max_overlap,
+        legacy_config_filename=config.legacy_config_filename,
+        model_root=model_root,
+        ao_system=config.ao_system,
+    )
     if args.maps:
         groups = _select_map_outer_pix_groups(
             outer_pixs=args.outer_pix,

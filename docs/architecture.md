@@ -101,6 +101,11 @@ The canonical package is split by ownership:
   - Gaia TGE dust loading
   - local dust-field sampling
   - build-time dust-field injection helpers
+- `ao_sky.predict`
+  - native traversal runtime records
+  - temporary AO-model loading and caching
+  - temporary `girmos-aosims` prediction adapter
+  - native point and field-mean prediction helpers
 - `ao_sky.build`
   - build-definition loading
   - build metadata/state contracts
@@ -173,7 +178,8 @@ The architecture uses distinct data layers with explicit ownership.
   - normalized build metadata
   - the full-sky outer-pixel state table for the configured outer level
 - normalized build metadata includes the resolved `gaia_root`, `build_root`,
-  and `dust_root`, plus build-definition fields such as `max_data_level`
+  `dust_root`, and `model_root`, plus build-definition fields such as
+  `max_data_level`
 - Per-outer-pixel build artifacts live under:
   - `hpx<outer-level>-<inner-level>/<hour>h/<sign><deg>/<outer_pix>/outer.h5`
 - Builds are inspectable and comparable without external context.
@@ -210,6 +216,9 @@ AO-system-specific scoring does not define the generic package boundary.
   package core.
 - Algorithm-specific behavior is reflected in build identity and explicit scorer
   configuration, not in hidden global behavior.
+- During the current migration phase, legacy `survey_tools` YAML may still act
+  as a temporary policy source, but the real build path must receive only
+  native `ao-sky` runtime objects.
 
 ## Public Surface
 

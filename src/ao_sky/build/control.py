@@ -31,7 +31,7 @@ from ._constants import (
     WORK_STATUS_RUNNING,
 )
 from ._exceptions import BuildError
-from ._models import BuildDefinition, BuildPaths, LegacyBuildRuntime
+from ._models import BuildDefinition, BuildPaths
 
 
 def _write_scalar_dataset(group: h5py.Group, name: str, value: object) -> None:
@@ -155,7 +155,7 @@ def create_build_root(
     definition: BuildDefinition,
     definition_yaml: str,
     roots: BuildPaths,
-    legacy_runtime: LegacyBuildRuntime,
+    legacy_config_path: Path,
 ) -> Path:
     """Create a new build root with initialized metadata and state."""
 
@@ -192,7 +192,8 @@ def create_build_root(
             "gaia_root": str(roots.gaia_root),
             "build_root": str(roots.build_root),
             "dust_root": str(roots.dust_root),
-            "legacy_config_path": str(legacy_runtime.legacy_config_path),
+            "model_root": str(roots.model_root),
+            "legacy_config_path": str(Path(legacy_config_path).resolve()),
             "outer_level": definition.outer_level,
             "inner_level": definition.inner_level,
             "max_data_level": definition.max_data_level,
@@ -251,6 +252,7 @@ def load_build_roots(build_path: Path) -> BuildPaths:
             gaia_root=Path(str(_decode_bytes(config_group["gaia_root"][()]))),
             build_root=Path(str(_decode_bytes(config_group["build_root"][()]))),
             dust_root=Path(str(_decode_bytes(config_group["dust_root"][()]))),
+            model_root=Path(str(_decode_bytes(config_group["model_root"][()]))),
         )
 
 

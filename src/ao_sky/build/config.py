@@ -90,10 +90,12 @@ def resolve_build_roots(
     gaia_root: Path | None,
     build_root: Path | None,
     dust_root: Path | None,
+    model_root: Path | None,
+    default_model_root: Path | None = None,
     aosky_conf: Path | None = None,
     cwd: Path | None = None,
 ) -> BuildPaths:
-    """Resolve build, Gaia, and dust roots from CLI arguments or `aosky.conf`."""
+    """Resolve build, Gaia, dust, and model roots from CLI or `aosky.conf`."""
 
     conf_path = aosky_conf
     if conf_path is None:
@@ -110,6 +112,7 @@ def resolve_build_roots(
     resolved_gaia_root = Path(gaia_root) if gaia_root is not None else None
     resolved_build_root = Path(build_root) if build_root is not None else None
     resolved_dust_root = Path(dust_root) if dust_root is not None else None
+    resolved_model_root = Path(model_root) if model_root is not None else None
 
     if resolved_gaia_root is None and conf_data.get("gaia_root") is not None:
         resolved_gaia_root = Path(str(conf_data["gaia_root"]))
@@ -117,6 +120,10 @@ def resolve_build_roots(
         resolved_build_root = Path(str(conf_data["build_root"]))
     if resolved_dust_root is None and conf_data.get("dust_root") is not None:
         resolved_dust_root = Path(str(conf_data["dust_root"]))
+    if resolved_model_root is None and conf_data.get("model_root") is not None:
+        resolved_model_root = Path(str(conf_data["model_root"]))
+    if resolved_model_root is None and default_model_root is not None:
+        resolved_model_root = Path(default_model_root)
 
     if resolved_gaia_root is None:
         raise BuildError(
@@ -130,11 +137,16 @@ def resolve_build_roots(
         raise BuildError(
             "dust_root must be provided either via CLI or aosky.conf"
         )
+    if resolved_model_root is None:
+        raise BuildError(
+            "model_root must be provided either via CLI or aosky.conf"
+        )
 
     return BuildPaths(
         gaia_root=resolved_gaia_root.expanduser().resolve(),
         build_root=resolved_build_root.expanduser().resolve(),
         dust_root=resolved_dust_root.expanduser().resolve(),
+        model_root=resolved_model_root.expanduser().resolve(),
     )
 
 

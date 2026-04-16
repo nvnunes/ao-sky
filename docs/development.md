@@ -130,13 +130,15 @@ survey_extent_overlays:
       - ../data/euclid/rsd2024a-footprint-equ-13-year1-MOC.fits
 ```
 
-`gaia_root`, `build_root`, and `dust_root` are not part of the build definition. Resolve them
-either with CLI options or with a project-root `aosky.conf` file:
+`gaia_root`, `build_root`, `dust_root`, and `model_root` are not part of the
+build definition. Resolve them either with CLI options or with a project-root
+`aosky.conf` file:
 
 ```yaml
 gaia_root: /data/gaia
 build_root: /data/ao-builds
 dust_root: /data/dust
+model_root: /data/models
 ```
 
 If `aosky.conf` is present in the working project root, `init` and `restart`
@@ -149,7 +151,8 @@ Example CLI flow with explicit roots:
 ./.conda/bin/ao-sky init build.yaml \
   --gaia-root /data/gaia \
   --build-root /data/ao-builds \
-  --dust-root /data/dust
+  --dust-root /data/dust \
+  --model-root /data/models
 
 ./.conda/bin/ao-sky show /data/ao-builds/GNAO-baseline-v1
 ./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1
@@ -159,4 +162,5 @@ Example CLI flow with explicit roots:
 During the current migration phase, `init` also accepts `--legacy-config` to
 override the temporary legacy `survey_tools/aomap/config.yaml` runtime-policy
 source. Normal repo usage should rely on the default unless a task explicitly
-needs a different legacy config.
+needs a different legacy config. When `model_root` is omitted, `init` falls
+back to the sibling legacy models cache under `../survey_tools/data/models`.
