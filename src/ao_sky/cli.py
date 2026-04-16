@@ -10,6 +10,19 @@ from ._version import __version__
 from .about import describe_package
 
 
+def _add_runtime_root_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--gaia-root", type=Path, default=None, help="Resolved Gaia root.")
+    parser.add_argument("--build-root", type=Path, default=None, help="Resolved build root.")
+    parser.add_argument("--dust-root", type=Path, default=None, help="Resolved dust root.")
+    parser.add_argument("--model-root", type=Path, default=None, help="Resolved AO model root.")
+    parser.add_argument(
+        "--aosky-conf",
+        type=Path,
+        default=None,
+        help="Optional aosky.conf YAML with gaia_root/build_root/dust_root/model_root defaults.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level CLI parser."""
 
@@ -36,16 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create a new persisted build root from a build-definition YAML file.",
     )
     init_parser.add_argument("definition", type=Path, help="Build-definition YAML filename.")
-    init_parser.add_argument("--gaia-root", type=Path, default=None, help="Resolved Gaia root.")
-    init_parser.add_argument("--build-root", type=Path, default=None, help="Resolved build root.")
-    init_parser.add_argument("--dust-root", type=Path, default=None, help="Resolved dust root.")
-    init_parser.add_argument("--model-root", type=Path, default=None, help="Resolved AO model root.")
-    init_parser.add_argument(
-        "--aosky-conf",
-        type=Path,
-        default=None,
-        help="Optional aosky.conf YAML with gaia_root/build_root/dust_root/model_root defaults.",
-    )
+    _add_runtime_root_arguments(init_parser)
     init_parser.add_argument(
         "--legacy-config",
         type=Path,
@@ -75,6 +79,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional aosky.conf YAML with build_root defaults.",
     )
     restart_parser.set_defaults(handler=_handle_restart)
+
+    fetch_dust_parser = subparsers.add_parser(
+        "fetch-dust",
+        help="Install the Gaia TGE dust dataset into one explicit dust root.",
+    )
+    _add_runtime_root_arguments(fetch_dust_parser)
+    fetch_dust_parser.set_defaults(handler=_handle_fetch_dust)
+
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Validate the configured Gaia, build, dust, and model roots.",
+    )
+    _add_runtime_root_arguments(check_parser)
+    check_parser.set_defaults(handler=_handle_check)
 
     show_parser = subparsers.add_parser(
         "show",
@@ -133,6 +151,32 @@ def _handle_show(args: argparse.Namespace) -> int:
 
     print(show_build(args.build))
     return 0
+
+
+def _handle_fetch_dust(args: argparse.Namespace) -> int:
+    from .build import fetch_dust_data
+
+    print(
+        fetch_dust_data(
+            dust_root=args.dust_root,
+            aosky_conf=args.aosky_conf,
+        )
+    )
+    return 0
+
+
+def _handle_check(args: argparse.Namespace) -> int:
+    from .build import check_runtime_roots
+
+    ok, report = check_runtime_roots(
+        gaia_root=args.gaia_root,
+        build_root=args.build_root,
+        dust_root=args.dust_root,
+        model_root=args.model_root,
+        aosky_conf=args.aosky_conf,
+    )
+    print(report)
+    return 0 if ok else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:

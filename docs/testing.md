@@ -45,6 +45,14 @@ Smoke-check the installed CLI entrypoint with:
 ./.conda/bin/ao-sky --version
 ```
 
+When the runtime-root CLI surface changes, also smoke-check the preflight
+commands:
+
+```bash
+./.conda/bin/ao-sky check --help
+./.conda/bin/ao-sky fetch-dust --help
+```
+
 When the public build surface changes, also smoke-check the build lifecycle.
 The repository test suite covers this contract, and an additional manual CLI
 smoke path is:
@@ -85,6 +93,11 @@ build_path="$(
     --model-root "$tmpdir/models" \
     --legacy-config "$tmpdir/legacy.yaml"
 )"
+./.conda/bin/ao-sky check \
+  --gaia-root "$tmpdir/gaia" \
+  --build-root "$tmpdir/builds" \
+  --dust-root "$tmpdir/dust" \
+  --model-root "$tmpdir/models"
 ./.conda/bin/ao-sky show "$build_path"
 ```
 

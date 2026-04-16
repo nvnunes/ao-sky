@@ -17,6 +17,68 @@ DEFAULT_LEGACY_CONFIG = (
 )
 
 
+def _load_aosky_conf(
+    *,
+    aosky_conf: Path | None,
+    cwd: Path | None = None,
+) -> dict[str, object]:
+    conf_path = aosky_conf
+    if conf_path is None:
+        search_root = Path.cwd() if cwd is None else Path(cwd)
+        candidate = search_root / "aosky.conf"
+        if candidate.is_file():
+            conf_path = candidate
+
+    if conf_path is None:
+        return {}
+
+    with Path(conf_path).open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def resolve_runtime_root_candidates(
+    *,
+    gaia_root: Path | None,
+    build_root: Path | None,
+    dust_root: Path | None,
+    model_root: Path | None,
+    aosky_conf: Path | None = None,
+    cwd: Path | None = None,
+) -> dict[str, Path | None]:
+    """Resolve optional runtime roots from CLI arguments or `aosky.conf`."""
+
+    conf_data = _load_aosky_conf(aosky_conf=aosky_conf, cwd=cwd)
+
+    resolved_gaia_root = Path(gaia_root) if gaia_root is not None else None
+    resolved_build_root = Path(build_root) if build_root is not None else None
+    resolved_dust_root = Path(dust_root) if dust_root is not None else None
+    resolved_model_root = Path(model_root) if model_root is not None else None
+
+    if resolved_gaia_root is None and conf_data.get("gaia_root") is not None:
+        resolved_gaia_root = Path(str(conf_data["gaia_root"]))
+    if resolved_build_root is None and conf_data.get("build_root") is not None:
+        resolved_build_root = Path(str(conf_data["build_root"]))
+    if resolved_dust_root is None and conf_data.get("dust_root") is not None:
+        resolved_dust_root = Path(str(conf_data["dust_root"]))
+    if resolved_model_root is None and conf_data.get("model_root") is not None:
+        resolved_model_root = Path(str(conf_data["model_root"]))
+
+    return {
+        "gaia_root": (
+            None if resolved_gaia_root is None else resolved_gaia_root.expanduser().resolve()
+        ),
+        "build_root": (
+            None if resolved_build_root is None else resolved_build_root.expanduser().resolve()
+        ),
+        "dust_root": (
+            None if resolved_dust_root is None else resolved_dust_root.expanduser().resolve()
+        ),
+        "model_root": (
+            None if resolved_model_root is None else resolved_model_root.expanduser().resolve()
+        ),
+    }
+
+
 def load_build_definition(filename: Path) -> tuple[BuildDefinition, str]:
     """Load and validate a minimal build-definition YAML file."""
 
@@ -96,32 +158,18 @@ def resolve_build_roots(
     cwd: Path | None = None,
 ) -> BuildPaths:
     """Resolve build, Gaia, dust, and model roots from CLI or `aosky.conf`."""
-
-    conf_path = aosky_conf
-    if conf_path is None:
-        search_root = Path.cwd() if cwd is None else Path(cwd)
-        candidate = search_root / "aosky.conf"
-        if candidate.is_file():
-            conf_path = candidate
-
-    conf_data: dict[str, object] = {}
-    if conf_path is not None:
-        with Path(conf_path).open("r", encoding="utf-8") as handle:
-            conf_data = yaml.safe_load(handle) or {}
-
-    resolved_gaia_root = Path(gaia_root) if gaia_root is not None else None
-    resolved_build_root = Path(build_root) if build_root is not None else None
-    resolved_dust_root = Path(dust_root) if dust_root is not None else None
-    resolved_model_root = Path(model_root) if model_root is not None else None
-
-    if resolved_gaia_root is None and conf_data.get("gaia_root") is not None:
-        resolved_gaia_root = Path(str(conf_data["gaia_root"]))
-    if resolved_build_root is None and conf_data.get("build_root") is not None:
-        resolved_build_root = Path(str(conf_data["build_root"]))
-    if resolved_dust_root is None and conf_data.get("dust_root") is not None:
-        resolved_dust_root = Path(str(conf_data["dust_root"]))
-    if resolved_model_root is None and conf_data.get("model_root") is not None:
-        resolved_model_root = Path(str(conf_data["model_root"]))
+    candidates = resolve_runtime_root_candidates(
+        gaia_root=gaia_root,
+        build_root=build_root,
+        dust_root=dust_root,
+        model_root=model_root,
+        aosky_conf=aosky_conf,
+        cwd=cwd,
+    )
+    resolved_gaia_root = candidates["gaia_root"]
+    resolved_build_root = candidates["build_root"]
+    resolved_dust_root = candidates["dust_root"]
+    resolved_model_root = candidates["model_root"]
     if resolved_model_root is None and default_model_root is not None:
         resolved_model_root = Path(default_model_root)
 
@@ -157,24 +205,41 @@ def resolve_build_root_only(
     cwd: Path | None = None,
 ) -> Path:
     """Resolve only the build root from CLI arguments or `aosky.conf`."""
-
-    conf_path = aosky_conf
-    if conf_path is None:
-        search_root = Path.cwd() if cwd is None else Path(cwd)
-        candidate = search_root / "aosky.conf"
-        if candidate.is_file():
-            conf_path = candidate
-
-    conf_data: dict[str, object] = {}
-    if conf_path is not None:
-        with Path(conf_path).open("r", encoding="utf-8") as handle:
-            conf_data = yaml.safe_load(handle) or {}
-
-    resolved_build_root = Path(build_root) if build_root is not None else None
-    if resolved_build_root is None and conf_data.get("build_root") is not None:
-        resolved_build_root = Path(str(conf_data["build_root"]))
+    candidates = resolve_runtime_root_candidates(
+        gaia_root=None,
+        build_root=build_root,
+        dust_root=None,
+        model_root=None,
+        aosky_conf=aosky_conf,
+        cwd=cwd,
+    )
+    resolved_build_root = candidates["build_root"]
     if resolved_build_root is None:
         raise BuildError(
             "build_root must be provided either via CLI or aosky.conf"
         )
     return resolved_build_root.expanduser().resolve()
+
+
+def resolve_dust_root_only(
+    *,
+    dust_root: Path | None,
+    aosky_conf: Path | None = None,
+    cwd: Path | None = None,
+) -> Path:
+    """Resolve only the dust root from CLI arguments or `aosky.conf`."""
+
+    candidates = resolve_runtime_root_candidates(
+        gaia_root=None,
+        build_root=None,
+        dust_root=dust_root,
+        model_root=None,
+        aosky_conf=aosky_conf,
+        cwd=cwd,
+    )
+    resolved_dust_root = candidates["dust_root"]
+    if resolved_dust_root is None:
+        raise BuildError(
+            "dust_root must be provided either via CLI or aosky.conf"
+        )
+    return resolved_dust_root.expanduser().resolve()

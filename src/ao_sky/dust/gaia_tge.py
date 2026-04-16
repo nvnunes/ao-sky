@@ -23,6 +23,46 @@ def gaia_tge_map_filename(dust_root: Path) -> Path:
     return filename
 
 
+def _load_dustmaps_fetch_dependencies():
+    try:
+        import dustmaps.gaia_tge as gaia_tge
+        from dustmaps.config import config as dustmaps_config
+    except ImportError as exc:  # pragma: no cover - import availability is environment-specific
+        raise DustError(
+            "dustmaps must be installed to fetch Gaia TGE dust fields"
+        ) from exc
+    return dustmaps_config, gaia_tge
+
+
+def fetch_gaia_tge_dataset(dust_root: Path) -> Path:
+    """Fetch Gaia TGE into one explicit `dust_root` and return the dataset path."""
+
+    dust_root = Path(dust_root).expanduser().resolve()
+    filename = dust_root / GAIA_TGE_RELATIVE_FILENAME
+    if filename.is_file():
+        return filename
+
+    dust_root.mkdir(parents=True, exist_ok=True)
+    filename.parent.mkdir(parents=True, exist_ok=True)
+
+    dustmaps_config, gaia_tge = _load_dustmaps_fetch_dependencies()
+    previous_data_dir = dustmaps_config.get("data_dir")
+    try:
+        dustmaps_config["data_dir"] = str(dust_root)
+        gaia_tge.fetch()
+    except Exception as exc:
+        raise DustError(f"Failed to fetch Gaia TGE dust data into {dust_root}") from exc
+    finally:
+        if previous_data_dir is None:
+            dustmaps_config.remove("data_dir")
+        else:
+            dustmaps_config["data_dir"] = previous_data_dir
+
+    if not filename.is_file():
+        raise DustError(f"Gaia TGE fetch did not produce expected file: {filename}")
+    return filename
+
+
 @lru_cache(maxsize=None)
 def _load_gaia_tge_query(map_filename: str):
     try:
@@ -90,4 +130,3 @@ def add_gaia_a0_to_inner(
 
     result.add_column(np.asarray(values, dtype=np.float64), name="gaia_A0", index=1)
     return result
-

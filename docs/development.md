@@ -141,13 +141,22 @@ dust_root: /data/dust
 model_root: /data/models
 ```
 
-If `aosky.conf` is present in the working project root, `init` and `restart`
-can use it automatically. Otherwise pass `--gaia-root` and `--build-root`
-explicitly.
+If `aosky.conf` is present in the working project root, `init`, `restart`,
+`check`, and `fetch-dust` can use it automatically. Otherwise pass the root
+flags explicitly.
 
 Example CLI flow with explicit roots:
 
 ```bash
+./.conda/bin/ao-sky check \
+  --gaia-root /data/gaia \
+  --build-root /data/ao-builds \
+  --dust-root /data/dust \
+  --model-root /data/models
+
+./.conda/bin/ao-sky fetch-dust \
+  --dust-root /data/dust
+
 ./.conda/bin/ao-sky init build.yaml \
   --gaia-root /data/gaia \
   --build-root /data/ao-builds \

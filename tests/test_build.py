@@ -12,7 +12,14 @@ import yaml
 from astropy.table import Table
 from mocpy import MOC
 
-from ao_sky.build import init_build, restart_build, run_build, show_build
+from ao_sky.build import (
+    check_runtime_roots,
+    fetch_dust_data,
+    init_build,
+    restart_build,
+    run_build,
+    show_build,
+)
 from ao_sky.build.augmentation import build_survey_extent_layers
 from ao_sky.build.aggregation import aggregate_maps, build_maps
 from ao_sky.build._constants import (
@@ -32,7 +39,10 @@ from ao_sky.build._constants import (
     WORK_STATUS_RUNNING,
 )
 from ao_sky.build._exceptions import BuildError
-from ao_sky.build.config import load_build_definition as load_build_definition_yaml
+from ao_sky.build.config import (
+    load_build_definition as load_build_definition_yaml,
+    resolve_dust_root_only,
+)
 from ao_sky.build.control import (
     load_build_definition,
     load_state,
@@ -325,6 +335,92 @@ def test_init_build_uses_aosky_conf_roots(tmp_path: Path, monkeypatch: pytest.Mo
     )
 
     assert build_path.parent == (tmp_path / "builds").resolve()
+
+
+def test_resolve_dust_root_only_uses_aosky_conf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    expected = tmp_path / "dust"
+    (project_root / "aosky.conf").write_text(
+        f"dust_root: {expected}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project_root)
+
+    assert resolve_dust_root_only(dust_root=None) == expected.resolve()
+
+
+def test_resolve_dust_root_only_requires_cli_or_conf(tmp_path: Path) -> None:
+    with pytest.raises(BuildError, match="dust_root must be provided"):
+        resolve_dust_root_only(dust_root=None, cwd=tmp_path)
+
+
+def test_check_runtime_roots_reports_ok_and_missing(tmp_path: Path) -> None:
+    gaia_root = tmp_path / "gaia"
+    build_root = tmp_path / "builds"
+    dust_root = tmp_path / "dust"
+    model_root = tmp_path / "models"
+    gaia_root.mkdir()
+    build_root.mkdir()
+    model_root.mkdir()
+    _write_gaia_tge_map(dust_root, [(healpix_id, 1, 0.5) for healpix_id in range(48)])
+
+    ok, report = check_runtime_roots(
+        gaia_root=gaia_root,
+        build_root=build_root,
+        dust_root=dust_root,
+        model_root=model_root,
+    )
+
+    assert ok
+    assert report.splitlines() == [
+        f"gaia_root: OK {gaia_root.resolve()}",
+        f"build_root: OK {build_root.resolve()}",
+        f"dust_root: OK {dust_root.resolve()}",
+        f"model_root: OK {model_root.resolve()}",
+    ]
+
+    ok, report = check_runtime_roots(
+        gaia_root=gaia_root,
+        build_root=build_root,
+        dust_root=tmp_path / "missing-dust",
+        model_root=None,
+    )
+
+    assert not ok
+    assert f"dust_root: MISSING {(tmp_path / 'missing-dust').resolve()}" in report
+    assert "model_root: MISSING <unset>" in report
+
+    empty_dust_root = tmp_path / "empty-dust"
+    empty_dust_root.mkdir()
+    ok, report = check_runtime_roots(
+        gaia_root=gaia_root,
+        build_root=build_root,
+        dust_root=empty_dust_root,
+        model_root=model_root,
+    )
+    assert not ok
+    assert f"dust_root: MISSING {empty_dust_root.resolve()}" in report
+
+
+def test_fetch_dust_data_resolves_dust_root_from_aosky_conf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    expected = tmp_path / "dust" / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
+    (project_root / "aosky.conf").write_text(
+        f"dust_root: {tmp_path / 'dust'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project_root)
+    monkeypatch.setattr(
+        "ao_sky.build.environment.fetch_gaia_tge_dataset",
+        lambda dust_root: expected.resolve(),
+    )
+
+    assert fetch_dust_data(dust_root=None) == expected.resolve()
 
 
 def test_load_build_definition_parses_overlay_specs_and_resolves_relative_paths(
