@@ -175,37 +175,210 @@ That hook runs:
 - `./.conda/bin/python -m pytest -q`
 - `./.conda/bin/mkdocs build --strict`
 
-For live migration comparisons against `survey_tools`, use the repo helper:
+## Live Legacy Compatibility Handoff
+
+Use this section when a new thread needs to continue the legacy-preserving
+Traversal work. The local paths below describe the current development machine,
+not a portable CI contract.
+
+Current live roots and fixtures:
+
+- repo root: `/Users/nelsonnunes/Library/CloudStorage/Dropbox/Projects/ao-sky`
+- live build workspace: `/Volumes/Data/Galaxy/aosky/gnao-baseline`
+- live build config: `/Volumes/Data/Galaxy/aosky/gnao-baseline/ao-sky.yaml`
+- current live build directory: `/Volumes/Data/Galaxy/aosky/gnao-baseline/v1`
+- SSD Gaia mirror: `/Users/nelsonnunes/ao-sky-cache/gaia`
+- HDD Gaia and dust root: `/Volumes/Data/Galaxy/aosky`
+- legacy model root: `../survey_tools/data/models`
+- legacy config source used by comparison helpers:
+  `../survey_tools/aomap/config.yaml`
+
+The routine Traversal compatibility samples are fixed in
+`scripts/compare_legacy_asterisms.py` so a new thread does not accidentally
+change the sample while comparing behavior:
+
+- smoke sample: `28559, 28550, 28607`
+- full sample:
+  `28559, 28550, 28607, 28383, 28463, 5407, 28589, 5380, 5424, 28597, 5448, 5391`
+- sparse map seed pixels: `1456, 1717, 4008`
+
+Use the smoke sample for quick checks:
 
 ```bash
-./.conda/bin/python scripts/compare_legacy_asterisms.py --sample smoke --model-root ../survey_tools/data/models
+./.conda/bin/python scripts/compare_legacy_asterisms.py \
+  --sample smoke \
+  --gaia-root /Users/nelsonnunes/ao-sky-cache/gaia \
+  --dust-root /Volumes/Data/Galaxy/aosky \
+  --model-root ../survey_tools/data/models \
+  --allow-local-winner-divergence \
+  --allow-boundary-overlap-divergence
 ```
 
-The default `smoke` sample intentionally uses low-density loaded outer pixels
-so routine phase work does not spend most of its time in a few crowded regions.
-Use the broader low-density 12-pixel sample when you want a heavier check:
+Use the broader low-density 12-pixel sample before calling a legacy-preserving
+Traversal phase complete:
 
 ```bash
-./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full --model-root ../survey_tools/data/models
+./.conda/bin/python scripts/compare_legacy_asterisms.py \
+  --sample full \
+  --gaia-root /Users/nelsonnunes/ao-sky-cache/gaia \
+  --dust-root /Volumes/Data/Galaxy/aosky \
+  --model-root ../survey_tools/data/models \
+  --allow-local-winner-divergence \
+  --allow-boundary-overlap-divergence
 ```
 
-When validating parallel Traversal changes, run the broader comparison through
-the `ao-sky` runner with three workers:
+When validating parallel Traversal changes, run the full comparison through the
+`ao-sky` runner with three workers. This has been the required acceptance gate
+for the parallel/cache-preserving path:
 
 ```bash
-./.conda/bin/python scripts/compare_legacy_asterisms.py --sample full --workers 3 --allow-local-winner-divergence --model-root ../survey_tools/data/models
+./.conda/bin/python scripts/compare_legacy_asterisms.py \
+  --sample full \
+  --workers 3 \
+  --gaia-root /Users/nelsonnunes/ao-sky-cache/gaia \
+  --dust-root /Volumes/Data/Galaxy/aosky \
+  --model-root ../survey_tools/data/models \
+  --allow-local-winner-divergence \
+  --allow-boundary-overlap-divergence
 ```
 
-The local-winner divergence flag preserves strict comparison for retained
-asterisms and non-winner inner fields while allowing the intentional `ao-sky`
-contract difference that only traceable local winners are persisted.
+Accepted compatibility differences:
+
+- `star_count` and `ngs_count` are not compared against legacy because `ao-sky`
+  now derives them from runtime Gaia rows after proper-motion preparation.
+- `winner_asterism_id`, `winner_distance_arcsec`, `winner_ee_resolved`,
+  `winner_ee_averaged`, `coverage_resolved`, and `coverage_averaged` may differ
+  where `ao-sky` intentionally persists only traceable local winners.
+- `asterism_count`, `best_ee`, `best_fwhm`, and `best_sr` may differ at the
+  boundary under the self-contained two-ring footprint rule.
+- Retained local asterism membership and the dense inner row domain should still
+  match, apart from the accepted boundary-footprint effects.
 
 For sparse all-sky aggregation comparisons against legacy, use the same helper
 with `--maps`:
 
 ```bash
-./.conda/bin/python scripts/compare_legacy_asterisms.py --maps --sample smoke --model-root ../survey_tools/data/models
+./.conda/bin/python scripts/compare_legacy_asterisms.py \
+  --maps \
+  --sample smoke \
+  --gaia-root /Users/nelsonnunes/ao-sky-cache/gaia \
+  --dust-root /Volumes/Data/Galaxy/aosky \
+  --model-root ../survey_tools/data/models \
+  --allow-local-winner-divergence \
+  --allow-boundary-overlap-divergence
 ```
+
+The comparison samples are intentionally low-density and already-loaded. Do not
+use crowded or skipped pixels for routine regression checks unless the change is
+specifically about density handling, memory guards, or skip behavior.
+
+## Phase 13 Benchmark Handoff
+
+Use `docs/benchmarking.md` as the benchmark record. This section records how the
+latest Traversal benchmark data was produced so another thread can reproduce or
+extend it without changing the sample.
+
+The current benchmark script is:
+
+```bash
+./.conda/bin/python scripts/benchmark_traversal_baseline.py
+```
+
+The script currently uses:
+
+- source build: `/Volumes/Data/Galaxy/aosky/gnao-baseline/v1`
+- Gaia root: `/Users/nelsonnunes/ao-sky-cache/gaia`
+- reference sample:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-compression-sweep-bench-20260416-212643/sample-pixels.ecsv`
+- sample shape: `18` complete level-4 regions, `288` level-6 outer pixels
+- default worker count: `3`
+- default Gaia table cache: `8` prepared tables, `128 MiB`
+- default worker memory guard: `6144 MiB`
+- default telemetry mode: `detailed`
+
+Use the same fixed sample for benchmark comparisons. If the sample changes,
+record that explicitly in `docs/benchmarking.md`; otherwise cache, SSD, codec,
+worker-count, and telemetry measurements are not directly comparable.
+
+Run a single baseline refresh with:
+
+```bash
+AO_SKY_BENCH_WORKERS=3 \
+./.conda/bin/python scripts/benchmark_traversal_baseline.py
+```
+
+Run the worker-count sweep used for the current recommendation with:
+
+```bash
+AO_SKY_BENCH_WORKERS=3,4,5,6,7,8,9 \
+AO_SKY_BENCH_WORKER_MEMORY_LIMIT_MB=2048 \
+AO_SKY_BENCH_PARENT_MEMORY_LIMIT_MB=12288 \
+AO_SKY_BENCH_TELEMETRY=basic \
+./.conda/bin/python scripts/benchmark_traversal_baseline.py
+```
+
+Use detailed telemetry only when diagnosing performance or memory shape:
+
+```bash
+AO_SKY_BENCH_WORKERS=3 \
+AO_SKY_BENCH_TELEMETRY=detailed \
+./.conda/bin/python scripts/benchmark_traversal_baseline.py
+```
+
+Detailed telemetry writes raw traversal diagnostics under each benchmark build's
+`diagnostics/` directory and adds more per-pixel profile fields to `build.log`.
+Normal production runs should keep telemetry lower because detailed telemetry is
+for diagnosis, not throughput.
+
+The current full-build operating default on the local workstation is:
+
+- `build.workers: 6`
+- `build.worker_memory_limit_mb: 2048`
+- `build.parent_memory_limit_mb: 12288`
+- `build.roots.gaia: /Users/nelsonnunes/ao-sky-cache/gaia`
+- artifact writes go directly to the build tree on `/Volumes/Data/Galaxy/aosky`
+- derived build artifacts use Blosc Zstd compression
+- speculative Gaia prewarm, write-behind artifact writes, and SSD artifact
+  staging are documented in `docs/benchmarking.md` but are not retained in the
+  active implementation
+
+For the live GNAO workspace, run commands from
+`/Volumes/Data/Galaxy/aosky/gnao-baseline` and use the local `./ao-sky` wrapper.
+If a previous run was interrupted, inspect the build first and use `restart` so
+stale `running` rows are repaired by the runner:
+
+```bash
+cd /Volumes/Data/Galaxy/aosky/gnao-baseline
+./ao-sky check
+./ao-sky show v1
+./ao-sky restart v1
+```
+
+## Developer Script Policy
+
+Keep reusable migration and benchmark scripts in `scripts/`, but do not promote
+every one-off investigation into permanent project surface.
+
+Retained scripts:
+
+- `scripts/compare_legacy_asterisms.py` is the live legacy compatibility
+  harness. It is intentionally outside normal `pytest` because it depends on
+  local `survey_tools`, Gaia, dust, and model assets, but it is the canonical
+  acceptance tool when a phase still claims legacy compatibility.
+- `scripts/benchmark_traversal_baseline.py` is the fixed-sample Traversal
+  benchmark harness. It owns the current 288-pixel benchmark workflow, parses
+  traversal telemetry, and writes reproducible CSV output for
+  `docs/benchmarking.md`.
+
+Do not retain one-off prewarm, write-behind, artifact-staging, compression, or
+cache probes as separate scripts unless they become repeated workflows. Their
+results belong in `docs/benchmarking.md`; if a probe becomes useful again,
+prefer adding a controlled mode to `scripts/benchmark_traversal_baseline.py`
+over adding another hardcoded script.
+
+Stable offline correctness checks should move into `pytest` once they no longer
+need live legacy assets. Live migration checks should stay as explicit script
+commands so normal repo verification remains repo-native and offline.
 
 If the hooks path is not active in your clone, set it with:
 
