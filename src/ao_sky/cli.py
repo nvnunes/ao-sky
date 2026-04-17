@@ -14,23 +14,24 @@ from .about import describe_package
 def _add_runtime_root_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gaia-root", type=Path, default=None, help="Resolved Gaia root.")
     parser.add_argument("--build-root", type=Path, default=None, help="Resolved build root.")
-    parser.add_argument("--dust-root", type=Path, default=None, help="Resolved dust root.")
     parser.add_argument("--model-root", type=Path, default=None, help="Resolved AO model root.")
     parser.add_argument(
-        "--aosky-conf",
+        "--ao-sky-yaml",
+        dest="aosky_yaml",
         type=Path,
         default=None,
-        help="Optional aosky.conf YAML with gaia_root/build_root/dust_root/model_root defaults.",
+        help="Optional ao-sky.yaml file with build.roots defaults.",
     )
 
 
 def _add_gaia_root_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gaia-root", type=Path, default=None, help="Resolved Gaia root.")
     parser.add_argument(
-        "--aosky-conf",
+        "--ao-sky-yaml",
+        dest="aosky_yaml",
         type=Path,
         default=None,
-        help="Optional aosky.conf YAML with gaia_root/build_root/dust_root/model_root defaults.",
+        help="Optional ao-sky.yaml file with build.roots defaults.",
     )
 
 
@@ -54,10 +55,22 @@ def _add_traversal_execution_arguments(parser: argparse.ArgumentParser) -> None:
         help="Worker-local Gaia table cache memory cap in MiB; 0 disables caching.",
     )
     parser.add_argument(
-        "--region-level",
+        "--worker-memory-limit-mb",
         type=int,
         default=None,
-        help="Coarse HEALPix level used for regional Traversal worker assignment.",
+        help="Stop Traversal if a worker reports peak RSS above this MiB limit; 0 disables the guard.",
+    )
+    parser.add_argument(
+        "--parent-memory-limit-mb",
+        type=int,
+        default=None,
+        help="Stop Traversal if parent plus active worker current RSS exceeds this MiB limit; 0 disables the guard.",
+    )
+    parser.add_argument(
+        "--telemetry",
+        choices=("basic", "detailed"),
+        default=None,
+        help="Traversal telemetry level. 'detailed' writes per-pixel diagnostics.",
     )
 
 
@@ -84,15 +97,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser(
         "init",
-        help="Create a new persisted build root from a build-definition YAML file.",
+        help="Create a new persisted build root from a merged build config YAML file.",
     )
-    init_parser.add_argument("definition", type=Path, help="Build-definition YAML filename.")
+    init_parser.add_argument(
+        "config",
+        type=Path,
+        nargs="?",
+        default=Path("ao-sky.yaml"),
+        help="Build config YAML filename.",
+    )
     _add_runtime_root_arguments(init_parser)
     init_parser.add_argument(
-        "--legacy-config",
+        "--survey-root",
         type=Path,
         default=None,
-        help="Temporary legacy config.yaml used to load AO-system runtime policy.",
+        help="Source survey root for builds with survey_overlays.",
     )
     init_parser.set_defaults(handler=_handle_init)
 
@@ -102,50 +121,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("build", type=Path, help="Build directory to run.")
     run_parser.add_argument(
-        "--aosky-conf",
+        "--ao-sky-yaml",
+        dest="aosky_yaml",
         type=Path,
         default=None,
-        help="Optional aosky.conf YAML with Traversal execution defaults.",
+        help="Optional ao-sky.yaml file with Traversal execution defaults.",
     )
     _add_traversal_execution_arguments(run_parser)
     run_parser.set_defaults(handler=_handle_run)
 
     restart_parser = subparsers.add_parser(
         "restart",
-        help="Restart the latest build in one AO-system/config lineage.",
+        help="Restart the latest build version in a lineage workspace.",
     )
-    restart_parser.add_argument("ao_system_short_name", help="AO-system lineage name.")
-    restart_parser.add_argument("config_short_name", help="Config lineage name.")
+    restart_parser.add_argument("lineage_name", help="Build lineage name.")
     restart_parser.add_argument("--build-root", type=Path, default=None, help="Resolved build root.")
     _add_traversal_execution_arguments(restart_parser)
     restart_parser.add_argument(
-        "--aosky-conf",
+        "--ao-sky-yaml",
+        dest="aosky_yaml",
         type=Path,
         default=None,
-        help="Optional aosky.conf YAML with build_root defaults.",
+        help="Optional ao-sky.yaml file with build root defaults.",
     )
     restart_parser.set_defaults(handler=_handle_restart)
 
-    fetch_dust_parser = subparsers.add_parser(
-        "fetch-dust",
-        help="Install the Gaia TGE dust dataset into one explicit dust root.",
-    )
-    _add_runtime_root_arguments(fetch_dust_parser)
-    fetch_dust_parser.set_defaults(handler=_handle_fetch_dust)
-
     fetch_gaia_parser = subparsers.add_parser(
         "fetch-gaia",
-        help="Materialize one full-sky canonical Gaia store and write its shared summary.",
+        help="Install dust and materialize one full-sky canonical Gaia store.",
     )
     _add_gaia_root_arguments(fetch_gaia_parser)
     fetch_gaia_parser.add_argument(
         "--gaia-release",
-        required=True,
+        default=None,
         help="Gaia release identifier such as dr3.",
     )
     fetch_gaia_parser.add_argument(
         "--outer-level",
-        required=True,
+        default=None,
         type=int,
         help="Outer nested HEALPix level to materialize.",
     )
@@ -155,30 +168,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refresh existing canonical Gaia files one pixel at a time.",
     )
     fetch_gaia_parser.set_defaults(handler=_handle_fetch_gaia)
-
-    fetch_model_parser = subparsers.add_parser(
-        "fetch-model",
-        help="Copy configured AO prediction models into one build root.",
-    )
-    fetch_model_parser.add_argument("build", type=Path, help="Build directory to update.")
-    fetch_model_parser.add_argument(
-        "--model-root",
-        type=Path,
-        default=None,
-        help="Source AO model root. Defaults to aosky.conf, then the build metadata.",
-    )
-    fetch_model_parser.add_argument(
-        "--aosky-conf",
-        type=Path,
-        default=None,
-        help="Optional aosky.conf YAML with model_root defaults.",
-    )
-    fetch_model_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Replace differing build-local model files one at a time.",
-    )
-    fetch_model_parser.set_defaults(handler=_handle_fetch_model)
 
     check_parser = subparsers.add_parser(
         "check",
@@ -203,16 +192,14 @@ def _handle_status(_: argparse.Namespace) -> int:
 
 def _handle_init(args: argparse.Namespace) -> int:
     from .build import init_build
-    from .build.config import DEFAULT_LEGACY_CONFIG
 
     build_path = init_build(
-        definition_filename=args.definition,
+        config_filename=args.config,
         gaia_root=args.gaia_root,
         build_root=args.build_root,
-        dust_root=args.dust_root,
         model_root=args.model_root,
-        aosky_conf=args.aosky_conf,
-        legacy_config_path=args.legacy_config or DEFAULT_LEGACY_CONFIG,
+        survey_root=args.survey_root,
+        aosky_yaml=args.aosky_yaml,
     )
     print(build_path)
     return 0
@@ -227,8 +214,10 @@ def _handle_run(args: argparse.Namespace) -> int:
             workers=args.workers,
             gaia_cache_entries=args.gaia_cache_entries,
             gaia_cache_mb=args.gaia_cache_mb,
-            region_level=args.region_level,
-            aosky_conf=args.aosky_conf,
+            worker_memory_limit_mb=args.worker_memory_limit_mb,
+            parent_memory_limit_mb=args.parent_memory_limit_mb,
+            telemetry=args.telemetry,
+            aosky_yaml=args.aosky_yaml,
         )
     )
     return 0
@@ -239,14 +228,15 @@ def _handle_restart(args: argparse.Namespace) -> int:
 
     print(
         restart_build(
-            ao_system_short_name=args.ao_system_short_name,
-            config_short_name=args.config_short_name,
+            lineage_name=args.lineage_name,
             build_root=args.build_root,
-            aosky_conf=args.aosky_conf,
+            aosky_yaml=args.aosky_yaml,
             workers=args.workers,
             gaia_cache_entries=args.gaia_cache_entries,
             gaia_cache_mb=args.gaia_cache_mb,
-            region_level=args.region_level,
+            worker_memory_limit_mb=args.worker_memory_limit_mb,
+            parent_memory_limit_mb=args.parent_memory_limit_mb,
+            telemetry=args.telemetry,
         )
     )
     return 0
@@ -259,43 +249,25 @@ def _handle_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def _handle_fetch_dust(args: argparse.Namespace) -> int:
-    from .build import fetch_dust_data
-
-    print(
-        fetch_dust_data(
-            dust_root=args.dust_root,
-            aosky_conf=args.aosky_conf,
-        )
-    )
-    return 0
-
-
 def _handle_fetch_gaia(args: argparse.Namespace) -> int:
     from .build import fetch_gaia_data
+    from .build.config import load_build_definition
+
+    gaia_release = args.gaia_release
+    outer_level = args.outer_level
+    if gaia_release is None or outer_level is None:
+        definition, _ = load_build_definition(args.aosky_yaml or Path("ao-sky.yaml"))
+        gaia_release = gaia_release or definition.gaia_release
+        outer_level = outer_level if outer_level is not None else definition.outer_level
 
     print(
         fetch_gaia_data(
             gaia_root=args.gaia_root,
-            gaia_release=args.gaia_release,
-            outer_level=args.outer_level,
+            gaia_release=gaia_release,
+            outer_level=outer_level,
             force=args.force,
-            aosky_conf=args.aosky_conf,
+            aosky_yaml=args.aosky_yaml,
             output=sys.stdout,
-        )
-    )
-    return 0
-
-
-def _handle_fetch_model(args: argparse.Namespace) -> int:
-    from .build import fetch_model_data
-
-    print(
-        fetch_model_data(
-            args.build,
-            model_root=args.model_root,
-            aosky_conf=args.aosky_conf,
-            force=args.force,
         )
     )
     return 0
@@ -307,9 +279,8 @@ def _handle_check(args: argparse.Namespace) -> int:
     ok, report = check_runtime_roots(
         gaia_root=args.gaia_root,
         build_root=args.build_root,
-        dust_root=args.dust_root,
         model_root=args.model_root,
-        aosky_conf=args.aosky_conf,
+        aosky_yaml=args.aosky_yaml,
     )
     print(report)
     return 0 if ok else 1

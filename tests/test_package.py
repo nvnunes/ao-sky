@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from gzip import open as gzip_open
 from importlib.metadata import version
 from pathlib import Path
 
@@ -14,9 +15,7 @@ from ao_sky import __version__, describe_package
 from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
 from ao_sky.build import (
     check_runtime_roots,
-    fetch_dust_data,
     fetch_gaia_data,
-    fetch_model_data,
     init_build,
     load_build_definition,
     show_build,
@@ -44,9 +43,7 @@ def test_gaia_surface_is_importable() -> None:
     assert find_asterisms is not None
     assert AsterismSearchOptions().max_stars == 1
     assert check_runtime_roots is not None
-    assert fetch_dust_data is not None
     assert fetch_gaia_data is not None
-    assert fetch_model_data is not None
     assert init_build is not None
     assert fetch_gaia_store is not None
     assert load_build_definition is not None
@@ -70,18 +67,10 @@ def test_module_cli_help_lists_build_commands() -> None:
         capture_output=True,
         text=True,
     )
-    assert "{status,init,run,restart,fetch-dust,fetch-gaia,fetch-model,check,show}" in result.stdout
-
-
-def test_module_cli_help_lists_fetch_dust_command() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "ao_sky", "fetch-dust", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
+    assert (
+        "{status,init,run,restart,fetch-gaia,check,show}"
+        in result.stdout
     )
-    assert "--dust-root" in result.stdout
-    assert "--aosky-conf" in result.stdout
 
 
 def test_module_cli_help_lists_fetch_gaia_command() -> None:
@@ -93,18 +82,6 @@ def test_module_cli_help_lists_fetch_gaia_command() -> None:
     )
     assert "--gaia-release" in result.stdout
     assert "--outer-level" in result.stdout
-    assert "--force" in result.stdout
-
-
-def test_module_cli_help_lists_fetch_model_command() -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "ao_sky", "fetch-model", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert "--model-root" in result.stdout
-    assert "--aosky-conf" in result.stdout
     assert "--force" in result.stdout
 
 
@@ -139,9 +116,13 @@ def test_module_cli_help_lists_run_worker_options() -> None:
     assert "--gaia-cache-entries" in restart_result.stdout
     assert "--gaia-cache-mb" in run_result.stdout
     assert "--gaia-cache-mb" in restart_result.stdout
-    assert "--region-level" in run_result.stdout
-    assert "--region-level" in restart_result.stdout
-    assert "--aosky-conf" in run_result.stdout
+    assert "--worker-memory-limit-mb" in run_result.stdout
+    assert "--worker-memory-limit-mb" in restart_result.stdout
+    assert "--parent-memory-limit-mb" in run_result.stdout
+    assert "--parent-memory-limit-mb" in restart_result.stdout
+    assert "--telemetry" in run_result.stdout
+    assert "--telemetry" in restart_result.stdout
+    assert "--ao-sky-yaml" in run_result.stdout
 
 
 def test_module_cli_run_rejects_invalid_worker_count(tmp_path: Path) -> None:
@@ -157,49 +138,61 @@ def test_module_cli_run_rejects_invalid_worker_count(tmp_path: Path) -> None:
 
 
 def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
-    definition = tmp_path / "build.yaml"
-    definition.write_text(
-        "\n".join(
-            (
-                "ao_system_short_name: GNAO",
-                "config_short_name: baseline",
-                "gaia_release: dr3",
-                "outer_level: 0",
-                "inner_level: 1",
-                "max_data_level: 1",
-                "epoch: 2028.0",
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    legacy = tmp_path / "legacy.yaml"
-    legacy.write_text(
-        "\n".join(
-            (
-                "ao_systems:",
-                "  - name: GNAO",
-                "    band: R",
-                "    fov: 120.0",
-                "    fov_1ngs: 60.0",
-                "    min_wfs: 2",
-                "    max_wfs: 3",
-                "    min_mag: 8.0",
-                "    nom_mag: 16.0",
-                "    max_mag: 18.5",
-                "    min_sep: 5.0",
-                "    max_sep: 120.0",
-                "asterisms_max_star_density: 6.0",
-                "asterisms_max_bright_star_mag: 8.0",
-                "asterisms_max_overlap: 0.66",
-            )
-        )
-        + "\n",
+    config = tmp_path / "build.yaml"
+    config.write_text(
+        """
+schema_version: 1
+ao_system:
+  band: R
+  fov_arcsec: 120.0
+  lgs: []
+  min_wfs: 2
+  max_wfs: 3
+  min_mag: 8.0
+  max_mag: 18.5
+  min_sep_arcsec: 5.0
+prediction:
+  wavelength_micron: 1.654
+  resolved_models:
+    2star: point_two
+    3star: point_three
+  averaged_models:
+    2star: mean_two
+    3star: mean_three
+traversal:
+  outer_level: 0
+  inner_level: 1
+gaia:
+  release: dr3
+  epoch: 2028.0
+  min_galactic_latitude_deg: null
+  max_star_density: 6.0
+  max_bright_star_mag: 8.0
+maps:
+  max_level: 1
+asterism:
+  max_overlap: 0.66
+best:
+  seeing_baseline:
+    wavelength_micron: 0.5
+    sr: 0.0
+    ee: 0.02
+    fwhm_mas: 650.0
+coverage:
+  resolved_ee_threshold: 0.4
+  averaged_ee_threshold: 0.3
+""".lstrip(),
         encoding="utf-8",
     )
     gaia_root = tmp_path / "gaia"
     build_root = tmp_path / "builds"
-    dust_root = tmp_path / "dust"
+    model_root = tmp_path / "models"
+    for model_name in ("point_two", "point_three", "mean_two", "mean_three"):
+        model_root.mkdir(parents=True, exist_ok=True)
+        (model_root / f"{model_name}.pt").write_bytes(model_name.encode("utf-8") + b":pt")
+        (model_root / f"{model_name}_metadata.pkl").write_bytes(
+            model_name.encode("utf-8") + b":metadata"
+        )
     summary = np.zeros(
         12,
         dtype=[("outer_pix", "<i8"), ("star_count", "<i8"), ("loaded", "?")],
@@ -209,6 +202,17 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
     GaiaSummaryStore(
         GaiaStoreConfig(root=gaia_root, release="dr3", healpix_level=0)
     ).write_summary(Table(summary))
+    dust_file = gaia_root / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
+    dust_file.parent.mkdir(parents=True, exist_ok=True)
+    with gzip_open(dust_file, "wt", encoding="utf-8") as handle:
+        handle.write(
+            "solution_id,healpix_id,healpix_level,a0,a0_uncertainty,a0_min,a0_max,"
+            "num_tracers_used,optimum_hpx_flag,status\n"
+        )
+        for healpix_id in range(48):
+            handle.write(
+                f"1,{healpix_id},1,{healpix_id + 0.5},0.1,0.0,1.0,10,\"True\",0\n"
+            )
 
     init_result = subprocess.run(
         [
@@ -216,22 +220,20 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
             "-m",
             "ao_sky",
             "init",
-            str(definition),
+            str(config),
             "--gaia-root",
             str(gaia_root),
             "--build-root",
             str(build_root),
-            "--dust-root",
-            str(dust_root),
-            "--legacy-config",
-            str(legacy),
+            "--model-root",
+            str(model_root),
         ],
         check=True,
         capture_output=True,
         text=True,
     )
     build_path = Path(init_result.stdout.strip().splitlines()[-1])
-    assert build_path.name == "GNAO-baseline-v1"
+    assert build_path.name == "v1"
 
     show_result = subprocess.run(
         [sys.executable, "-m", "ao_sky", "show", str(build_path)],
@@ -246,12 +248,11 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
 def test_module_cli_check_reports_valid_runtime_roots(tmp_path: Path) -> None:
     gaia_root = tmp_path / "gaia"
     build_root = tmp_path / "builds"
-    dust_root = tmp_path / "dust"
     model_root = tmp_path / "models"
     gaia_root.mkdir()
     build_root.mkdir()
     model_root.mkdir()
-    dust_file = dust_root / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
+    dust_file = gaia_root / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
     dust_file.parent.mkdir(parents=True, exist_ok=True)
     dust_file.write_text("ok", encoding="utf-8")
 
@@ -265,8 +266,6 @@ def test_module_cli_check_reports_valid_runtime_roots(tmp_path: Path) -> None:
             str(gaia_root),
             "--build-root",
             str(build_root),
-            "--dust-root",
-            str(dust_root),
             "--model-root",
             str(model_root),
         ],
@@ -277,4 +276,4 @@ def test_module_cli_check_reports_valid_runtime_roots(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert f"gaia_root: OK {gaia_root.resolve()}" in result.stdout
-    assert f"dust_root: OK {dust_root.resolve()}" in result.stdout
+    assert f"dust_root: OK {gaia_root.resolve()}" in result.stdout

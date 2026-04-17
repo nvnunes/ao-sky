@@ -12,26 +12,14 @@ import astropy.units as u
 class AOSystemRuntime:
     """AO-system policy and model metadata needed by native traversal."""
 
-    name: str
     band: str
     fov: u.Quantity
-    fov_1ngs: u.Quantity
     lgs: tuple[dict[str, float], ...]
     min_wfs: int
     max_wfs: int
     min_mag: float
-    nom_mag: float
     max_mag: float
     min_sep: u.Quantity
-    max_sep: u.Quantity
-    min_rel_sep: float
-    max_rel_sep: float
-    min_rel_area: float
-    max_rel_area: float
-    point_models: dict[str, str]
-    mean_models: dict[str, str]
-    rot_range: tuple[float, float] | None
-    rot_step: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,14 +35,15 @@ class PredictRuntime:
     max_bright_star_mag: float | None
     max_overlap: float | None
     prediction_wavelength: u.Quantity
+    resolved_models: dict[str, str]
+    averaged_models: dict[str, str]
     seeing_reference_wavelength: u.Quantity
     seeing_reference_sr: float
     seeing_reference_ee: float
     seeing_reference_fwhm: float
     coverage_ee_threshold_resolved: float
-    coverage_ee_threshold_mean: float
+    coverage_ee_threshold_averaged: float
     model_root: Path
-    legacy_config_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,4 +63,3 @@ class SeeingBaselinePerformance:
     sr: float | None
     ee: float | None
     fwhm: float | None
-

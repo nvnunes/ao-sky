@@ -13,10 +13,16 @@ from astropy.table import Table
 
 from ao_sky.build import init_build as real_init_build
 from ao_sky.build._models import BuildDefinition
+from ao_sky.build._exceptions import BuildError
 from ao_sky.build.config import load_build_definition as load_build_definition_yaml
 from ao_sky.build.control import load_build_roots
-from ao_sky.build.legacy_config import load_native_runtime
 from ao_sky.build.runtime_gaia import RUNTIME_HPX_COLUMN, RuntimeGaiaHealpixStore
+from ao_sky.build.runtime_config import (
+    load_runtime_config,
+    runtime_config_filename,
+    runtime_to_config,
+    write_runtime_config,
+)
 from ao_sky.build.traversal import (
     TraversalGeometry,
     _filter_neighbours_by_galactic_latitude,
@@ -32,12 +38,15 @@ from ao_sky.predict import PredictError
 from ao_sky.predict import backend as predict_backend
 from ao_sky.predict import service as predict_service
 from ao_sky.predict._models import AOSystemRuntime, PointPredictionBatch, PredictRuntime
-from ao_sky.spatial import get_pixel_skycoord
+from ao_sky.spatial import get_parent_pixel, get_pixel_skycoord
 
 
-def _write_legacy_config(path: Path) -> Path:
-    path.write_text(
-        """
+def _write_legacy_config(
+    path: Path,
+    *,
+    min_galactic_latitude: float | None = None,
+) -> Path:
+    text = """
 ao_systems:
   - name: GNAO
     band: R
@@ -47,11 +56,18 @@ ao_systems:
     min_mag: 8.0
     max_mag: 18.5
     min_sep: 5.0
-    max_sep: 120.0
+    point_models:
+      2star: point_two
+      3star: point_three
+    models:
+      2star: mean_two
+      3star: mean_three
+coverage_ee_threshold_resolved: 0.4
+coverage_ee_threshold_mean: 0.3
 """.strip()
-        + "\n",
-        encoding="utf-8",
-    )
+    if min_galactic_latitude is not None:
+        text += f"\nasterisms_min_galactic_latitude: {float(min_galactic_latitude)}"
+    path.write_text(text + "\n", encoding="utf-8")
     return path
 
 
@@ -59,20 +75,125 @@ def _write_build_definition(path: Path) -> Path:
     path.write_text(
         yaml.safe_dump(
             {
-                "ao_system_short_name": "GNAO",
-                "config_short_name": "baseline",
-                "gaia_release": "dr3",
-                "outer_level": 0,
-                "inner_level": 1,
-                "max_data_level": 1,
-                "epoch": 2028.0,
-                "min_galactic_latitude": 90.0,
+                "schema_version": 1,
+                "build": {},
+                "ao_system": {
+                    "band": "R",
+                    "fov_arcsec": 120.0,
+                    "lgs": [],
+                    "min_wfs": 2,
+                    "max_wfs": 3,
+                    "min_mag": 8.0,
+                    "max_mag": 18.5,
+                    "min_sep_arcsec": 5.0,
+                },
+                "prediction": {
+                    "wavelength_micron": 1.654,
+                    "resolved_models": {
+                        "2star": "point_two",
+                        "3star": "point_three",
+                    },
+                    "averaged_models": {
+                        "2star": "mean_two",
+                        "3star": "mean_three",
+                    },
+                },
+                "traversal": {
+                    "outer_level": 0,
+                    "inner_level": 1,
+                },
+                "gaia": {
+                    "release": "dr3",
+                    "epoch": 2028.0,
+                    "min_galactic_latitude_deg": None,
+                    "max_star_density": 6.0,
+                    "max_bright_star_mag": 8.0,
+                },
+                "maps": {"max_level": 1},
+                "asterism": {"max_overlap": 0.66},
+                "best": {
+                    "seeing_baseline": {
+                        "wavelength_micron": 0.5,
+                        "sr": 0.0,
+                        "ee": 0.02,
+                        "fwhm_mas": 650.0,
+                    },
+                },
+                "coverage": {
+                    "resolved_ee_threshold": 0.4,
+                    "averaged_ee_threshold": 0.3,
+                },
             },
             sort_keys=False,
         ),
         encoding="utf-8",
     )
     return path
+
+
+def load_native_runtime(
+    definition: BuildDefinition,
+    *,
+    legacy_config_path: Path,
+    model_root: Path,
+) -> PredictRuntime:
+    with Path(legacy_config_path).open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    system = raw["ao_systems"][0]
+    ao_system = AOSystemRuntime(
+        band=str(system["band"]),
+        fov=float(system["fov"]) * u.arcsec,
+        lgs=(
+            {"zd": 30.0, "az": 45.0},
+            {"zd": 30.0, "az": 135.0},
+            {"zd": 30.0, "az": 225.0},
+            {"zd": 30.0, "az": 315.0},
+        ),
+        min_wfs=int(system["min_wfs"]),
+        max_wfs=int(system["max_wfs"]),
+        min_mag=float(system["min_mag"]),
+        max_mag=float(system["max_mag"]),
+        min_sep=float(system["min_sep"]) * u.arcsec,
+    )
+    return PredictRuntime(
+        ao_system=ao_system,
+        outer_level=definition.outer_level,
+        inner_level=definition.inner_level,
+        epoch=float(raw.get("asterism_epoch", 2028.0)),
+        min_galactic_latitude=(
+            None
+            if raw.get("asterisms_min_galactic_latitude") is None
+            else float(raw["asterisms_min_galactic_latitude"])
+        ),
+        max_star_density=float(raw.get("asterisms_max_star_density", 2.0)),
+        max_bright_star_mag=(
+            None
+            if raw.get("asterisms_max_bright_star_mag") is None
+            else float(raw["asterisms_max_bright_star_mag"])
+        ),
+        max_overlap=(
+            None
+            if raw.get("asterisms_max_overlap") is None
+            else float(raw["asterisms_max_overlap"])
+        ),
+        prediction_wavelength=1.654 * u.micron,
+        resolved_models={
+            str(key): str(value)
+            for key, value in (system.get("point_models") or {}).items()
+        },
+        averaged_models={
+            str(key): str(value) for key, value in (system.get("models") or {}).items()
+        },
+        seeing_reference_wavelength=0.5 * u.micron,
+        seeing_reference_sr=0.0,
+        seeing_reference_ee=0.02,
+        seeing_reference_fwhm=650.0,
+        coverage_ee_threshold_resolved=float(
+            raw.get("coverage_ee_threshold_resolved", 0.25)
+        ),
+        coverage_ee_threshold_averaged=float(raw.get("coverage_ee_threshold_mean", 0.25)),
+        model_root=Path(model_root).resolve(),
+    )
 
 
 def _write_gaia_tge_map(
@@ -91,6 +212,16 @@ def _write_gaia_tge_map(
                 f"1,{healpix_id},{healpix_level},{a0},0.1,0.0,1.0,10,\"True\",0\n"
             )
     return filename
+
+
+def _write_required_model_files(model_root: Path, model_name: str) -> None:
+    model_root.mkdir(parents=True, exist_ok=True)
+    pt_file = model_root / f"{model_name}.pt"
+    metadata_file = model_root / f"{model_name}_metadata.pkl"
+    if not pt_file.exists():
+        pt_file.write_bytes(model_name.encode("utf-8") + b":pt")
+    if not metadata_file.exists():
+        metadata_file.write_bytes(model_name.encode("utf-8") + b":metadata")
 
 
 def _write_gaia_summary(
@@ -119,23 +250,47 @@ def init_build(
     dust_root: Path | None,
     legacy_config_path: Path,
     model_root: Path | None = None,
-    aosky_conf: Path | None = None,
+    aosky_yaml: Path | None = None,
 ) -> Path:
     definition, _ = load_build_definition_yaml(definition_filename)
+    effective_model_root = model_root or Path(legacy_config_path).parent / "models"
+    runtime = load_native_runtime(
+        definition,
+        legacy_config_path=legacy_config_path,
+        model_root=effective_model_root,
+    )
+    for model_name in set(runtime.resolved_models.values()) | set(
+        runtime.averaged_models.values()
+    ):
+        _write_required_model_files(effective_model_root, model_name)
+    build_config = yaml.safe_load(Path(definition_filename).read_text(encoding="utf-8"))
+    payload = runtime_to_config(runtime)
+    payload["build"] = {**payload.get("build", {}), **build_config.get("build", {})}
+    payload["gaia"]["release"] = build_config["gaia"]["release"]
+    payload["maps"] = build_config["maps"]
+    Path(definition_filename).write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
     if gaia_root is not None:
         _write_gaia_summary(
             Path(gaia_root),
             release=definition.gaia_release,
             outer_level=definition.outer_level,
         )
+        _write_gaia_tge_map(
+            Path(gaia_root),
+            [
+                (healpix_id, definition.max_data_level, healpix_id + 0.5)
+                for healpix_id in range(12 * (4 ** definition.max_data_level))
+            ],
+        )
     return real_init_build(
-        definition_filename=definition_filename,
+        config_filename=definition_filename,
         gaia_root=gaia_root,
         build_root=build_root,
-        dust_root=dust_root,
-        legacy_config_path=legacy_config_path,
-        model_root=model_root,
-        aosky_conf=aosky_conf,
+        model_root=effective_model_root,
+        aosky_yaml=aosky_yaml,
     )
 
 
@@ -210,14 +365,11 @@ class _RawGaiaStore:
 def test_load_native_runtime_applies_defaults_and_model_root(tmp_path: Path) -> None:
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     definition = BuildDefinition(
-        ao_system_short_name="GNAO",
-        config_short_name="baseline",
+        lineage_name="baseline",
         gaia_release="dr3",
         outer_level=0,
         inner_level=1,
         max_data_level=1,
-        epoch=2028.0,
-        min_galactic_latitude=10.0,
     )
 
     runtime = load_native_runtime(
@@ -229,13 +381,71 @@ def test_load_native_runtime_applies_defaults_and_model_root(tmp_path: Path) -> 
     assert runtime.model_root == (tmp_path / "models").resolve()
     assert runtime.prediction_wavelength.to_value() == pytest.approx(1.654)
     assert runtime.seeing_reference_wavelength.to_value() == pytest.approx(0.5)
-    assert runtime.coverage_ee_threshold_resolved == pytest.approx(0.25)
-    assert runtime.coverage_ee_threshold_mean == pytest.approx(0.25)
+    assert runtime.coverage_ee_threshold_resolved == pytest.approx(0.4)
+    assert runtime.coverage_ee_threshold_averaged == pytest.approx(0.3)
     assert runtime.max_star_density == pytest.approx(2.0)
-    assert runtime.ao_system.fov_1ngs.to(u.arcsec).value == pytest.approx(120.0)
     assert len(runtime.ao_system.lgs) == 4
-    assert runtime.ao_system.point_models == {}
-    assert runtime.ao_system.mean_models == {}
+    assert runtime.resolved_models == {"2star": "point_two", "3star": "point_three"}
+    assert runtime.averaged_models == {"2star": "mean_two", "3star": "mean_three"}
+
+
+def test_runtime_config_round_trips_native_policy(tmp_path: Path) -> None:
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    definition = BuildDefinition(
+        lineage_name="baseline",
+        gaia_release="dr3",
+        outer_level=0,
+        inner_level=1,
+        max_data_level=1,
+    )
+    runtime = load_native_runtime(
+        definition,
+        legacy_config_path=legacy,
+        model_root=tmp_path / "models-a",
+    )
+
+    filename = write_runtime_config(tmp_path / "build", runtime)
+    payload = yaml.safe_load(filename.read_text(encoding="utf-8"))
+    loaded = load_runtime_config(filename, model_root=tmp_path / "models-b")
+
+    assert filename == runtime_config_filename(tmp_path / "build")
+    assert "source" not in payload
+    assert "build" not in payload
+    assert loaded.model_root == (tmp_path / "models-b").resolve()
+    assert loaded.ao_system.fov.to_value(u.arcsec) == pytest.approx(120.0)
+    assert loaded.resolved_models == runtime.resolved_models
+    assert loaded.averaged_models == runtime.averaged_models
+    assert loaded.outer_level == runtime.outer_level
+    assert loaded.inner_level == runtime.inner_level
+    assert loaded.max_star_density == pytest.approx(runtime.max_star_density)
+    assert loaded.max_overlap == pytest.approx(runtime.max_overlap)
+    assert loaded.prediction_wavelength.to_value(u.micron) == pytest.approx(1.654)
+
+
+def test_load_runtime_config_rejects_missing_nested_values(tmp_path: Path) -> None:
+    filename = write_runtime_config(
+        tmp_path / "build",
+        _make_predict_runtime(model_root=tmp_path / "models"),
+    )
+    payload = yaml.safe_load(filename.read_text(encoding="utf-8"))
+    del payload["ao_system"]["band"]
+    filename.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BuildError, match="ao_system.band"):
+        load_runtime_config(filename, model_root=tmp_path / "models")
+
+
+def test_load_runtime_config_rejects_invalid_runtime_values(tmp_path: Path) -> None:
+    filename = write_runtime_config(
+        tmp_path / "build",
+        _make_predict_runtime(model_root=tmp_path / "models"),
+    )
+    payload = yaml.safe_load(filename.read_text(encoding="utf-8"))
+    payload["ao_system"]["fov_arcsec"] = -1.0
+    filename.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BuildError, match="fov_arcsec must be positive"):
+        load_runtime_config(filename, model_root=tmp_path / "models")
 
 
 def test_init_build_persists_model_root(tmp_path: Path) -> None:
@@ -253,7 +463,8 @@ def test_init_build_persists_model_root(tmp_path: Path) -> None:
     )
 
     roots = load_build_roots(build_path)
-    assert roots.model_root == model_root.resolve()
+    assert roots.model_root == (build_path / "models").resolve()
+    assert (build_path / "models" / "manifest.json").is_file()
 
 
 def test_backend_missing_dependency_raises_clear_error(
@@ -298,26 +509,14 @@ def _make_predict_runtime(
     min_galactic_latitude: float | None = None,
 ) -> PredictRuntime:
     ao_system = AOSystemRuntime(
-        name="GNAO",
         band="R",
         fov=fov,
-        fov_1ngs=fov,
         lgs=(),
         min_wfs=2,
         max_wfs=2,
         min_mag=8.0,
-        nom_mag=12.0,
         max_mag=18.5,
         min_sep=5.0 * u.arcsec,
-        max_sep=120.0 * u.arcsec,
-        min_rel_sep=0.0,
-        max_rel_sep=0.0,
-        min_rel_area=0.0,
-        max_rel_area=0.0,
-        point_models={"2star": point_model},
-        mean_models={"2star": mean_model},
-        rot_range=None,
-        rot_step=None,
     )
     return PredictRuntime(
         ao_system=ao_system,
@@ -329,14 +528,15 @@ def _make_predict_runtime(
         max_bright_star_mag=None,
         max_overlap=None,
         prediction_wavelength=1.654 * u.micron,
+        resolved_models={"2star": point_model},
+        averaged_models={"2star": mean_model},
         seeing_reference_wavelength=0.5 * u.micron,
         seeing_reference_sr=0.0,
         seeing_reference_ee=0.0,
         seeing_reference_fwhm=0.0,
         coverage_ee_threshold_resolved=0.25,
-        coverage_ee_threshold_mean=0.25,
+        coverage_ee_threshold_averaged=0.25,
         model_root=model_root,
-        legacy_config_path=model_root / "legacy.yaml",
     )
 
 
@@ -390,6 +590,28 @@ def test_runtime_gaia_store_force_reload_replaces_cached_table(tmp_path: Path) -
     assert first is not refreshed
     assert refreshed is again
     assert int(again["source_id"][0]) == 202
+
+
+def test_runtime_gaia_store_does_not_cache_oversized_tables(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
+    raw = _gaia_table([(101, 10.0, 0.0, 12.0, 100.0, 50.0)])
+    base_store = _RawGaiaStore(tmp_path, {0: raw})
+    store = RuntimeGaiaHealpixStore(
+        base_store,
+        runtime,
+        max_entries=4,
+        max_bytes=1,
+    )
+
+    first = store.load_healpix(0)
+    second = store.load_healpix(0)
+
+    assert first is not second
+    assert base_store.loads == [0, 0]
+    stats = store.stats()
+    assert stats.entries == 0
+    assert stats.current_bytes == 0
+    assert stats.oversized_skips == 2
 
 
 def test_runtime_gaia_store_marks_invalid_coordinates_with_invalid_hpx(tmp_path: Path) -> None:
@@ -481,7 +703,7 @@ def test_build_base_inner_table_ignores_invalid_runtime_gaia_rows(tmp_path: Path
     assert int(np.sum(inner["ngs_count"])) == 1
 
 
-def test_build_base_inner_table_counts_raw_gaia_coordinates(
+def test_build_base_inner_table_uses_runtime_gaia_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -493,29 +715,37 @@ def test_build_base_inner_table_counts_raw_gaia_coordinates(
         max_entries=4,
         max_bytes=1024 * 1024,
     )
-    projected_ra: list[float] = []
 
-    def fake_get_pixel_from_skycoord(level, skycoord):
-        projected_ra.append(float(np.atleast_1d(skycoord.ra.degree)[0]))
+    def fake_runtime_get_pixel_from_skycoord(level, skycoord):
+        assert level == 14
         return np.zeros(len(skycoord), dtype=np.int64)
 
+    def fail_traversal_projection(*args: object, **kwargs: object) -> np.ndarray:
+        raise AssertionError("inner counts should use runtime hpx14")
+
+    monkeypatch.setattr(
+        "ao_sky.build.runtime_gaia.get_pixel_from_skycoord",
+        fake_runtime_get_pixel_from_skycoord,
+    )
     monkeypatch.setattr(
         "ao_sky.build.traversal.get_pixel_from_skycoord",
-        fake_get_pixel_from_skycoord,
+        fail_traversal_projection,
     )
 
     inner = build_base_inner_table(store, runtime, 0)
+    expected_pix = int(get_parent_pixel(14, np.asarray([0]), runtime.inner_level)[0])
+    expected_row = int(np.flatnonzero(np.asarray(inner["pix"], dtype=np.int64) == expected_pix)[0])
 
     assert int(np.sum(inner["star_count"])) == 1
-    assert projected_ra == [10.0]
+    assert int(inner["star_count"][expected_row]) == 1
 
 
-def test_traversal_geometry_reuses_inner_pixel_geometry(tmp_path: Path) -> None:
+def test_traversal_geometry_does_not_retain_inner_pixel_geometry(tmp_path: Path) -> None:
     runtime = _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg)
     geometry = TraversalGeometry.from_runtime(runtime)
 
-    assert geometry.inner_pixs(0) is geometry.inner_pixs(0)
-    assert geometry.inner_centres(0) is geometry.inner_centres(0)
+    assert np.array_equal(geometry.inner_pixs(0), geometry.inner_pixs(0))
+    assert geometry.inner_centres(0) is not geometry.inner_centres(0)
 
 
 def test_neighbour_latitude_filter_uses_outer_pixel_level(
@@ -620,13 +850,11 @@ def test_winner_fields_remain_local_when_neighbour_has_better_best_ee(
 ) -> None:
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     definition = BuildDefinition(
-        ao_system_short_name="GNAO",
-        config_short_name="baseline",
+        lineage_name="baseline",
         gaia_release="dr3",
         outer_level=0,
         inner_level=1,
         max_data_level=1,
-        epoch=2028.0,
     )
     runtime = load_native_runtime(
         definition,
@@ -710,7 +938,7 @@ def test_winner_fields_remain_local_when_neighbour_has_better_best_ee(
     )
     monkeypatch.setattr("ao_sky.build.traversal.clear_backend_cache", lambda: None)
 
-    winner_idxs, winner_angles, winner_ngs_payloads = _update_inner_pixel_asterism_performance(
+    winner_idxs, winner_ngs_payloads = _update_inner_pixel_asterism_performance(
         runtime,
         inner,
         context,
@@ -721,7 +949,6 @@ def test_winner_fields_remain_local_when_neighbour_has_better_best_ee(
     assert int(inner["winner_asterism_id"][0]) == 7
     assert float(inner["winner_distance_arcsec"][0]) == pytest.approx(1.0)
     assert int(winner_idxs[0]) == 0
-    assert float(winner_angles[0]) == pytest.approx(0.0)
     assert winner_ngs_payloads[0] == [
         {"zd": 1.0, "az": 0.0, "mag": 10.0},
         {"zd": 2.0, "az": 90.0, "mag": 11.0},
@@ -734,13 +961,11 @@ def test_field_mean_reuses_winner_ngs_payload(
 ) -> None:
     runtime = load_native_runtime(
         BuildDefinition(
-            ao_system_short_name="GNAO",
-            config_short_name="baseline",
+            lineage_name="baseline",
             gaia_release="dr3",
             outer_level=0,
             inner_level=1,
             max_data_level=1,
-            epoch=2028.0,
         ),
         legacy_config_path=_write_legacy_config(tmp_path / "legacy.yaml"),
         model_root=tmp_path / "models",
@@ -766,10 +991,9 @@ def test_field_mean_reuses_winner_ngs_payload(
     )
     monkeypatch.setattr("ao_sky.build.traversal.get_mean_model", lambda runtime, surviving_stars: object())
 
-    def fake_predict_field_mean_batch(runtime, num_stars, model, ngs, rot_angles):
+    def fake_predict_field_mean_batch(runtime, num_stars, model, ngs):
         seen["num_stars"] = num_stars
         seen["ngs"] = ngs
-        seen["rot_angles"] = rot_angles
         return np.array([0.42], dtype=np.float64)
 
     monkeypatch.setattr(
@@ -783,7 +1007,6 @@ def test_field_mean_reuses_winner_ngs_payload(
         inner,
         context=object(),
         winner_asterism_idxs=np.array([0], dtype=np.int64),
-        winner_angles=np.array([15.0], dtype=np.float64),
         winner_ngs_payloads=winner_payloads,
     )
 
@@ -791,7 +1014,6 @@ def test_field_mean_reuses_winner_ngs_payload(
     assert seen == {
         "num_stars": 2,
         "ngs": [payload],
-        "rot_angles": [15.0],
     }
 
 
@@ -801,13 +1023,11 @@ def test_build_traversal_products_uses_expanded_asterisms_for_inner_context(
 ) -> None:
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     definition = BuildDefinition(
-        ao_system_short_name="GNAO",
-        config_short_name="baseline",
+        lineage_name="baseline",
         gaia_release="dr3",
         outer_level=1,
         inner_level=2,
         max_data_level=2,
-        epoch=2028.0,
     )
     runtime = load_native_runtime(
         definition,
@@ -923,7 +1143,6 @@ def test_build_traversal_products_uses_expanded_asterisms_for_inner_context(
         winner_payloads[:] = None
         return (
             np.array([-1], dtype=np.int64),
-            np.array([np.nan], dtype=np.float64),
             winner_payloads,
         )
 
@@ -949,16 +1168,13 @@ def test_build_traversal_products_uses_expanded_asterisms_for_inner_context(
 
 
 def test_build_traversal_products_skip_path_still_injects_dust(tmp_path: Path) -> None:
-    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml", min_galactic_latitude=90.0)
     definition = BuildDefinition(
-        ao_system_short_name="GNAO",
-        config_short_name="baseline",
+        lineage_name="baseline",
         gaia_release="dr3",
         outer_level=0,
         inner_level=1,
         max_data_level=1,
-        epoch=2028.0,
-        min_galactic_latitude=90.0,
     )
     runtime = load_native_runtime(
         definition,

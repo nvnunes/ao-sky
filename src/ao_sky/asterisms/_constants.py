@@ -35,7 +35,5 @@ ASTERISM_TABLE_COLUMNS: Final[tuple[str, ...]] = (
     "star3_mag",
     "radius_arcsec",
     "area_arcsec2",
-    "relative_area",
     "separation_arcsec",
-    "relative_separation",
 )

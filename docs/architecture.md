@@ -98,8 +98,8 @@ The canonical package is split by ownership:
   - overlap logic
   - filtering and scoring seams
 - `ao_sky.dust`
-  - Gaia TGE dust loading
-  - local dust-field sampling
+  - Gaia TGE source loading and build-local dense A0 cache creation
+  - mmap-backed local dust-field sampling
   - build-time dust-field injection helpers
 - `ao_sky.predict`
   - native traversal runtime records
@@ -107,7 +107,7 @@ The canonical package is split by ownership:
   - temporary `girmos-aosims` prediction adapter
   - native point and field-mean prediction helpers
 - `ao_sky.build`
-  - build-definition loading
+  - merged build-config loading
   - build metadata/state contracts
   - build layout rules
   - persisted outer-pixel artifact writers/readers
@@ -144,6 +144,9 @@ The architecture uses distinct data layers with explicit ownership.
 - Asterism catalogs.
 - Aggregate map products.
 - Survey-extent overlays and other derived summaries.
+- Stored as HDF5 datasets using Blosc Zstd compression through
+  `hdf5plugin`; readers that bypass `ao_sky.build` and use `h5py` directly
+  must import `hdf5plugin` before reading these artifacts.
 - Versioned by build metadata and output layout version, not by ad hoc folder
   naming.
 
@@ -170,25 +173,34 @@ The architecture uses distinct data layers with explicit ownership.
 - Every build has:
   - a root `build.h5` control file for metadata and outer-pixel state
   - a root `build.log`
+  - a root `build.yaml` native Traversal runtime config copied at `init`
   - one `outer.h5` artifact container per processed outer pixel
   - one `maps-hpx<level>.h5` all-sky map artifact per aggregated level once
     the build reaches `aggregation`
   - one `survey_extent` dataset inside each `maps-hpx<level>.h5` file once a
     build reaches `augmentation`, when survey overlays are configured
-  - a `models/` snapshot directory when `fetch-model` has been run for the
-    build
-- Builds are named `<ao-system-short-name>-<config-short-name>-v<N>`.
+  - a `models/` snapshot directory created at `init`
+  - a `surveys/` snapshot directory created at `init` for builds with survey
+    overlays
+- Build versions are named `v<N>` under the lineage workspace.
 - `build.h5` stores:
-  - the original build-definition YAML
+  - the original merged build-config YAML
   - normalized build metadata
+  - the build-local runtime-config path and source-provenance path
   - the full-sky outer-pixel state table for the configured outer level
-- normalized build metadata includes the resolved `gaia_root`, `build_root`,
-  `dust_root`, and `model_root`, plus build-definition fields such as
-  `max_data_level`
+- normalized build metadata includes the resolved `gaia_root`, build-local
+  `dust_root`, `build_root`, and `model_root`, plus build-config fields such as
+  `maps.max_level`; build-local snapshot paths such as `dust`, `models`, and
+  `surveys/...` are persisted relative to the build root
 - Per-outer-pixel build artifacts live under:
   - `hpx<outer-level>-<inner-level>/<hour>h/<sign><deg>/<outer_pix>/outer.h5`
-- Builds that have run `fetch-model` are inspectable and comparable without
-  external model context.
+- Initialized builds are inspectable and comparable without external model
+  context.
+- Initialized builds with survey overlays can augment survey extents without
+  external survey-file context.
+- Native build execution reads AO-system, traversal, and prediction policy
+  from `build.yaml`. Legacy YAML import, when needed for comparison
+  work, happens outside the build API before `init`.
 
 ## Build And Scheduling Model
 
@@ -202,7 +214,9 @@ Build execution is organized around restartable outer-pixel work.
 - Traversal uses a long-lived worker runtime even when `workers=1`, and can run
   with multiple regional process workers as an execution-time option; worker
   count, regional scheduling, and Gaia memory-cache settings are not part of
-  the persisted build contract.
+  the persisted build contract. The optional worker memory limit is also an
+  execution-time guard: it fails the run cleanly if a worker reports peak RSS
+  above the configured limit.
 - Canonical Gaia files remain raw on disk, but long-lived Traversal workers
   use a runtime-local Gaia cache whose rows are shifted to the build epoch,
   enriched with `R` and `hpx14`, and then marked read-only. Downstream
@@ -247,9 +261,9 @@ AO-system-specific scoring does not define the generic package boundary.
   package core.
 - Algorithm-specific behavior is reflected in build identity and explicit scorer
   configuration, not in hidden global behavior.
-- During the current migration phase, legacy `survey_tools` YAML may still act
-  as a temporary policy source, but the real build path must receive only
-  native `ao-sky` runtime objects.
+- Build execution receives native `ao-sky` runtime configuration only. Legacy
+  `survey_tools` YAML import, when needed for compatibility checks, belongs in
+  comparison tooling outside the build API.
 
 ## Public Surface
 

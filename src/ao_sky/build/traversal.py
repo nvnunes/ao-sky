@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import astropy.units as u
@@ -11,14 +12,18 @@ from astropy.coordinates import SkyCoord, search_around_sky
 from astropy.table import Table
 import numpy as np
 
-from ..asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
+from ..asterisms import (
+    AsterismSearchOptions,
+    AsterismSearchProfile,
+    find_asterisms,
+    load_asterism_stars,
+)
 from ..dust import add_gaia_a0_to_inner
-from ..gaia import GAIA_SCHEMA_COLUMNS, GaiaHealpixStore, compute_legacy_r_magnitude
+from ..gaia import GAIA_SCHEMA_COLUMNS, GaiaHealpixStore, compute_r_magnitude
 from ..predict import (
     clear_backend_cache,
     get_mean_model,
     get_point_model,
-    get_rotation_angles,
     get_seeing_baseline_performance,
     predict_asterism_ee,
     predict_field_mean_batch,
@@ -35,9 +40,135 @@ from ..spatial import (
     get_subpixels,
 )
 from ._exceptions import BuildError
+from ._models import TraversalStageStats, TraversalStructureStats
 from .runtime_gaia import RUNTIME_HPX_COLUMN, RUNTIME_HPX_LEVEL
 
 ASTERISM_BOUNDARY_RINGS = 2
+
+
+@dataclass(slots=True)
+class TraversalStageProfile:
+    """Mutable timing profile for one outer-pixel Traversal pipeline."""
+
+    star_selection_seconds: float = 0.0
+    candidate_generation_seconds: float = 0.0
+    filtering_seconds: float = 0.0
+    bright_star_filter_seconds: float = 0.0
+    overlap_quality_seconds: float = 0.0
+    overlap_geometry_seconds: float = 0.0
+    inner_assignment_seconds: float = 0.0
+    local_selection_seconds: float = 0.0
+    inner_table_seconds: float = 0.0
+    context_seconds: float = 0.0
+    point_prediction_seconds: float = 0.0
+    field_mean_prediction_seconds: float = 0.0
+    coverage_seconds: float = 0.0
+    dust_seconds: float = 0.0
+    persisted_asterisms_seconds: float = 0.0
+
+    def to_stats(self) -> TraversalStageStats:
+        return TraversalStageStats(
+            star_selection_seconds=self.star_selection_seconds,
+            candidate_generation_seconds=self.candidate_generation_seconds,
+            filtering_seconds=self.filtering_seconds,
+            bright_star_filter_seconds=self.bright_star_filter_seconds,
+            overlap_quality_seconds=self.overlap_quality_seconds,
+            overlap_geometry_seconds=self.overlap_geometry_seconds,
+            inner_assignment_seconds=self.inner_assignment_seconds,
+            local_selection_seconds=self.local_selection_seconds,
+            inner_table_seconds=self.inner_table_seconds,
+            context_seconds=self.context_seconds,
+            point_prediction_seconds=self.point_prediction_seconds,
+            field_mean_prediction_seconds=self.field_mean_prediction_seconds,
+            coverage_seconds=self.coverage_seconds,
+            dust_seconds=self.dust_seconds,
+            persisted_asterisms_seconds=self.persisted_asterisms_seconds,
+        )
+
+
+@dataclass(slots=True)
+class TraversalStructureProfile:
+    """Mutable cardinality profile for one outer-pixel Traversal pipeline."""
+
+    search_star_rows: int = 0
+    ngs_rows: int = 0
+    close_pair_rows: int = 0
+    self_pair_rows: int = 0
+    raw_asterism_rows: int = 0
+    dedupe_key_rows: int = 0
+    post_bright_asterism_rows: int = 0
+    post_overlap_asterism_rows: int = 0
+    local_asterism_rows: int = 0
+    context_pair_rows: int = 0
+    winner_rows: int = 0
+    winner_payload_rows: int = 0
+
+    def to_stats(self) -> TraversalStructureStats:
+        return TraversalStructureStats(
+            search_star_rows=self.search_star_rows,
+            ngs_rows=self.ngs_rows,
+            close_pair_rows=self.close_pair_rows,
+            self_pair_rows=self.self_pair_rows,
+            raw_asterism_rows=self.raw_asterism_rows,
+            dedupe_key_rows=self.dedupe_key_rows,
+            post_bright_asterism_rows=self.post_bright_asterism_rows,
+            post_overlap_asterism_rows=self.post_overlap_asterism_rows,
+            local_asterism_rows=self.local_asterism_rows,
+            context_pair_rows=self.context_pair_rows,
+            winner_rows=self.winner_rows,
+            winner_payload_rows=self.winner_payload_rows,
+            search_star_rows_peak=self.search_star_rows,
+            ngs_rows_peak=self.ngs_rows,
+            close_pair_rows_peak=self.close_pair_rows,
+            context_pair_rows_peak=self.context_pair_rows,
+            raw_asterism_rows_peak=self.raw_asterism_rows,
+            local_asterism_rows_peak=self.local_asterism_rows,
+            winner_payload_rows_peak=self.winner_payload_rows,
+        )
+
+
+@dataclass(slots=True)
+class TraversalMemoryProfile:
+    """Mutable per-pixel RSS checkpoints for detailed diagnostics."""
+
+    rss_start_mb: float = 0.0
+    peak_rss_start_mb: float = 0.0
+    rss_after_star_selection_mb: float = 0.0
+    peak_rss_after_star_selection_mb: float = 0.0
+    rss_after_find_asterisms_mb: float = 0.0
+    peak_rss_after_find_asterisms_mb: float = 0.0
+    rss_after_filtering_mb: float = 0.0
+    peak_rss_after_filtering_mb: float = 0.0
+    rss_after_context_mb: float = 0.0
+    peak_rss_after_context_mb: float = 0.0
+    rss_after_point_prediction_mb: float = 0.0
+    peak_rss_after_point_prediction_mb: float = 0.0
+    rss_after_field_mean_mb: float = 0.0
+    peak_rss_after_field_mean_mb: float = 0.0
+    rss_after_coverage_mb: float = 0.0
+    peak_rss_after_coverage_mb: float = 0.0
+    rss_after_dust_mb: float = 0.0
+    peak_rss_after_dust_mb: float = 0.0
+    rss_after_persisted_asterisms_mb: float = 0.0
+    peak_rss_after_persisted_asterisms_mb: float = 0.0
+    rss_after_artifact_write_mb: float = 0.0
+    peak_rss_after_artifact_write_mb: float = 0.0
+    rss_after_gc_mb: float = 0.0
+    peak_rss_after_gc_mb: float = 0.0
+
+
+def _sample_memory(
+    memory_profile: TraversalMemoryProfile | None,
+    current_attr: str,
+    peak_attr: str,
+    *,
+    rss_sampler=None,
+    peak_sampler=None,
+) -> None:
+    if memory_profile is None or rss_sampler is None or peak_sampler is None:
+        return
+    setattr(memory_profile, current_attr, float(rss_sampler()))
+    setattr(memory_profile, peak_attr, float(peak_sampler()))
 
 
 @dataclass(slots=True)
@@ -51,8 +182,6 @@ class TraversalGeometry:
     inner_resolution: u.Quantity
     baseline: SeeingBaselinePerformance
     min_galactic_latitude: float | None
-    _inner_pixs: dict[int, np.ndarray] = field(default_factory=dict)
-    _inner_centres: dict[int, SkyCoord] = field(default_factory=dict)
     _skip_asterisms: dict[int, tuple[bool, str]] = field(default_factory=dict)
 
     @classmethod
@@ -71,23 +200,17 @@ class TraversalGeometry:
         )
 
     def inner_pixs(self, outer_pix: int) -> np.ndarray:
-        outer_pix = int(outer_pix)
-        if outer_pix not in self._inner_pixs:
-            self._inner_pixs[outer_pix] = get_subpixels(
-                self.outer_level,
-                outer_pix,
-                self.inner_level,
-            )
-        return self._inner_pixs[outer_pix]
+        return get_subpixels(
+            self.outer_level,
+            int(outer_pix),
+            self.inner_level,
+        )
 
     def inner_centres(self, outer_pix: int) -> SkyCoord:
-        outer_pix = int(outer_pix)
-        if outer_pix not in self._inner_centres:
-            self._inner_centres[outer_pix] = get_pixel_skycoord(
-                self.inner_level,
-                self.inner_pixs(outer_pix),
-            )
-        return self._inner_centres[outer_pix]
+        return get_pixel_skycoord(
+            self.inner_level,
+            self.inner_pixs(outer_pix),
+        )
 
     def should_skip_asterisms(self, outer_pix: int) -> tuple[bool, str]:
         """Return the cached Galactic-latitude skip decision for an outer pixel."""
@@ -172,10 +295,20 @@ def should_skip_asterisms(
     return False, ""
 
 
-def _get_band_values(table: Table, band: str) -> np.ndarray:
-    if band in table.colnames:
-        return np.asarray(table[band], dtype=np.float64)
-    raise BuildError(f"Unsupported build band {band!r}")
+def coarse_density_skip_outer_pixs(
+    runtime: PredictRuntime,
+    star_counts: np.ndarray,
+) -> frozenset[int]:
+    """Return outer pixels whose coarse summary density already exceeds the NGS cutoff."""
+
+    if runtime.max_star_density is None:
+        return frozenset()
+    outer_area_arcmin2 = get_pixel_area(runtime.outer_level).to(u.arcmin**2).value
+    skip = np.flatnonzero(
+        np.asarray(star_counts, dtype=np.float64) / outer_area_arcmin2
+        > float(runtime.max_star_density)
+    )
+    return frozenset(int(pix) for pix in skip)
 
 
 def _get_inner_count_band_values(table: Table, band: str) -> np.ndarray:
@@ -183,13 +316,16 @@ def _get_inner_count_band_values(table: Table, band: str) -> np.ndarray:
         return np.asarray(table[band], dtype=np.float64)
     if band == "R":
         return np.asarray(
-            compute_legacy_r_magnitude(table[list(GAIA_SCHEMA_COLUMNS)]),
+            compute_r_magnitude(table[list(GAIA_SCHEMA_COLUMNS)]),
             dtype=np.float64,
         )
     raise BuildError(f"Unsupported build band {band!r}")
 
 
 def _get_inner_count_pixels(table: Table, level: int) -> np.ndarray:
+    if RUNTIME_HPX_COLUMN in table.colnames and level <= RUNTIME_HPX_LEVEL:
+        return _get_runtime_table_pixels(table, level)
+
     pixels = np.full((len(table),), -1, dtype=np.int64)
     valid = np.isfinite(np.asarray(table["ra"], dtype=np.float64)) & np.isfinite(
         np.asarray(table["dec"], dtype=np.float64)
@@ -210,8 +346,7 @@ def _get_inner_count_pixels(table: Table, level: int) -> np.ndarray:
 
 
 def _load_inner_count_stars(store: GaiaHealpixStore, outer_pix: int) -> Table:
-    raw_store = getattr(store, "store", store)
-    return raw_store.load_healpix(outer_pix, read_only=True)
+    return store.load_healpix(outer_pix, read_only=True)
 
 
 def _filter_neighbours_by_galactic_latitude(
@@ -350,7 +485,7 @@ def _get_ngs_from_asterisms(asterisms: Table) -> list[list[dict[str, float]]]:
 
 
 def _get_asterisms_ee(asterisms: Table, runtime: PredictRuntime, batch_size: int = 10000) -> np.ndarray:
-    if len(asterisms) == 0 or not runtime.ao_system.mean_models:
+    if len(asterisms) == 0:
         return np.zeros((len(asterisms),), dtype=np.float64)
 
     qualities = np.zeros((len(asterisms),), dtype=np.float64)
@@ -360,8 +495,6 @@ def _get_asterisms_ee(asterisms: Table, runtime: PredictRuntime, batch_size: int
         if len(indexes) == 0:
             continue
         model = get_mean_model(runtime, num_stars)
-        if model is None:
-            continue
         num_batches = int(np.ceil(len(indexes) / batch_size))
         for batch in range(num_batches):
             start_idx = batch * batch_size
@@ -385,53 +518,7 @@ def _get_asterisms_ee(asterisms: Table, runtime: PredictRuntime, batch_size: int
 
 
 def _get_asterism_quality(asterisms: Table, runtime: PredictRuntime) -> np.ndarray:
-    if runtime.ao_system.mean_models:
-        return _get_asterisms_ee(asterisms, runtime)
-
-    max_separation = runtime.ao_system.fov.to(u.arcsec).value
-    radius_1ngs = runtime.ao_system.fov_1ngs.to(u.arcsec).value / 2.0
-    min_rel_factor_small = 0.25
-    min_rel_factor_large = 0.5
-    min_rel_sep = radius_1ngs / max_separation
-    mid_rel_sep = 0.5
-    max_rel_sep = 1.0
-    below_mid_slope = (1.0 - min_rel_factor_small) / (mid_rel_sep - min_rel_sep)
-    above_mid_slope = (1.0 - min_rel_factor_large) / (max_rel_sep - mid_rel_sep)
-    qualities = np.zeros((len(asterisms),), dtype=np.float64)
-
-    for index, asterism in enumerate(asterisms):
-        rel_sep = (
-            float(asterism["relative_separation"])
-            if int(asterism["num_stars"]) > 1
-            else min_rel_sep
-        )
-        if rel_sep < 0.5:
-            rel_factor = max(
-                min_rel_factor_small,
-                1.0 - below_mid_slope * (mid_rel_sep - rel_sep),
-            )
-        else:
-            rel_factor = max(
-                min_rel_factor_large,
-                1.0 - above_mid_slope * (rel_sep - mid_rel_sep),
-            )
-
-        mag_factors: list[float] = []
-        for star_idx in range(1, int(asterism["num_stars"]) + 1):
-            if runtime.ao_system.max_mag == runtime.ao_system.nom_mag:
-                mag_factors.append(1.0)
-            else:
-                mag_factors.append(
-                    min(
-                        1.0,
-                        (runtime.ao_system.max_mag - float(asterism[f"star{star_idx}_mag"]))
-                        / (runtime.ao_system.max_mag - runtime.ao_system.nom_mag),
-                    )
-                )
-        while len(mag_factors) < 3:
-            mag_factors.append(0.0)
-        qualities[index] = rel_factor * (sum(mag_factors) / 3.0)
-    return qualities
+    return _get_asterisms_ee(asterisms, runtime)
 
 
 def _filter_bright_star_exclusion(
@@ -469,17 +556,21 @@ def _filter_overlaps(
     centres: SkyCoord,
     runtime: PredictRuntime,
     geometry: TraversalGeometry,
+    profile: TraversalStageProfile | None = None,
 ) -> tuple[Table, SkyCoord]:
     threshold = runtime.max_overlap
     if threshold is None or len(asterisms) == 0:
         return asterisms, centres
 
+    started = time.perf_counter()
     fov_radius = runtime.ao_system.fov.to(u.rad).value
-    fov_1ngs_radius = runtime.ao_system.fov_1ngs.to(u.rad).value
     asterism_pixs = get_pixel_from_skycoord(geometry.fov_level, centres)
     keep = np.ones(len(asterisms), dtype=np.bool_)
     qualities = _get_asterism_quality(asterisms, runtime)
+    if profile is not None:
+        profile.overlap_quality_seconds += time.perf_counter() - started
 
+    started = time.perf_counter()
     for pix in np.unique(asterism_pixs):
         search_pixs = np.concatenate([[pix], get_pixel_neighbours(geometry.fov_level, int(pix))])
         candidate_indexes = np.flatnonzero(keep & np.isin(asterism_pixs, search_pixs))
@@ -495,70 +586,17 @@ def _filter_overlaps(
                 if skip[offset] or separation > fov_radius:
                     continue
                 idx2 = candidate_indexes[offset]
-                radius1 = fov_radius if asterisms["num_stars"][idx1] > 1 else fov_1ngs_radius
-                radius2 = fov_radius if asterisms["num_stars"][idx2] > 1 else fov_1ngs_radius
+                radius1 = fov_radius
+                radius2 = fov_radius
                 overlap_area = _get_circle_overlap_area(radius1, radius2, float(separation))
                 overlap = overlap_area / (np.pi * min(radius1, radius2) ** 2)
                 if overlap > threshold:
                     skip[offset] = True
         current_pix = asterism_pixs[candidate_indexes] == pix
         keep[candidate_indexes[current_pix & skip]] = False
+    if profile is not None:
+        profile.overlap_geometry_seconds += time.perf_counter() - started
     return asterisms[keep], centres[keep]
-
-
-def _filter_relative_constraints(
-    asterisms: Table,
-    centres: SkyCoord,
-    runtime: PredictRuntime,
-) -> tuple[Table, SkyCoord]:
-    result = asterisms
-    result_centres = centres
-    if runtime.ao_system.max_rel_sep > 0:
-        keep = (
-            np.asarray(result["relative_separation"], dtype=np.float64) >= runtime.ao_system.min_rel_sep
-        ) & (
-            np.asarray(result["relative_separation"], dtype=np.float64) < runtime.ao_system.max_rel_sep
-        )
-        result = result[keep]
-        result_centres = result_centres[keep]
-    if runtime.ao_system.max_rel_area > 0 and len(result) > 0:
-        keep = (
-            np.asarray(result["relative_area"], dtype=np.float64) >= runtime.ao_system.min_rel_area
-        ) & (
-            np.asarray(result["relative_area"], dtype=np.float64) < runtime.ao_system.max_rel_area
-        )
-        result = result[keep]
-        result_centres = result_centres[keep]
-    return result, result_centres
-
-
-def build_outer_pixel_asterisms(
-    store: GaiaHealpixStore,
-    runtime: PredictRuntime,
-    outer_pix: int,
-    *,
-    geometry: TraversalGeometry | None = None,
-) -> tuple[Table, Table, Table]:
-    """Return the search stars, filtered NGS, and retained asterisms."""
-
-    stars, ngs, asterisms, _ = _build_expanded_outer_pixel_asterisms(
-        store,
-        runtime,
-        outer_pix,
-        geometry=geometry,
-    )
-    if len(asterisms) == 0:
-        return stars, ngs, asterisms
-
-    keep = (
-        get_parent_pixel(
-            runtime.inner_level,
-            np.asarray(asterisms["pix"], dtype=np.int64),
-            runtime.outer_level,
-        )
-        == int(outer_pix)
-    )
-    return stars, ngs, asterisms[keep]
 
 
 def _build_expanded_outer_pixel_asterisms(
@@ -568,10 +606,16 @@ def _build_expanded_outer_pixel_asterisms(
     *,
     geometry: TraversalGeometry | None = None,
     boundary_rings: int = ASTERISM_BOUNDARY_RINGS,
+    profile: TraversalStageProfile | None = None,
+    structure_profile: TraversalStructureProfile | None = None,
+    memory_profile: TraversalMemoryProfile | None = None,
+    rss_sampler=None,
+    peak_sampler=None,
 ) -> tuple[Table, Table, Table, SkyCoord]:
     """Return retained asterisms from one outer pixel's expanded star footprint."""
 
     geometry = geometry or TraversalGeometry.from_runtime(runtime)
+    started = time.perf_counter()
     stars, ngs = prepare_search_inputs(
         store,
         runtime,
@@ -579,22 +623,76 @@ def _build_expanded_outer_pixel_asterisms(
         geometry=geometry,
         boundary_rings=boundary_rings,
     )
+    if profile is not None:
+        profile.star_selection_seconds += time.perf_counter() - started
+    if structure_profile is not None:
+        structure_profile.search_star_rows = int(len(stars))
+        structure_profile.ngs_rows = int(len(ngs))
+    _sample_memory(
+        memory_profile,
+        "rss_after_star_selection_mb",
+        "peak_rss_after_star_selection_mb",
+        rss_sampler=rss_sampler,
+        peak_sampler=peak_sampler,
+    )
+
     options = AsterismSearchOptions(
         min_stars=runtime.ao_system.min_wfs,
         max_stars=runtime.ao_system.max_wfs,
         min_separation_arcsec=runtime.ao_system.min_sep.to(u.arcsec).value,
-        max_separation_arcsec=runtime.ao_system.max_sep.to(u.arcsec).value,
-        max_single_star_radius_arcsec=runtime.ao_system.fov_1ngs.to(u.arcsec).value / 2.0,
+        max_separation_arcsec=runtime.ao_system.fov.to(u.arcsec).value,
+        max_single_star_radius_arcsec=runtime.ao_system.fov.to(u.arcsec).value / 2.0,
     )
-    asterisms = find_asterisms(ngs, options).copy(copy_data=True)
+    started = time.perf_counter()
+    search_profile = AsterismSearchProfile() if structure_profile is not None else None
+    asterisms = find_asterisms(ngs, options, profile=search_profile).copy(copy_data=True)
     centres = SkyCoord(ra=asterisms["ra"], dec=asterisms["dec"], unit=(u.degree, u.degree))
+    if profile is not None:
+        profile.candidate_generation_seconds += time.perf_counter() - started
+    if structure_profile is not None and search_profile is not None:
+        structure_profile.close_pair_rows = int(search_profile.close_pair_count)
+        structure_profile.self_pair_rows = int(search_profile.self_pair_count)
+        structure_profile.raw_asterism_rows = int(search_profile.output_asterism_count)
+        structure_profile.dedupe_key_rows = int(search_profile.dedupe_key_count)
+    _sample_memory(
+        memory_profile,
+        "rss_after_find_asterisms_mb",
+        "peak_rss_after_find_asterisms_mb",
+        rss_sampler=rss_sampler,
+        peak_sampler=peak_sampler,
+    )
+
+    filter_started = time.perf_counter()
+    started = time.perf_counter()
     asterisms, centres = _filter_bright_star_exclusion(asterisms, centres, stars, runtime)
-    asterisms, centres = _filter_overlaps(asterisms, centres, runtime, geometry)
-    asterisms, centres = _filter_relative_constraints(asterisms, centres, runtime)
+    if profile is not None:
+        profile.bright_star_filter_seconds += time.perf_counter() - started
+    if structure_profile is not None:
+        structure_profile.post_bright_asterism_rows = int(len(asterisms))
+    asterisms, centres = _filter_overlaps(
+        asterisms,
+        centres,
+        runtime,
+        geometry,
+        profile=profile,
+    )
+    if structure_profile is not None:
+        structure_profile.post_overlap_asterism_rows = int(len(asterisms))
+    started = time.perf_counter()
     if len(asterisms) > 0:
         asterisms["pix"] = get_pixel_from_skycoord(runtime.inner_level, centres)
     else:
         asterisms["pix"] = np.array([], dtype=np.int64)
+    if profile is not None:
+        profile.inner_assignment_seconds += time.perf_counter() - started
+        profile.filtering_seconds += time.perf_counter() - filter_started
+    _sample_memory(
+        memory_profile,
+        "rss_after_filtering_mb",
+        "peak_rss_after_filtering_mb",
+        rss_sampler=rss_sampler,
+        peak_sampler=peak_sampler,
+    )
     return stars, ngs, asterisms, centres
 
 
@@ -751,6 +849,7 @@ def _build_context(
     local_asterism_mask: np.ndarray,
     *,
     geometry: TraversalGeometry | None = None,
+    structure_profile: TraversalStructureProfile | None = None,
 ) -> SimpleNamespace:
     geometry = geometry or TraversalGeometry.from_runtime(runtime)
     context = SimpleNamespace()
@@ -779,6 +878,8 @@ def _build_context(
         asterism_catalog,
         (runtime.ao_system.fov - geometry.inner_resolution) / 2,
     )
+    if structure_profile is not None:
+        structure_profile.context_pair_rows = int(len(context.pixel_idxs))
     context.star_x = {}
     context.star_y = {}
     num_stars = np.asarray(context.asterisms["num_stars"], dtype=np.int64)
@@ -803,7 +904,6 @@ def _get_valid_ngs_from_context_pair(
     asterism_idx: int,
     *,
     field_radius: float,
-    field_radius_1ngs: float,
 ) -> list[dict[str, float]]:
     all_stars: list[dict[str, float]] = []
     pixel_x = context.inner_x[pixel_idx]
@@ -822,9 +922,7 @@ def _get_valid_ngs_from_context_pair(
         )
 
     stars_in_fov = [star for star in all_stars if star["zd"] <= field_radius]
-    if len(stars_in_fov) >= 2:
-        return stars_in_fov
-    return [star for star in all_stars if star["zd"] <= field_radius_1ngs]
+    return stars_in_fov
 
 
 def _update_inner_pixel_asterism_performance(
@@ -833,15 +931,13 @@ def _update_inner_pixel_asterism_performance(
     context: SimpleNamespace,
     *,
     batch_size: int = 10000,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     field_radius = runtime.ao_system.fov.to(u.arcsec).value / 2.0
-    field_radius_1ngs = runtime.ao_system.fov_1ngs.to(u.arcsec).value / 2.0
     winner_asterism_idxs = np.full((len(inner),), -1, dtype=np.int64)
-    winner_angles = np.full((len(inner),), np.nan, dtype=np.float64)
     winner_ngs_payloads = np.empty((len(inner),), dtype=object)
     winner_ngs_payloads[:] = None
     if len(context.pixel_idxs) == 0:
-        return winner_asterism_idxs, winner_angles, winner_ngs_payloads
+        return winner_asterism_idxs, winner_ngs_payloads
 
     candidate_pixel_idxs = context.pixel_idxs
     candidate_asterism_idxs = context.asterism_idxs
@@ -852,30 +948,26 @@ def _update_inner_pixel_asterism_performance(
         batch_pixel_idxs = candidate_pixel_idxs[start_idx:end_idx]
         batch_asterism_idxs = candidate_asterism_idxs[start_idx:end_idx]
         grouped_pairs: dict[int, dict[str, list]] = {}
-        for row_idx, (pixel_idx, asterism_idx) in enumerate(zip(batch_pixel_idxs, batch_asterism_idxs, strict=True)):
+        for pixel_idx, asterism_idx in zip(batch_pixel_idxs, batch_asterism_idxs, strict=True):
             ngs = _get_valid_ngs_from_context_pair(
                 context,
                 int(pixel_idx),
                 int(asterism_idx),
                 field_radius=field_radius,
-                field_radius_1ngs=field_radius_1ngs,
             )
             surviving_stars = len(ngs)
             if surviving_stars < runtime.ao_system.min_wfs:
                 continue
             group = grouped_pairs.setdefault(
                 surviving_stars,
-                {"row_idxs": [], "pixel_idxs": [], "asterism_idxs": [], "ngs": []},
+                {"pixel_idxs": [], "asterism_idxs": [], "ngs": []},
             )
-            group["row_idxs"].append(row_idx)
             group["pixel_idxs"].append(int(pixel_idx))
             group["asterism_idxs"].append(int(asterism_idx))
             group["ngs"].append(ngs)
 
         for surviving_stars, group in grouped_pairs.items():
             model = get_point_model(runtime, surviving_stars)
-            if model is None:
-                continue
             metrics = predict_point_batch(
                 runtime,
                 num_stars=surviving_stars,
@@ -910,7 +1002,6 @@ def _update_inner_pixel_asterism_performance(
                     )
                 ):
                     inner["winner_ee_resolved"][pixel_idx] = float(ee)
-                    winner_angles[pixel_idx] = float(metrics.ee_angle[result_idx])
                     winner_asterism_idxs[pixel_idx] = int(asterism_idx)
                     winner_ngs_payloads[pixel_idx] = ngs
                     inner["winner_asterism_id"][pixel_idx] = int(
@@ -927,7 +1018,7 @@ def _update_inner_pixel_asterism_performance(
                 ):
                     inner["best_fwhm"][pixel_idx] = float(fwhm)
         clear_backend_cache()
-    return winner_asterism_idxs, winner_angles, winner_ngs_payloads
+    return winner_asterism_idxs, winner_ngs_payloads
 
 
 def _update_inner_pixel_asterism_field_mean(
@@ -935,7 +1026,6 @@ def _update_inner_pixel_asterism_field_mean(
     inner: Table,
     context: SimpleNamespace,
     winner_asterism_idxs: np.ndarray,
-    winner_angles: np.ndarray,
     winner_ngs_payloads: np.ndarray | None = None,
     *,
     batch_size: int = 10000,
@@ -945,7 +1035,6 @@ def _update_inner_pixel_asterism_field_mean(
         return
 
     field_radius = runtime.ao_system.fov.to(u.arcsec).value / 2.0
-    field_radius_1ngs = runtime.ao_system.fov_1ngs.to(u.arcsec).value / 2.0
     grouped_pairs: dict[int, dict[str, list]] = {}
     for pixel_idx in winner_pixel_idxs:
         asterism_idx = int(winner_asterism_idxs[pixel_idx])
@@ -956,23 +1045,19 @@ def _update_inner_pixel_asterism_field_mean(
                 int(pixel_idx),
                 asterism_idx,
                 field_radius=field_radius,
-                field_radius_1ngs=field_radius_1ngs,
             )
         surviving_stars = len(ngs)
         if surviving_stars < runtime.ao_system.min_wfs:
             continue
         group = grouped_pairs.setdefault(
             surviving_stars,
-            {"pixel_idxs": [], "ngs": [], "angles": []},
+            {"pixel_idxs": [], "ngs": []},
         )
         group["pixel_idxs"].append(int(pixel_idx))
         group["ngs"].append(ngs)
-        group["angles"].append(float(winner_angles[pixel_idx]))
 
     for surviving_stars, group in grouped_pairs.items():
         model = get_mean_model(runtime, surviving_stars)
-        if model is None:
-            continue
         num_rows = len(group["pixel_idxs"])
         num_batches = int(np.ceil(num_rows / batch_size))
         for batch in range(num_batches):
@@ -980,13 +1065,11 @@ def _update_inner_pixel_asterism_field_mean(
             end_idx = min((batch + 1) * batch_size, num_rows)
             batch_pixel_idxs = group["pixel_idxs"][start_idx:end_idx]
             batch_ngs = group["ngs"][start_idx:end_idx]
-            batch_angles = group["angles"][start_idx:end_idx]
             ee_field_mean = predict_field_mean_batch(
                 runtime,
                 num_stars=surviving_stars,
                 model=model,
                 ngs=batch_ngs,
-                rot_angles=batch_angles,
             )
             inner["winner_ee_averaged"][batch_pixel_idxs] = ee_field_mean
         clear_backend_cache()
@@ -1000,12 +1083,25 @@ def build_traversal_products(
     dust_root: Path,
     max_data_level: int,
     geometry: TraversalGeometry | None = None,
+    asterism_skip_reason: str | None = None,
+    profile: TraversalStageProfile | None = None,
+    structure_profile: TraversalStructureProfile | None = None,
+    memory_profile: TraversalMemoryProfile | None = None,
+    rss_sampler=None,
+    peak_sampler=None,
 ) -> tuple[Table, Table]:
     """Return retained asterisms and the rich inner table for one outer pixel."""
 
     geometry = geometry or TraversalGeometry.from_runtime(runtime)
-    skip_asterisms, _ = should_skip_asterisms(runtime, outer_pix, geometry=geometry)
+    skip_asterisms, _ = should_skip_asterisms(
+        runtime,
+        outer_pix,
+        geometry=geometry,
+    )
+    if asterism_skip_reason is not None:
+        skip_asterisms = True
     if skip_asterisms:
+        started = time.perf_counter()
         inner = build_base_inner_table(
             store,
             runtime,
@@ -1013,6 +1109,9 @@ def build_traversal_products(
             geometry=geometry,
             asterisms=None,
         )
+        if profile is not None:
+            profile.inner_table_seconds += time.perf_counter() - started
+        started = time.perf_counter()
         inner = add_gaia_a0_to_inner(
             inner,
             dust_root=dust_root,
@@ -1021,14 +1120,26 @@ def build_traversal_products(
             inner_level=runtime.inner_level,
             max_data_level=max_data_level,
         )
-        return _empty_persisted_asterisms(), inner
+        if profile is not None:
+            profile.dust_seconds += time.perf_counter() - started
+        started = time.perf_counter()
+        empty_asterisms = _empty_persisted_asterisms()
+        if profile is not None:
+            profile.persisted_asterisms_seconds += time.perf_counter() - started
+        return empty_asterisms, inner
 
     _, _, expanded_asterisms, _ = _build_expanded_outer_pixel_asterisms(
         store,
         runtime,
         outer_pix,
         geometry=geometry,
+        profile=profile,
+        structure_profile=structure_profile,
+        memory_profile=memory_profile,
+        rss_sampler=rss_sampler,
+        peak_sampler=peak_sampler,
     )
+    started = time.perf_counter()
     if len(expanded_asterisms) > 0:
         local_asterism_mask = (
             get_parent_pixel(
@@ -1042,6 +1153,12 @@ def build_traversal_products(
     else:
         local_asterism_mask = np.array([], dtype=np.bool_)
         local_asterisms = expanded_asterisms
+    if profile is not None:
+        profile.local_selection_seconds += time.perf_counter() - started
+    if structure_profile is not None:
+        structure_profile.local_asterism_rows = int(len(local_asterisms))
+
+    started = time.perf_counter()
     inner = build_base_inner_table(
         store,
         runtime,
@@ -1049,42 +1166,91 @@ def build_traversal_products(
         geometry=geometry,
         asterisms=local_asterisms,
     )
+    if profile is not None:
+        profile.inner_table_seconds += time.perf_counter() - started
     if len(expanded_asterisms) > 0:
+        started = time.perf_counter()
         context = _build_context(
             runtime,
             outer_pix,
             expanded_asterisms,
             local_asterism_mask,
             geometry=geometry,
+            structure_profile=structure_profile,
+        )
+        if profile is not None:
+            profile.context_seconds += time.perf_counter() - started
+        _sample_memory(
+            memory_profile,
+            "rss_after_context_mb",
+            "peak_rss_after_context_mb",
+            rss_sampler=rss_sampler,
+            peak_sampler=peak_sampler,
         )
         if context.asterisms is not None and len(context.asterisms) > 0 and len(context.pixel_idxs) > 0:
+            started = time.perf_counter()
             (
                 winner_asterism_idxs,
-                winner_angles,
                 winner_ngs_payloads,
             ) = _update_inner_pixel_asterism_performance(
                 runtime,
                 inner,
                 context,
             )
-            if runtime.ao_system.mean_models:
-                _update_inner_pixel_asterism_field_mean(
-                    runtime,
-                    inner,
-                    context,
-                    winner_asterism_idxs,
-                    winner_angles,
-                    winner_ngs_payloads,
+            if profile is not None:
+                profile.point_prediction_seconds += time.perf_counter() - started
+            if structure_profile is not None:
+                structure_profile.winner_rows = int(np.count_nonzero(winner_asterism_idxs >= 0))
+                structure_profile.winner_payload_rows = int(
+                    sum(payload is not None for payload in winner_ngs_payloads)
                 )
+            _sample_memory(
+                memory_profile,
+                "rss_after_point_prediction_mb",
+                "peak_rss_after_point_prediction_mb",
+                rss_sampler=rss_sampler,
+                peak_sampler=peak_sampler,
+            )
+            started = time.perf_counter()
+            _update_inner_pixel_asterism_field_mean(
+                runtime,
+                inner,
+                context,
+                winner_asterism_idxs,
+                winner_ngs_payloads,
+            )
+            if profile is not None:
+                profile.field_mean_prediction_seconds += time.perf_counter() - started
+            _sample_memory(
+                memory_profile,
+                "rss_after_field_mean_mb",
+                "peak_rss_after_field_mean_mb",
+                rss_sampler=rss_sampler,
+                peak_sampler=peak_sampler,
+            )
+            started = time.perf_counter()
             inner["coverage_resolved"] = (
                 np.asarray(inner["winner_ee_resolved"], dtype=np.float64)
                 >= runtime.coverage_ee_threshold_resolved
             )
-            inner["coverage_averaged"] = (
-                np.asarray(inner["winner_ee_averaged"], dtype=np.float64)
-                >= runtime.coverage_ee_threshold_mean
-            )
+            if profile is not None:
+                profile.coverage_seconds += time.perf_counter() - started
+        started = time.perf_counter()
+        inner["coverage_averaged"] = (
+            np.asarray(inner["winner_ee_averaged"], dtype=np.float64)
+            >= runtime.coverage_ee_threshold_averaged
+        )
+        if profile is not None:
+            profile.coverage_seconds += time.perf_counter() - started
+        _sample_memory(
+            memory_profile,
+            "rss_after_coverage_mb",
+            "peak_rss_after_coverage_mb",
+            rss_sampler=rss_sampler,
+            peak_sampler=peak_sampler,
+        )
 
+    started = time.perf_counter()
     inner = add_gaia_a0_to_inner(
         inner,
         dust_root=dust_root,
@@ -1093,4 +1259,25 @@ def build_traversal_products(
         inner_level=runtime.inner_level,
         max_data_level=max_data_level,
     )
-    return _to_persisted_asterisms(local_asterisms), inner
+    if profile is not None:
+        profile.dust_seconds += time.perf_counter() - started
+    _sample_memory(
+        memory_profile,
+        "rss_after_dust_mb",
+        "peak_rss_after_dust_mb",
+        rss_sampler=rss_sampler,
+        peak_sampler=peak_sampler,
+    )
+
+    started = time.perf_counter()
+    persisted_asterisms = _to_persisted_asterisms(local_asterisms)
+    if profile is not None:
+        profile.persisted_asterisms_seconds += time.perf_counter() - started
+    _sample_memory(
+        memory_profile,
+        "rss_after_persisted_asterisms_mb",
+        "peak_rss_after_persisted_asterisms_mb",
+        rss_sampler=rss_sampler,
+        peak_sampler=peak_sampler,
+    )
+    return persisted_asterisms, inner

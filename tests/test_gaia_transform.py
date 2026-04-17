@@ -10,7 +10,7 @@ from ao_sky.gaia import (
     GAIA_SCHEMA_COLUMNS,
     GaiaError,
     apply_proper_motion,
-    compute_legacy_r_magnitude,
+    compute_r_magnitude,
 )
 
 
@@ -78,13 +78,13 @@ def test_apply_proper_motion_rejects_epoch_and_dt_years_together() -> None:
         apply_proper_motion(_make_table(), epoch=2017.0, dt_years=1.0)
 
 
-def test_compute_legacy_r_magnitude_matches_legacy_polynomial() -> None:
+def test_compute_r_magnitude_matches_legacy_polynomial() -> None:
     table = _make_table()
     table["G"] = np.asarray([12.5, 13.0])
     table["BP"] = np.asarray([12.8, 13.6])
     table["RP"] = np.asarray([12.1, 12.9])
 
-    result = compute_legacy_r_magnitude(table)
+    result = compute_r_magnitude(table)
 
     mag_diff = table["BP"] - table["RP"]
     expected = table["G"] - (

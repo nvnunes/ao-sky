@@ -19,16 +19,14 @@ from ._constants import (
 from ._exceptions import BuildError
 from .config import resolve_runtime_root_candidates
 from .control import (
-    load_build_definition,
     load_build_roots,
-    load_legacy_config_path,
+    load_runtime_config_path,
     load_state,
     set_model_root,
 )
-from .legacy_config import load_native_runtime
+from .runtime_config import load_runtime_config
 
 _REQUIRED_MODEL_SUFFIXES = (".pt", "_metadata.pkl")
-_OPTIONAL_MODEL_SUFFIXES = ("_data.pkl",)
 _HASH_CHUNK_SIZE = 1024 * 1024
 
 
@@ -36,7 +34,7 @@ def fetch_model_data(
     build_path: Path,
     *,
     model_root: Path | None = None,
-    aosky_conf: Path | None = None,
+    aosky_yaml: Path | None = None,
     force: bool = False,
     cwd: Path | None = None,
 ) -> Path:
@@ -49,15 +47,13 @@ def fetch_model_data(
     source_root, source_is_override = _resolve_source_model_root(
         resolved_build_path,
         model_root=model_root,
-        aosky_conf=aosky_conf,
+        aosky_yaml=aosky_yaml,
         cwd=cwd,
     )
 
-    definition = load_build_definition(resolved_build_path)
-    legacy_config_path = load_legacy_config_path(resolved_build_path)
-    runtime = load_native_runtime(
-        definition,
-        legacy_config_path=legacy_config_path,
+    runtime_config_path = load_runtime_config_path(resolved_build_path)
+    runtime = load_runtime_config(
+        runtime_config_path,
         model_root=source_root,
     )
     model_roles = _required_model_roles(runtime)
@@ -76,9 +72,8 @@ def fetch_model_data(
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_model_root": str(source_root),
-        "model_root": str(destination_root),
-        "ao_system": runtime.ao_system.name,
-        "legacy_config_path": str(legacy_config_path.resolve()),
+        "model_root": MODEL_SNAPSHOT_DIRNAME,
+        "runtime_config_path": str(runtime_config_path.resolve()),
         "models": [],
     }
 
@@ -93,23 +88,13 @@ def fetch_model_data(
                 _copy_model_file(
                     source_root=source_root,
                     destination_root=destination_root,
+                    build_path=resolved_build_path,
                     model_name=model_name,
                     suffix=suffix,
                     required=True,
                     force=force,
                 )
             )
-        for suffix in _OPTIONAL_MODEL_SUFFIXES:
-            copied = _copy_model_file(
-                source_root=source_root,
-                destination_root=destination_root,
-                model_name=model_name,
-                suffix=suffix,
-                required=False,
-                force=force,
-            )
-            if copied is not None:
-                model_entry["files"].append(copied)
         manifest["models"].append(model_entry)
 
     _write_json_atomically(manifest_path, manifest)
@@ -121,15 +106,14 @@ def _resolve_source_model_root(
     build_path: Path,
     *,
     model_root: Path | None,
-    aosky_conf: Path | None,
+    aosky_yaml: Path | None,
     cwd: Path | None,
 ) -> tuple[Path, bool]:
     candidates = resolve_runtime_root_candidates(
         gaia_root=None,
         build_root=None,
-        dust_root=None,
         model_root=model_root,
-        aosky_conf=aosky_conf,
+        aosky_yaml=aosky_yaml,
         cwd=cwd,
     )
     resolved = candidates["model_root"]
@@ -142,7 +126,7 @@ def _require_traversal_not_started(build_path: Path) -> None:
     state = load_state(build_path)
     if np.any(state["traversal_status"] != WORK_STATUS_PENDING):
         raise BuildError(
-            "fetch-model is only valid before Traversal has started; "
+            "Model snapshots can only be refreshed before Traversal has started; "
             "create a new build to snapshot models for completed or partial Traversal output"
         )
 
@@ -151,12 +135,12 @@ def _required_model_roles(runtime) -> dict[str, set[str]]:
     roles: dict[str, set[str]] = defaultdict(set)
     for num_stars in range(runtime.ao_system.min_wfs, runtime.ao_system.max_wfs + 1):
         key = f"{int(num_stars)}star"
-        point_model = runtime.ao_system.point_models.get(key)
+        point_model = runtime.resolved_models.get(key)
         if point_model:
-            roles[point_model].add(f"point:{key}")
-        mean_model = runtime.ao_system.mean_models.get(key)
+            roles[point_model].add(f"resolved:{key}")
+        mean_model = runtime.averaged_models.get(key)
         if mean_model:
-            roles[mean_model].add(f"mean:{key}")
+            roles[mean_model].add(f"averaged:{key}")
     return dict(roles)
 
 
@@ -175,6 +159,7 @@ def _copy_model_file(
     *,
     source_root: Path,
     destination_root: Path,
+    build_path: Path,
     model_name: str,
     suffix: str,
     required: bool,
@@ -192,7 +177,7 @@ def _copy_model_file(
         if not destination.is_file():
             raise BuildError(f"Model destination exists and is not a file: {destination}")
         if _same_file_content(source, destination):
-            return _file_manifest_entry(destination)
+            return _file_manifest_entry(destination, build_path=build_path)
         if not force:
             raise BuildError(
                 f"Model file already exists with different content: {destination}; "
@@ -201,7 +186,7 @@ def _copy_model_file(
 
     if source.resolve() != destination.resolve():
         _copy_file_atomically(source, destination)
-    return _file_manifest_entry(destination)
+    return _file_manifest_entry(destination, build_path=build_path)
 
 
 def _same_file_content(left: Path, right: Path) -> bool:
@@ -234,10 +219,10 @@ def _write_json_atomically(filename: Path, payload: dict[str, object]) -> None:
             temp.unlink()
 
 
-def _file_manifest_entry(filename: Path) -> dict[str, object]:
+def _file_manifest_entry(filename: Path, *, build_path: Path) -> dict[str, object]:
     return {
         "name": filename.name,
-        "path": str(filename.resolve()),
+        "path": filename.resolve().relative_to(build_path.resolve()).as_posix(),
         "size": filename.stat().st_size,
         "sha256": _sha256(filename),
     }

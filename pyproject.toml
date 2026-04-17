@@ -26,6 +26,7 @@ dependencies = [
     "astroquery>=0.4.7",
     "dustmaps>=1.0.13",
     "h5py>=3.0",
+    "hdf5plugin>=6.0",
     "joblib>=1.5",
     "mocpy>=0.18",
     "numpy>=1.26",

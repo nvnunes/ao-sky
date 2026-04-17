@@ -50,61 +50,110 @@ commands:
 
 ```bash
 ./.conda/bin/ao-sky check --help
-./.conda/bin/ao-sky fetch-dust --help
 ./.conda/bin/ao-sky fetch-gaia --help
-./.conda/bin/ao-sky fetch-model --help
 ./.conda/bin/ao-sky run --help
 ./.conda/bin/ao-sky restart --help
 ```
 
 When the public build surface changes, also smoke-check the build lifecycle.
 The repository test suite covers this contract, and an additional manual CLI
-smoke path is:
+smoke path is below. This path is intentionally repo-native and offline: it
+creates a minimal shared Gaia summary fixture plus dust/model placeholders
+rather than calling the live Gaia archive or downloading dust.
 
 ```bash
 tmpdir="$(mktemp -d)"
 cat >"$tmpdir/build.yaml" <<'YAML'
-ao_system_short_name: GNAO
-config_short_name: baseline
-gaia_release: dr3
-outer_level: 0
-inner_level: 1
-max_data_level: 1
-epoch: 2028.0
+schema_version: 1
+ao_system:
+  band: R
+  fov_arcsec: 120.0
+  lgs: []
+  min_wfs: 2
+  max_wfs: 3
+  min_mag: 8.0
+  max_mag: 18.5
+  min_sep_arcsec: 5.0
+prediction:
+  wavelength_micron: 1.654
+  resolved_models:
+    2star: point_two
+    3star: point_three
+  averaged_models:
+    2star: mean_two
+    3star: mean_three
+traversal:
+  outer_level: 0
+  inner_level: 1
+gaia:
+  release: dr3
+  epoch: 2028.0
+  min_galactic_latitude_deg: null
+  max_star_density: 6.0
+  max_bright_star_mag: 8.0
+maps:
+  max_level: 1
+asterism:
+  max_overlap: 0.66
+best:
+  seeing_baseline:
+    wavelength_micron: 0.5
+    sr: 0.0
+    ee: 0.02
+    fwhm_mas: 650.0
+coverage:
+  resolved_ee_threshold: 0.4
+  averaged_ee_threshold: 0.3
 YAML
-cat >"$tmpdir/legacy.yaml" <<'YAML'
-ao_systems:
-  - name: GNAO
-    band: R
-    fov: 120.0
-    fov_1ngs: 60.0
-    min_wfs: 2
-    max_wfs: 3
-    min_mag: 8.0
-    nom_mag: 16.0
-    max_mag: 18.5
-    min_sep: 5.0
-    max_sep: 120.0
-asterisms_max_star_density: 6.0
-asterisms_max_bright_star_mag: 8.0
-asterisms_max_overlap: 0.66
-YAML
-./.conda/bin/ao-sky fetch-gaia \
+mkdir -p "$tmpdir/models"
+./.conda/bin/python - "$tmpdir" <<'PY'
+from pathlib import Path
+import gzip
+import sys
+
+import numpy as np
+from astropy.table import Table
+
+from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
+
+root = Path(sys.argv[1])
+summary = np.zeros(
+    12,
+    dtype=[
+        ("outer_pix", "<i8"),
+        ("star_count", "<i8"),
+        ("loaded", "?"),
+    ],
+)
+summary["outer_pix"] = np.arange(12, dtype=np.int64)
+summary["loaded"] = True
+GaiaSummaryStore(
+    GaiaStoreConfig(root=root / "gaia", release="dr3", healpix_level=0)
+).write_summary(Table(summary))
+
+dust_file = root / "gaia" / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
+dust_file.parent.mkdir(parents=True, exist_ok=True)
+with gzip.open(dust_file, "wt", encoding="utf-8") as handle:
+    handle.write("healpix_id,healpix_level,a0,optimum_hpx_flag\n")
+    for healpix_id in range(48):
+        handle.write(f"{healpix_id},1,0.5,true\n")
+
+model_root = root / "models"
+model_root.mkdir(parents=True, exist_ok=True)
+for model_name in ("point_two", "point_three", "mean_two", "mean_three"):
+    (model_root / f"{model_name}.pt").write_bytes(model_name.encode() + b":pt")
+    (model_root / f"{model_name}_metadata.pkl").write_bytes(
+        model_name.encode() + b":metadata"
+    )
+PY
+./.conda/bin/ao-sky init "$tmpdir/build.yaml" \
   --gaia-root "$tmpdir/gaia" \
-  --gaia-release dr3 \
-  --outer-level 0
-build_path="$(
-  ./.conda/bin/ao-sky init "$tmpdir/build.yaml" \
-    --gaia-root "$tmpdir/gaia" \
-    --build-root "$tmpdir/builds" \
-    --dust-root "$tmpdir/dust" \
-    --model-root "$tmpdir/models" \
-    --legacy-config "$tmpdir/legacy.yaml"
-)"
+  --build-root "$tmpdir/builds" \
+  --model-root "$tmpdir/models"
+build_path="$tmpdir/builds/v1"
 ./.conda/bin/ao-sky check \
   --gaia-root "$tmpdir/gaia" \
   --build-root "$tmpdir/builds" \
-  --dust-root "$tmpdir/dust" \
   --model-root "$tmpdir/models"
 ./.conda/bin/ao-sky show "$build_path"
 ```

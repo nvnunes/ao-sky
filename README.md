@@ -25,13 +25,14 @@ conda create -y -p ./.conda python=3.12
 ```
 
 Use [`docs/development.md`](docs/development.md) for the full local workflow
-including the current build-definition and `ao-sky init|run|restart|show`
-workflow, and use [`docs/testing.md`](docs/testing.md) for the canonical
-verification path.
+including root preflight, Gaia fetch, build definitions, runtime config, and
+`ao-sky init|run|restart|show`. Use
+[`docs/testing.md`](docs/testing.md) for the canonical verification path.
 
 ## Core Docs
 
 - [`docs/architecture.md`](docs/architecture.md): package and data/build design
+- [`docs/api.md`](docs/api.md): supported Python API and public helper contracts
 - [`docs/development.md`](docs/development.md): local bootstrap and development workflow
 - [`docs/plan.md`](docs/plan.md): transitional migration context and implementation plan
 - [`docs/benchmarking.md`](docs/benchmarking.md): benchmark evidence that informs storage and cache decisions

@@ -98,59 +98,106 @@ The current public build surface is centered on:
 - `ao-sky restart`
 - `ao-sky show`
 
-`init` takes a minimal build-definition YAML file. The required fields are:
+`init` takes one merged build-config YAML file. The config filename identifies
+the build lineage, while the AO-system, prediction, traversal, Gaia, maps,
+asterism, best, and coverage sections define the runtime policy.
+`survey_overlays` is optional.
 
-- `ao_system_short_name`
-- `config_short_name`
-- `gaia_release`
-- `outer_level`
-- `inner_level`
-- `max_data_level`
-- `epoch`
-
-Optional fields:
-
-- `min_galactic_latitude`
-- `survey_extent_overlays`
-
-Example build definition:
+Example build config:
 
 ```yaml
-ao_system_short_name: GNAO
-config_short_name: baseline
-gaia_release: dr3
-outer_level: 6
-inner_level: 14
-max_data_level: 9
-epoch: 2028.0
-min_galactic_latitude: 10.0
-survey_extent_overlays:
+schema_version: 1
+build:
+  workers: 3
+  worker_memory_limit_mb: 2048
+  parent_memory_limit_mb: 12288
+  roots:
+    gaia: /data/gaia
+    model: /data/models
+    survey: /data/surveys
+ao_system:
+  band: R
+  fov_arcsec: 120.0
+  lgs: []
+  min_wfs: 2
+  max_wfs: 3
+  min_mag: 8.0
+  max_mag: 18.5
+  min_sep_arcsec: 5.0
+prediction:
+  wavelength_micron: 1.654
+  resolved_models:
+    2star: point_two
+    3star: point_three
+  averaged_models:
+    2star: mean_two
+    3star: mean_three
+traversal:
+  outer_level: 6
+  inner_level: 14
+gaia:
+  release: dr3
+  epoch: 2028.0
+  min_galactic_latitude_deg: 20.0
+  max_star_density: 6.0
+  max_bright_star_mag: 8.0
+maps:
+  max_level: 9
+asterism:
+  max_overlap: 0.66
+best:
+  seeing_baseline:
+    wavelength_micron: 0.5
+    sr: 0.0
+    ee: 0.02
+    fwhm_mas: 650.0
+coverage:
+  resolved_ee_threshold: 0.4
+  averaged_ee_threshold: 0.3
+survey_overlays:
   - name: ews
     moc_files:
-      - ../data/euclid/rsd2024a-footprint-equ-13-year1-MOC.fits
+      - rsd2024a-footprint-equ-13-year1-MOC.fits
 ```
 
-`gaia_root`, `build_root`, `dust_root`, and `model_root` are not part of the
-build definition. Resolve them either with CLI options or with a project-root
-`aosky.conf` file:
+External runtime roots live under `build.roots`. Build versions are created in
+the current working directory by default. The source Gaia TGE CSV lives under
+the Gaia root, while `init` converts it into a build-local dense A0 cache under
+`<build>/dust` so traversal workers can memory-map the small build artifact.
+CLI root flags can still override roots for tests and ad hoc runs.
 
-```yaml
-gaia_root: /data/gaia
-build_root: /data/ao-builds
-dust_root: /data/dust
-model_root: /data/models
-workers: 3
-gaia_cache_entries: 64
-gaia_cache_mb: 2048
-region_level: 4
-```
-
-If `aosky.conf` is present in the working project root, `init`, `run`,
-`restart`, `check`, `fetch-dust`, `fetch-gaia`, and `fetch-model` can use it
+`ao-sky.yaml` discovery is deliberately narrow. Commands first use an explicit
+`--ao-sky-yaml` path, then `./ao-sky.yaml` in the current working directory, then
+`ao-sky.yaml` in the nearest parent Python project root identified by
+`pyproject.toml`. `init`, `run`, `restart`, `check`, and `fetch-gaia` can use
+that discovered file
 automatically. Otherwise pass the root flags explicitly. The execution settings
-are runtime defaults only and are not persisted into build metadata.
+are runtime defaults only and are not persisted into build metadata. Traversal
+derives its regional worker-assignment level from `outer_level` and `workers`;
+there is no user-facing region-level setting. The current derivation targets at
+least `max(4, workers * 4)` outer pixels per region, clamped by `outer_level`.
+Worker-local Gaia table cache settings are also runtime-only. Set
+`--gaia-cache-entries 0` or `--gaia-cache-mb 0` only for cache comparison
+benchmarks; normal Traversal should keep the prepared Gaia table cache enabled.
+Derived build artifacts use Blosc Zstd compression by default through
+`hdf5plugin`. This keeps `outer.h5` and `maps-hpx<level>.h5` close to the
+smallest measured artifact size while removing most of the old `gzip=9`
+write-time cost. If you inspect these files directly with `h5py`, import
+`hdf5plugin` first so the HDF5 filter is registered in the process.
+Artifact writes are direct and worker-owned; SSD artifact staging was measured
+and removed from the active execution surface.
 
-Example CLI flow with explicit roots:
+Example lineage-workspace flow:
+
+```bash
+cd /data/ao-builds/gnao-baseline
+./ao-sky check
+./ao-sky fetch-gaia
+./ao-sky init
+./ao-sky restart gnao-baseline
+```
+
+Explicit root flags remain available for tests and ad hoc runs:
 
 ```bash
 ./.conda/bin/ao-sky fetch-gaia \
@@ -161,36 +208,39 @@ Example CLI flow with explicit roots:
 ./.conda/bin/ao-sky check \
   --gaia-root /data/gaia \
   --build-root /data/ao-builds \
-  --dust-root /data/dust \
   --model-root /data/models
-
-./.conda/bin/ao-sky fetch-dust \
-  --dust-root /data/dust
 
 ./.conda/bin/ao-sky init build.yaml \
   --gaia-root /data/gaia \
   --build-root /data/ao-builds \
-  --dust-root /data/dust \
-  --model-root /data/models
+  --model-root /data/models \
+  --survey-root /data/surveys
 
-./.conda/bin/ao-sky fetch-model /data/ao-builds/GNAO-baseline-v1 \
-  --model-root /data/models
-
-./.conda/bin/ao-sky show /data/ao-builds/GNAO-baseline-v1
-./.conda/bin/ao-sky run /data/ao-builds/GNAO-baseline-v1 \
+./.conda/bin/ao-sky show /data/ao-builds/v1
+./.conda/bin/ao-sky run /data/ao-builds/v1 \
   --workers 3 \
   --gaia-cache-entries 64 \
-  --gaia-cache-mb 2048
-./.conda/bin/ao-sky restart GNAO baseline \
+  --gaia-cache-mb 2048 \
+  --worker-memory-limit-mb 2048 \
+  --parent-memory-limit-mb 12288
+./.conda/bin/ao-sky restart build \
   --build-root /data/ao-builds \
-  --workers 3
+  --workers 3 \
+  --worker-memory-limit-mb 2048 \
+  --parent-memory-limit-mb 12288
 ```
 
-During the current migration phase, `init` also accepts `--legacy-config` to
-override the temporary legacy `survey_tools/aomap/config.yaml` runtime-policy
-source. Normal repo usage should rely on the default unless a task explicitly
-needs a different legacy config. When `model_root` is omitted, `init` falls
-back to the sibling legacy models cache under `../survey_tools/data/models`.
-`aosky.conf` remains path-only configuration; `fetch-model` is the explicit
-step that snapshots the configured model files into one build under
-`<build>/models` and updates that build to use the snapshot.
+`init` copies the runtime policy from the merged build config into build-local
+`build.yaml`; `run` and `restart` read that build-local config.
+`ao-sky.yaml` remains path-only configuration. `init` also snapshots the
+configured model files into `<build>/models`, writes the build-local Gaia TGE
+A0 cache into `<build>/dust`, and updates the build to use those snapshots. For
+builds with configured survey overlays, `init` resolves
+each `moc_files` entry as a filename under `survey_root`, copies it under
+`<build>/surveys`, and updates the build to use build-root-relative
+`surveys/<filename>` paths.
+
+For performance or memory investigations, add `--telemetry detailed` to `run`
+or `restart`. Detailed telemetry writes per-pixel RSS checkpoints to
+`<build>/diagnostics/traversal-memory.csv`; normal runs should use the default
+basic telemetry.

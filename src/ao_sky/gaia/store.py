@@ -218,14 +218,26 @@ class GaiaHealpixStore:
     def _write_healpix_file(self, filename: Path, table: Table) -> None:
         filename.parent.mkdir(parents=True, exist_ok=True)
         data = table_to_structured_array(table)
-        with h5py.File(filename, "w") as handle:
-            handle.create_dataset(
-                HDF5_DATASET_NAME,
-                data=data,
-                compression=HDF5_COMPRESSION,
-                compression_opts=HDF5_COMPRESSION_OPTS,
-                shuffle=HDF5_SHUFFLE,
-            )
+        with NamedTemporaryFile(
+            dir=filename.parent,
+            prefix=f".{filename.stem}-",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_handle:
+            tmp_path = Path(tmp_handle.name)
+        try:
+            with h5py.File(tmp_path, "w") as handle:
+                handle.create_dataset(
+                    HDF5_DATASET_NAME,
+                    data=data,
+                    compression=HDF5_COMPRESSION,
+                    compression_opts=HDF5_COMPRESSION_OPTS,
+                    shuffle=HDF5_SHUFFLE,
+                )
+            tmp_path.replace(filename)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
 
 def _maybe_mark_read_only(table: Table, *, read_only: bool) -> Table:

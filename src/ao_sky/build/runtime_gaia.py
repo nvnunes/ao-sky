@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import threading
+import time
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
@@ -14,7 +16,7 @@ from ..gaia import (
     GaiaHealpixStore,
     GaiaTableCacheStats,
     apply_proper_motion,
-    compute_legacy_r_magnitude,
+    compute_r_magnitude,
 )
 from ..gaia.cache import estimate_table_bytes
 from ..predict._models import PredictRuntime
@@ -48,6 +50,11 @@ class RuntimeGaiaHealpixStore:
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        self._oversized_skips = 0
+        self._load_seconds = 0.0
+        self._raw_load_seconds = 0.0
+        self._prepare_seconds = 0.0
+        self._lock = threading.RLock()
 
     @property
     def enabled(self) -> bool:
@@ -63,10 +70,11 @@ class RuntimeGaiaHealpixStore:
         force_reload: bool = False,
         read_only: bool = True,
     ) -> Table:
+        key = int(outer_pix)
         if force_reload:
             table = self._load_runtime_table(outer_pix, force_reload=force_reload)
             if self.enabled:
-                self._replace(int(outer_pix), table)
+                self._replace(key, table)
                 return table if read_only else table.copy(copy_data=True)
             return table if read_only else table.copy(copy_data=True)
 
@@ -74,44 +82,49 @@ class RuntimeGaiaHealpixStore:
             table = self._load_runtime_table(outer_pix, force_reload=False)
             return table if read_only else table.copy(copy_data=True)
 
-        key = int(outer_pix)
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._hits += 1
-            table, _ = cached
-            self._cache.move_to_end(key)
-            return table if read_only else table.copy(copy_data=True)
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._hits += 1
+                table, _ = cached
+                self._cache.move_to_end(key)
+                return table if read_only else table.copy(copy_data=True)
+            self._misses += 1
 
-        self._misses += 1
         table = self._load_runtime_table(outer_pix, force_reload=force_reload)
-        size = estimate_table_bytes(table)
-        self._cache[key] = (table, size)
-        self._current_bytes += size
-        self._peak_bytes = max(self._peak_bytes, self._current_bytes)
-        self._evict()
+        self._replace(key, table)
         return table if read_only else table.copy(copy_data=True)
 
     def stats(self) -> GaiaTableCacheStats:
-        return GaiaTableCacheStats(
-            hits=self._hits,
-            misses=self._misses,
-            evictions=self._evictions,
-            current_bytes=self._current_bytes,
-            peak_bytes=self._peak_bytes,
-            entries=len(self._cache),
-        )
+        with self._lock:
+            return GaiaTableCacheStats(
+                hits=self._hits,
+                misses=self._misses,
+                evictions=self._evictions,
+                current_bytes=self._current_bytes,
+                peak_bytes=self._peak_bytes,
+                entries=len(self._cache),
+                oversized_skips=self._oversized_skips,
+                load_seconds=self._load_seconds,
+                raw_load_seconds=self._raw_load_seconds,
+                prepare_seconds=self._prepare_seconds,
+            )
 
     def _load_runtime_table(self, outer_pix: int, *, force_reload: bool) -> Table:
+        started = time.perf_counter()
+        raw_started = time.perf_counter()
         raw = self.store.load_healpix(
             outer_pix,
             force_reload=force_reload,
             read_only=True,
         )
+        raw_load_seconds = time.perf_counter() - raw_started
+        prepare_started = time.perf_counter()
         table = apply_proper_motion(
             raw[list(GAIA_SCHEMA_COLUMNS)],
             epoch=self.runtime.epoch,
         )
-        table["R"] = compute_legacy_r_magnitude(table[list(GAIA_SCHEMA_COLUMNS)])
+        table["R"] = compute_r_magnitude(table[list(GAIA_SCHEMA_COLUMNS)])
         hpx = np.full((len(table),), -1, dtype=np.int64)
         valid_coords = np.isfinite(table["ra"]) & np.isfinite(table["dec"])
         if np.any(valid_coords):
@@ -128,17 +141,27 @@ class RuntimeGaiaHealpixStore:
             )
         table[RUNTIME_HPX_COLUMN] = hpx
         _mark_table_read_only(table)
+        prepare_seconds = time.perf_counter() - prepare_started
+        load_seconds = time.perf_counter() - started
+        with self._lock:
+            self._raw_load_seconds += raw_load_seconds
+            self._prepare_seconds += prepare_seconds
+            self._load_seconds += load_seconds
         return table
 
     def _replace(self, outer_pix: int, table: Table) -> None:
-        previous = self._cache.pop(int(outer_pix), None)
-        if previous is not None:
-            self._current_bytes -= previous[1]
-        size = estimate_table_bytes(table)
-        self._cache[int(outer_pix)] = (table, size)
-        self._current_bytes += size
-        self._peak_bytes = max(self._peak_bytes, self._current_bytes)
-        self._evict()
+        with self._lock:
+            previous = self._cache.pop(int(outer_pix), None)
+            if previous is not None:
+                self._current_bytes -= previous[1]
+            size = estimate_table_bytes(table)
+            if size > self.max_bytes:
+                self._oversized_skips += 1
+                return
+            self._cache[int(outer_pix)] = (table, size)
+            self._current_bytes += size
+            self._peak_bytes = max(self._peak_bytes, self._current_bytes)
+            self._evict()
 
     def _evict(self) -> None:
         while self._cache and (

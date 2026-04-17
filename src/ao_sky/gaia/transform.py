@@ -16,8 +16,8 @@ def _get_pm_component(values: np.ndarray) -> np.ndarray:
     return np.asarray(data, dtype=np.float64)
 
 
-def compute_legacy_r_magnitude(table: Table) -> np.ndarray:
-    """Return the legacy empirical Gaia-to-`R` magnitude estimate.
+def compute_r_magnitude(table: Table) -> np.ndarray:
+    """Return the empirical Gaia-to-`R` magnitude estimate.
 
     This helper applies the same Gaia DR3 polynomial that the legacy
     `survey_tools` guide-star path used. It does not mutate the caller's input

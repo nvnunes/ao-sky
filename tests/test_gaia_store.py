@@ -179,6 +179,46 @@ def test_force_reload_rewrites_canonical_file(tmp_path: Path, monkeypatch: pytes
     assert persisted["source_id"].tolist() == [9]
 
 
+def test_force_reload_write_failure_preserves_existing_canonical_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = GaiaHealpixStore(
+        GaiaStoreConfig(root=tmp_path, release="dr3", healpix_level=6)
+    )
+    filename = store.healpix_filename(0)
+    _write_hdf5(filename, _make_table(source_ids=(1,)))
+    real_h5py_file = h5py.File
+
+    class FailingH5File:
+        def __init__(self, path: Path, mode: str) -> None:
+            self.path = Path(path)
+            self.mode = mode
+
+        def __enter__(self) -> "FailingH5File":
+            self.path.write_bytes(b"partial")
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def create_dataset(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("simulated HDF5 write failure")
+
+    monkeypatch.setattr(
+        "ao_sky.gaia.store.query_healpix_table",
+        lambda *_: _make_table(source_ids=(9,)),
+    )
+    monkeypatch.setattr("ao_sky.gaia.store.h5py.File", FailingH5File)
+
+    with pytest.raises(RuntimeError, match="simulated HDF5 write failure"):
+        store.load_healpix(0, force_reload=True)
+
+    monkeypatch.setattr("ao_sky.gaia.store.h5py.File", real_h5py_file)
+    assert store.load_healpix(0)["source_id"].tolist() == [1]
+    assert not list(filename.parent.glob(".gaia-*.tmp"))
+
+
 def test_materialized_hdf5_uses_expected_dataset_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

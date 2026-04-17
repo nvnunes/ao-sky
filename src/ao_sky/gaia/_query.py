@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 from contextlib import redirect_stderr, redirect_stdout
 
-from astroquery.gaia import Gaia
 import requests
 from astropy.table import Table
 
@@ -19,6 +18,14 @@ from ..spatial import get_pixel_resolution, get_pixel_skycoord
 
 
 # Query construction
+
+def _get_gaia_archive():
+    """Import the Gaia archive client only when live materialization is needed."""
+
+    from astroquery.gaia import Gaia
+
+    return Gaia
+
 
 def _get_archive_table_name(release: str) -> str:
     release = release.strip().lower()
@@ -114,9 +121,10 @@ def query_healpix_table(release: str, healpix_level: int, outer_pix: int) -> Tab
     query = build_healpix_query(release, healpix_level, outer_pix)
 
     try:
+        gaia_archive = _get_gaia_archive()
         with open(os.devnull, "w", encoding="utf-8") as fnull:
             with redirect_stdout(fnull), redirect_stderr(fnull):
-                job = Gaia.launch_job_async(query)
+                job = gaia_archive.launch_job_async(query)
     except requests.exceptions.HTTPError as exc:
         if str(exc) == "OK":
             raise GaiaError("Gaia archive is likely down for maintenance") from exc

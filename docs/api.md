@@ -5,6 +5,7 @@ This document describes the current code-first API exposed by `ao_sky`.
 The supported public surface currently centers on:
 
 - `ao_sky.gaia` for canonical Gaia storage and proper-motion transforms
+- `ao_sky.dust` for Gaia TGE source validation and build-local A0 cache helpers
 - `ao_sky.spatial` for reusable non-plotting HEALPix helpers
 - `ao_sky.asterisms` for outer-pixel star assembly and in-memory search
 - `ao_sky.build` for persisted build roots, build state, and per-outer-pixel
@@ -22,10 +23,13 @@ The current package-supported Gaia API exposes:
 - `GaiaError`
 - `fetch_gaia_store`
 - `apply_proper_motion`
-- `compute_legacy_r_magnitude`
+- `compute_r_magnitude`
 - `GAIA_SCHEMA_COLUMNS`
 - `HDF5_DATASET_NAME`
 - `GAIA_SUMMARY_DATASET_NAME`
+- `GAIA_SUMMARY_DTYPE`
+- `GAIA_SUMMARY_FILENAME`
+- `GaiaTableCacheStats`
 - `HDF5_COMPRESSION`
 - `HDF5_COMPRESSION_OPTS`
 - `HDF5_SHUFFLE`
@@ -65,10 +69,52 @@ The shared Gaia summary dataset is:
 - one dense row per outer pixel
 - fields: `outer_pix`, `star_count`, `loaded`
 
+### `ao_sky.dust`
+
+The current package-supported dust API exposes:
+
+- `DustError`
+- `fetch_gaia_tge_dataset`
+- `gaia_tge_map_filename`
+- `gaia_tge_a0_cache_filename`
+- `prepare_gaia_tge_a0_cache`
+- `sample_gaia_a0_for_outer_pixel`
+- `add_gaia_a0_to_inner`
+
+The source Gaia TGE path contract is:
+
+`<gaia_root>/gaia_tge/TotalGalacticExtinctionMap_001.csv.gz`
+
+Initialized builds also persist a build-local dense A0 cache:
+
+`<build>/dust/ao-sky-gaia-tge-a0-hpx<max_level>.npy`
+
+Traversal and aggregation sample this cache with `numpy.load(...,
+mmap_mode="r")`, using the same `max_data_level` coarse-sampling rule as the
+legacy pipeline.
+
+### Derived Build Artifact Compression
+
+Derived build artifacts are HDF5 files written by `ao_sky.build`, including
+per-outer-pixel `outer.h5` files, all-sky `maps-hpx<level>.h5` files, and
+augmentation datasets inside map files.
+
+The default derived-artifact compression contract is:
+
+- codec: Blosc Zstd
+- Blosc compression level: `5`
+- Blosc shuffle: enabled
+- Python dependency: `hdf5plugin`
+
+Code that reads these artifacts through `ao_sky.build` readers gets the HDF5
+plugin registration automatically. Code that opens the files directly with
+`h5py` should import `hdf5plugin` before reading plugin-compressed datasets.
+
 ### `ao_sky.spatial`
 
 The current package-supported spatial API exposes:
 
+- `SpatialError`
 - `get_pixel_resolution`
 - `get_pixel_area`
 - `get_pixel_from_skycoord`
@@ -82,7 +128,9 @@ The current package-supported spatial API exposes:
 
 The current package-supported asterism API exposes:
 
+- `AsterismError`
 - `AsterismSearchOptions`
+- `AsterismSearchProfile`
 - `load_asterism_stars`
 - `find_asterisms`
 - `ASTERISM_TABLE_COLUMNS`
@@ -92,15 +140,15 @@ The current package-supported asterism API exposes:
 The current package-supported build API exposes:
 
 - `BuildError`
-- `load_build_definition`
+- `check_runtime_roots`
 - `fetch_gaia_data`
-- `fetch_model_data`
+- `init_build`
+- `load_build_definition`
+- `resolve_build_root_only`
 - `resolve_gaia_root_only`
 - `resolve_build_roots`
-- `resolve_build_root_only`
-- `init_build`
-- `run_build`
 - `restart_build`
+- `run_build`
 - `show_build`
 
 ## Core Read And Search Paths
@@ -131,15 +179,15 @@ Load the shared dense Gaia summary table for one Gaia release and outer level.
 
 ### `fetch_gaia_store(config, *, force_reload=False, output=None) -> Path`
 
-Materialize the full-sky canonical Gaia store for one Gaia release and outer
-level, then refresh the shared Gaia summary from the final on-disk file state.
+Load the full-sky canonical Gaia store for one Gaia release and outer level,
+then refresh the shared Gaia summary from the final store state.
 
 Behavior:
 
 - ensure the dense shared `summary.h5` file exists before the full-sky pass
 - skip existing Gaia files unless `force_reload=True`
-- after each outer-pixel step, reopen the final on-disk Gaia file, count its
-  rows, and update the corresponding summary row immediately
+- after each outer-pixel step, count the final Gaia table and update the
+  corresponding summary row immediately
 - leave partial summary progress behind if the run is interrupted or fails
 - when `output` is provided, emit legacy-style start, progress, and done lines
 
@@ -149,7 +197,7 @@ Return a canonical Gaia table with in-memory proper motion applied. The schema
 is preserved exactly, and the returned table updates `ra`, `dec`, and
 `ref_epoch`.
 
-### `compute_legacy_r_magnitude(table) -> ndarray`
+### `compute_r_magnitude(table) -> ndarray`
 
 Return the empirical Gaia-to-`R` magnitude estimate used by the legacy guide-star
 workflow. This is an in-memory Gaia-domain helper and is not part of the raw
@@ -190,57 +238,124 @@ Non-goals of the current Gaia API:
 
 ## Build Lifecycle
 
+### `ao-sky.yaml` Discovery
+
+Helpers that accept `aosky_yaml` use a narrow discovery order when the argument
+is omitted:
+
+- `./ao-sky.yaml` in the current working directory
+- `ao-sky.yaml` in the nearest parent Python project root identified by
+  `pyproject.toml`
+- no configuration defaults
+
+Explicit function arguments and CLI flags still take precedence over values
+loaded from `ao-sky.yaml`.
+
+### `check_runtime_roots(...) -> tuple[bool, str]`
+
+Resolve and validate the runtime root set without requiring a specific build.
+
+Behavior:
+
+- resolve `gaia_root`, `build_root`, `dust_root`, and `model_root` from explicit
+  arguments or `ao-sky.yaml`; `dust_root` is derived from `gaia_root`
+- require Gaia, build, and model roots to exist as directories
+- require the dust root to contain the Gaia TGE dataset file
+- return a success flag and concise human-readable report
+- perform no downloads, build inspection, or persisted build mutation
+
+### `fetch_gaia_data(*, gaia_root, gaia_release, outer_level, force=False, aosky_yaml=None, cwd=None, output=None) -> Path`
+
+Resolve the Gaia root, ensure Gaia TGE dust is installed there, and run the
+shared full-sky Gaia loading workflow.
+
+Behavior:
+
+- install or validate the Gaia TGE dataset under `<gaia_root>/gaia_tge`
+- load one explicit Gaia release and outer level into the canonical Gaia store
+- skip existing per-pixel Gaia files unless `force=True`
+- refresh the shared dense `summary.h5` artifact as the run progresses
+- return the written summary filename
+- do not create build-local dust caches; that is a build-aware `init` step
+
 ### `init_build(...) -> Path`
 
-Create a new build root, persist `build.h5`, seed full-sky outer-pixel state,
-and create the build artifact layout.
+Create a new build root from one merged build config, persist `build.h5`, seed
+full-sky outer-pixel state, and create the build artifact layout.
 
 Behavior:
 
-- load a minimal build-definition YAML with the required build identity fields
+- load a merged build-config YAML with `gaia.release`, `maps.max_level`,
+  runtime policy sections, and optional `survey_overlays`
 - require the matching shared Gaia summary to exist for the configured Gaia
   release and outer level
-- resolve `gaia_root`, `build_root`, and `dust_root` from explicit arguments or `aosky.conf`
+- resolve `gaia_root`, `build_root`, and `model_root` from explicit arguments
+  or `ao-sky.yaml`
+- convert the source Gaia TGE CSV under `gaia_root` into a build-local dense
+  A0 cache at `<build>/dust/ao-sky-gaia-tge-a0-hpx<max_level>.npy`
+  and persist `dust_root` as that build-local dust snapshot
 - persist the resolved roots into `build.h5`
+- copy the supplied native runtime policy into build-local `build.yaml`; later
+  build execution reads that build-local config
+- copy required `.pt` and `_metadata.pkl` files for configured resolved and
+  averaged models into `<build>/models`
+- write `<build>/models/manifest.json` and update persisted `model_root` to the
+  build-local snapshot
+- when `survey_overlays` are configured, resolve each `moc_files` entry as a
+  filename under `survey_root`, copy it into `<build>/surveys`, write
+  `<build>/surveys/manifest.json`, and persist build-root-relative
+  `surveys/<filename>` paths for augmentation
 
-### `fetch_model_data(build_path, *, model_root=None, aosky_conf=None, force=False) -> Path`
-
-Copy the AO prediction model bundle configured for one initialized build into
-`<build>/models`, write `manifest.json`, and update the persisted `model_root`
-so later build runs use the build-local copy.
-
-Behavior:
-
-- resolve the source model root from `model_root`, then `aosky.conf`, then the
-  build metadata
-- copy required `.pt` and `_metadata.pkl` files for configured point and mean
-  models
-- copy optional `_data.pkl` files when present
-- skip identical existing files
-- fail on differing existing files unless `force=True`
-- fail once Traversal has started
-
-### `run_build(build_path, *, workers=1, gaia_cache_entries=None, gaia_cache_mb=None, region_level=None, aosky_conf=None) -> Path`
+### `run_build(build_path, *, workers=None, gaia_cache_entries=None, gaia_cache_mb=None, worker_memory_limit_mb=None, parent_memory_limit_mb=None, telemetry=None, aosky_yaml=None) -> Path`
 
 Run one initialized build through its unfinished outer-pixel work and write
 `outer.h5` artifact containers.
 
-`workers` controls Traversal execution parallelism at execution time. The
-single-worker default uses a long-lived in-process Traversal worker so runtime
-setup, model caches, and Gaia table caches are reused across outer pixels.
+`workers` controls Traversal execution parallelism at execution time. When it
+is `None`, `ao-sky.yaml` may provide `build.workers`; otherwise the fallback is
+`1`. The single-worker fallback uses a long-lived in-process Traversal worker so
+runtime setup, model caches, and Gaia table caches are reused across outer
+pixels.
 Multi-worker runs use long-lived regional process workers. Cache-aware
 Traversal uses a worker-local runtime Gaia table cache controlled by
-`gaia_cache_entries`, `gaia_cache_mb`, and `region_level`. Cached runtime Gaia
-rows are derived from raw canonical Gaia files, shifted to the build epoch,
-enriched with `R` and `hpx14`, and marked read-only. These settings and derived
-columns are runtime execution details only; they are not persisted in the build
-definition, build metadata, or canonical Gaia files. Native build Traversal
-expects these runtime rows; raw canonical-row fallback is kept at lower-level
-loader APIs only.
+`gaia_cache_entries` and `gaia_cache_mb`; set either to `0` only for cache-off
+benchmarks. Read prewarm and artifact write-behind were measured and rejected
+as active execution paths because they added complexity without enough benefit
+over regional traversal plus the prepared-table cache. Artifact writes remain
+synchronous and worker-owned. The regional worker-assignment level is derived
+internally from `outer_level` and `workers`, so it is not a public runtime
+setting. Cached runtime Gaia rows are derived from raw canonical Gaia files,
+shifted to the build epoch, enriched with `R` and `hpx14`, and marked
+read-only. These settings and derived columns are runtime execution details
+only; they are not persisted in the build definition, build metadata, or
+canonical Gaia files. Native build Traversal expects these runtime rows for
+inner counts, asterism search, and prediction.
 
-### `restart_build(..., workers=1, gaia_cache_entries=None, gaia_cache_mb=None, region_level=None) -> Path`
+`worker_memory_limit_mb` is an optional execution-time safety guard. A value of
+`0` or `None` disables it. When enabled, regional workers report profiling
+lines and stop the Traversal run if a worker's peak RSS exceeds the limit; the
+build is left restartable instead of risking unbounded memory growth.
 
-Resume the latest build in one AO-system/config lineage, using the same
+`parent_memory_limit_mb` is an optional aggregate current-RSS safety guard. A
+value of `0` or `None` disables it. When enabled, the parent process periodically
+checks its current RSS plus active worker current RSS and stops Traversal if the
+aggregate exceeds the limit. This guard is intended to protect the whole system;
+`worker_memory_limit_mb` remains the per-worker pathological-pixel guard.
+
+`telemetry` controls runtime diagnostics. The default `None`/`"basic"` keeps
+low-cost operational profiling in `build.log`. `"detailed"` additionally writes
+one per-outer-pixel diagnostic row to
+`<build>/diagnostics/traversal-memory.csv` with RSS checkpoints and key
+intermediate row counts. Detailed telemetry is for benchmark/debug runs and is
+not part of the persisted build contract.
+
+Artifact writes are direct and worker-owned. SSD artifact staging was benchmarked
+and rejected as an active runtime option after Blosc Zstd made write latency
+negligible relative to Traversal compute.
+
+### `restart_build(..., workers=None, gaia_cache_entries=None, gaia_cache_mb=None, worker_memory_limit_mb=None, parent_memory_limit_mb=None, telemetry=None) -> Path`
+
+Resume the latest `v<N>` build under the lineage workspace, using the same
 execution-time worker-count contract as `run_build`.
 
 ### `show_build(build_path) -> str`

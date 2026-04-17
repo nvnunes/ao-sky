@@ -7,7 +7,7 @@ from astropy.table import Table, vstack
 import astropy.units as u
 import numpy as np
 
-from ..gaia import GaiaHealpixStore, apply_proper_motion, compute_legacy_r_magnitude
+from ..gaia import GaiaHealpixStore, apply_proper_motion, compute_r_magnitude
 from ..gaia._constants import GAIA_SCHEMA_COLUMNS
 from ..spatial import get_parent_pixel, get_pixel_from_skycoord, get_pixel_neighbours, get_subpixels
 from ._exceptions import AsterismError
@@ -180,7 +180,7 @@ def load_asterism_stars(
             stars[name] = values
 
     if "R" not in stars.colnames:
-        stars["R"] = compute_legacy_r_magnitude(stars[list(GAIA_SCHEMA_COLUMNS)])
+        stars["R"] = compute_r_magnitude(stars[list(GAIA_SCHEMA_COLUMNS)])
 
     stars = stars[~np.isnan(stars["ra"]) & ~np.isnan(stars["dec"])]
     if not include_locality:

@@ -65,6 +65,17 @@ class AsterismSearchOptions:
         object.__setattr__(self, "max_single_star_radius_arcsec", max_single_star_radius)
 
 
+@dataclass(slots=True)
+class AsterismSearchProfile:
+    """Low-overhead cardinality telemetry for one asterism search."""
+
+    input_star_count: int = 0
+    close_pair_count: int = 0
+    self_pair_count: int = 0
+    output_asterism_count: int = 0
+    dedupe_key_count: int = 0
+
+
 # Search buffer
 
 class _AsterismBuffer:
@@ -102,9 +113,7 @@ class _AsterismBuffer:
         self.star3_mag: list[np.ndarray] = []
         self.radius_arcsec: list[np.ndarray] = []
         self.area_arcsec2: list[np.ndarray] = []
-        self.relative_area: list[np.ndarray] = []
         self.separation_arcsec: list[np.ndarray] = []
-        self.relative_separation: list[np.ndarray] = []
 
 
 def _increment_buffer(buffer: _AsterismBuffer) -> None:
@@ -123,9 +132,7 @@ def _increment_buffer(buffer: _AsterismBuffer) -> None:
         getattr(buffer, f"{prefix}_mag").append(np.zeros((buffer.max_size), dtype=np.float64))
     buffer.radius_arcsec.append(np.zeros((buffer.max_size), dtype=np.float64))
     buffer.area_arcsec2.append(np.zeros((buffer.max_size), dtype=np.float64))
-    buffer.relative_area.append(np.zeros((buffer.max_size), dtype=np.float64))
     buffer.separation_arcsec.append(np.zeros((buffer.max_size), dtype=np.float64))
-    buffer.relative_separation.append(np.zeros((buffer.max_size), dtype=np.float64))
     buffer.idx = -1
 
 
@@ -300,10 +307,6 @@ def _add_asterism(
     star_data: Table,
     options: AsterismSearchOptions,
 ) -> None:
-    optimal_star_area = (
-        3.0 / 4.0 * np.sqrt(3.0) * np.power(options.max_separation_arcsec / 4.0, 2)
-    )
-
     num_stars = len(star_indexes)
     if num_stars == 0:
         raise IndexError("Minimum of 1 star required")
@@ -417,9 +420,6 @@ def _add_asterism(
         )
         radius = area / ((l1 + l2 + l3) / 2.0)
 
-    relative_separation = separation / options.max_separation_arcsec
-    relative_area = area / optimal_star_area
-
     if buffer.idx == -1 or (buffer.idx + 1) >= buffer.max_size:
         _increment_buffer(buffer)
 
@@ -435,9 +435,7 @@ def _add_asterism(
     _set_star_slot(buffer, "star3", star_data, row_idx, idx3)
     buffer.radius_arcsec[-1][row_idx] = radius
     buffer.area_arcsec2[-1][row_idx] = area
-    buffer.relative_area[-1][row_idx] = relative_area
     buffer.separation_arcsec[-1][row_idx] = separation
-    buffer.relative_separation[-1][row_idx] = relative_separation
 
 
 # Public search
@@ -447,6 +445,7 @@ def find_asterisms(
     options: AsterismSearchOptions,
     *,
     verbose: bool = False,
+    profile: AsterismSearchProfile | None = None,
 ) -> Table:
     """Return all asterisms found in a prepared Gaia star table.
 
@@ -470,12 +469,17 @@ def find_asterisms(
     """
 
     _require_search_columns(stars)
+    if profile is not None:
+        profile.input_star_count = int(len(stars))
     star_catalog = SkyCoord(ra=stars["ra"], dec=stars["dec"], unit=(u.degree, u.degree))
     star_idx1s, star_idx2s, seps, _ = search_around_sky(
         star_catalog,
         star_catalog,
         options.max_separation_arcsec * u.arcsec,
     )
+    if profile is not None:
+        profile.close_pair_count = int(len(star_idx1s))
+        profile.self_pair_count = int(np.count_nonzero(star_idx1s == star_idx2s))
     sorting_indexes = np.argsort(star_idx1s)
     star_idx1s = star_idx1s[sorting_indexes]
     star_idx2s = star_idx2s[sorting_indexes]
@@ -539,6 +543,9 @@ def find_asterisms(
         print(f"{N}/{N}: {time.time() - start_time:.2f}s", flush=True)
 
     _merge_buffer(buffer)
+    if profile is not None:
+        profile.output_asterism_count = int(buffer.N)
+        profile.dedupe_key_count = int(len(added_keys))
     return Table(
         [getattr(buffer, name) for name in ASTERISM_TABLE_COLUMNS],
         names=ASTERISM_TABLE_COLUMNS,

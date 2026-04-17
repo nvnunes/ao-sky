@@ -38,9 +38,10 @@ actionable without depending on planning documents in other repositories.
 `survey_tools` should now be treated as legacy and compatibility
 infrastructure, not as the place for major AO-sky modernization.
 
-This repository is still in its bootstrap stage. The current repo surface is
-mostly the design documents that define the package boundary and migration
-direction.
+This repository now has an implemented package, CLI, native runtime config,
+Gaia summary prerequisite, build lifecycle, artifact layout, and comparison
+tooling. This plan remains the migration sequencing source of truth; it is not
+a claim that `ao-sky` is still design-only.
 
 The reason this repository exists is to create a clean upstream home for the
 reusable AO-sky core without forcing that work to remain shaped by the old
@@ -235,7 +236,7 @@ wrapper code.
   - outer HEALPix level
 - Do not add implicit Gaia-root discovery or repo-root config-file lookup
   inside `ao_sky.gaia`.
-- If a supported `aosky.conf` is added later, treat it as a CLI or
+- If a supported `ao-sky.yaml` is added later, treat it as a CLI or
   application-layer convenience that constructs explicit store configuration
   rather than as hidden package-global behavior.
 - Re-implement and modernize the Gaia store tests first.
@@ -269,9 +270,9 @@ wrapper code.
 - Implement restart-aware planning over unfinished outer pixels.
 - Replace chunk-barrier scheduling with a more flexible scheduler.
 - Add neighbour-oriented traversal and star-count balancing.
-- Keep this phase single-process; defer parallel worker execution to the later
-  cache-aware execution phase.
-- If a supported repo-root `aosky.conf` is added, define it here as a CLI or
+- Keep this phase single-process; defer parallel worker execution and runtime
+  optimization to later phases.
+- If a supported repo-root `ao-sky.yaml` is added, define it here as a CLI or
   application-layer configuration surface rather than as hidden package-global
   behavior inside `ao_sky.gaia`.
 
@@ -289,9 +290,8 @@ wrapper code.
   Persist Outer-Pixel Products.
 - Keep raw candidate asterisms transient and in memory; do not persist the
   full raw candidate set.
-- Keep the temporary live legacy Traversal shell-out behind one shared adapter
-  in `ao_sky.build.legacy_runtime` so the build path and legacy-comparison
-  harness do not drift through duplicated inline legacy scripts.
+- Keep the temporary live legacy Traversal shell-out isolated to comparison
+  tooling so it cannot become part of the canonical build API.
 - Do not persist `Av` in build `asterisms` during this phase.
 - Do not use dust-based asterism filtering during Phase 5 Traversal; compare
   against the legacy path with the asterism dust cut disabled.
@@ -321,31 +321,34 @@ wrapper code.
   `winner_*`, or coverage fields.
 - Keep build `asterisms` dust-free in this phase; export-oriented dust fields
   still belong to the later export phase.
-- Configure the local dust data location through the planned `aosky.conf`
+- Configure the local dust data location through the planned `ao-sky.yaml`
   surface rather than by copying the legacy relative-path behavior.
 - Extend the temporary legacy-comparison harness to validate the new local
   `gaia_A0` path against the live legacy coarse-sampling behavior.
 
-### Phase 7: Add Survey-Scale Derived Products
+### Phase 7: Add All-Sky Derived Products
 
 - Rebuild the Aggregation part of the Build on top of the new model.
-- Rebuild the Augmentation part of the Build, including survey-extent overlays
-  and other richer survey-scale derived products.
 - Extend the temporary legacy-comparison harness as needed to validate these
-  survey-scale outputs where useful during migration.
+  all-sky aggregation outputs where useful during migration.
 
-### Phase 8: Replace The Temporary Legacy Shell-Out
+### Phase 8: Add All-Sky Augmentation
+
+- Rebuild the Augmentation part of the Build, including survey-extent overlays
+  and other richer all-sky derived products.
+
+### Phase 9: Replace The Temporary Legacy Shell-Out
 
 - Replace the temporary live legacy Traversal shell-out used for richer
   per-outer-pixel products with native `ao-sky` implementation.
-- Move the remaining AO/winner prediction and selection path out of
-  `ao_sky.build.legacy_runtime` and into the canonical package surface.
+- Move the remaining AO/winner prediction and selection path into the canonical
+  package surface, leaving live legacy shell-outs in comparison tooling only.
 - Keep the Phase 5/6 product contracts stable while removing the live
   dependency on legacy `survey_tools` execution during builds.
 - Continue using the temporary live legacy-comparison harness to validate the
   native path while this replacement is in progress.
 
-### Phase 9: Audit `survey_tools` `aomap` For Missing Implementation
+### Phase 10: Audit `survey_tools` `aomap` For Missing Implementation
 
 - Perform a focused audit of the live `survey_tools` `aomap` implementation
   against the then-current `ao-sky` build surface.
@@ -356,33 +359,142 @@ wrapper code.
 - Use the audit to confirm that the preceding build-product phases are
   sufficient before cache work and compatibility adoption proceed.
 
-### Phase 10: Add Gaia Pre-Download And Summary Support
+### Phase 11: Add Gaia Pre-Download And Summary Support
 
-- Add a CLI command that can pre-download or materialize the canonical Gaia
-  store for a full configured outer-pixel range rather than relying only on
-  one-off on-demand reads.
-- Build and persist a Gaia summary artifact that includes per-outer-pixel star
-  counts suitable for execution planning.
-- Use that summary to add the star-count scheduling proxy for the execution
-  engine when full Gaia materialization has been prepared ahead of a build.
-- Keep one-off builds viable when the full Gaia store has not been
-  pre-downloaded.
+- Add a CLI command that can pre-download the canonical Gaia store for one
+  explicit Gaia release and outer level.
+- Build and persist a dense shared Gaia summary artifact with one row per outer
+  pixel and fields `outer_pix`, `star_count`, and `loaded`.
+- Require the matching shared Gaia summary during `init`; build creation should
+  fail clearly when the summary is missing and direct the user to
+  `fetch-gaia`.
+- Use summary `star_count` as the scheduling proxy for Traversal.
+- Keep `fetch-gaia` resumable by default by skipping already loaded files,
+  checking file presence, and refreshing summary progress from the on-disk
+  store state without bulk deletion.
 
-### Phase 11: Add Cache-Aware Execution Support
+### Phase 12: Add Parallel Execution Support
 
-- Add parallel worker execution on top of the non-cache single-process
-  execution engine from Phase 4.
-- Add a pre-warming local-cache scheme that can stage Gaia and inner files into
-  local storage in parallel with ongoing processing.
-- Define the cache lifecycle, ownership, and cleanup behavior relative to the
-  persisted build model.
-- Benchmark against the recorded baseline in `docs/benchmarking.md` and refresh
-  it under the current storage setup before treating the added complexity as
-  justified.
-- Benchmark the cache-aware execution path against the non-cache execution
-  engine before treating the added complexity as justified.
+- Add parallel worker execution on top of the current single-process execution
+  engine.
+- Keep this phase focused on the worker model, worker ownership, and the
+  interaction between parallel execution and the persisted build state.
+- Refresh the relevant execution benchmarks under the current storage setup so
+  the parallel worker design is grounded in current measurements rather than
+  only the historical baseline in `docs/benchmarking.md`.
+- Benchmark the parallel execution path against the non-cache single-process
+  execution engine before adding cache complexity.
 
-### Phase 12: Improve The Winning-Asterism Algorithm
+### Phase 13: Major Traversal Optimization Pass
+
+Status: complete. Phase 13 is the known-good legacy-preserving state before
+Phase 14 intentionally changes the winner/overlap algorithm.
+
+- Treated this as an end-to-end Traversal optimization pass across scheduling,
+  runtime caching, memory safety, artifact IO, compression, telemetry,
+  build-local snapshots, and legacy validation.
+- Implemented regional Traversal execution that groups outer pixels by a
+  coarse HEALPix region level derived from `outer_level` and `workers`, then
+  assigns balanced region sets to long-lived workers.
+- Reused the long-lived Traversal worker runtime for the default single-worker
+  path, running in process without spawn overhead so runtime setup, model
+  caches, and Gaia table caches are reused by default.
+- Kept Traversal outer-pixel independent by deriving rich inner performance and
+  retained local asterisms from the current pixel's two-ring expanded
+  Gaia-star footprint, not from neighbouring pixels' derived asterism
+  artifacts.
+- Kept the two-ring boundary as an internal fixed rule, not a runtime knob. One
+  ring was insufficient for self-contained best-map fidelity, and two is the
+  minimal integer-ring margin adopted for this phase. Because expansion happens
+  before build-epoch proper-motion shifting, the extra ring also acts as a
+  pragmatic buffer for high-proper-motion stars that originate just outside the
+  raw outer-pixel boundary but can move into the relevant edge footprint.
+- Implemented a worker-local in-memory LRU cache for runtime Gaia tables,
+  controlled by both an entry target and a per-worker memory cap. Canonical
+  Gaia files remain raw, but cached runtime rows are shifted to the build
+  epoch, enriched with `R` and `hpx14`, and marked read-only so Traversal does
+  not repeatedly apply proper motion or recompute fine HEALPix projections.
+  Native build Traversal treats this as its row contract for inner counts,
+  asterism search, and prediction.
+- Hardened the runtime Gaia cache by fixing oversized-entry behavior,
+  preserving force-reload semantics, adding basic thread safety, and making
+  read-only prepared tables the normal cached representation.
+- Used the shared Gaia summary as a cheap coarse stellar-density prefilter for
+  Traversal asterism generation. If an outer pixel's average summary density is
+  already above the configured NGS density cutoff, Traversal skips the
+  expensive asterism path for that outer pixel while still building base inner
+  counts from runtime Gaia rows. Finer density indexes are deferred to Phase
+  15.
+- Kept the parent process as the only owner of `build.h5` state while workers
+  stream state messages back to the parent. Parent state writes are buffered
+  and flushed periodically with retry/backoff rather than opening and writing
+  `build.h5` for every row update.
+- Kept successful build-log output periodic and failure logs per-pixel, avoiding
+  high-volume per-pixel success log I/O.
+- Exposed worker count, Gaia cache, per-worker memory guard, parent aggregate
+  memory guard, and telemetry settings as runtime CLI options with optional
+  `ao-sky.yaml` defaults, without persisting them into build metadata. The
+  regional assignment level is derived internally from `outer_level` and
+  `workers` rather than exposed as a config knob.
+- Set the current local operating defaults to `workers=6`,
+  `worker_memory_limit_mb=2048`, `parent_memory_limit_mb=12288`, Gaia data on
+  the SSD mirror, worker-local cache enabled, and direct HDD artifact writes.
+- Persisted a build-local native `build.yaml` at `init`. Legacy YAML conversion,
+  when needed for comparison work, now happens outside the build API and passes
+  the resulting native runtime config into `init`.
+- Moved build-local model and survey snapshots into `init`: configured model
+  files are copied into `<build>/models`, configured survey MOC files are copied
+  into `<build>/surveys`, and the build metadata points at those build-local
+  snapshots.
+- Moved Gaia TGE dust into the Gaia root as part of `fetch-gaia`, then created a
+  build-local dense `A0` cache under `<build>/dust` at every `init` so workers
+  use a small mmap-friendly build artifact instead of repeatedly reading the
+  source CSV.
+- Switched derived build artifacts to Blosc Zstd by default. Benchmarks showed
+  it preserved near-maximum compression while reducing artifact-write time from
+  the old `gzip=9` path to a negligible part of Traversal.
+- Added `basic` and `detailed` Traversal telemetry. Basic telemetry remains
+  low-overhead operational profiling in `build.log`; detailed telemetry writes
+  per-pixel RSS checkpoints and intermediate cardinalities for benchmark and
+  memory investigations.
+- Benchmarked worker scaling, memory guards, Gaia HDD versus SSD reads, cache
+  on/off behavior, compression codecs, artifact staging, read prewarm, and
+  write-behind. The retained path is regional workers plus worker-local
+  prepared-table caching, SSD Gaia reads, Blosc Zstd artifacts, and direct
+  worker-owned artifact writes.
+- Confirmed the known-good legacy-preserving state with the 12-pixel live
+  legacy comparison using `workers=3`. Retained asterism membership matched
+  exactly except for accepted two-ring boundary-footprint divergences, and
+  dense inner row domains and ordering matched for all sampled pixels.
+
+Measured optimization decisions retained from Phase 13:
+
+- Read prewarm stays out of the active implementation. The tested design used
+  one worker-local IO thread per worker, a bounded queue, and the existing
+  prepared Gaia table cache. Fixed-pixel HDD/SSD comparisons showed the benefit
+  came primarily from regional traversal plus prepared-table cache reuse, not
+  speculative prewarm. Revisit only if future profiling shows workers blocked
+  on cold reads that the cache cannot amortize.
+- Write-behind stays out of the active implementation. The tested design kept
+  artifact writes worker-owned, bounded pending write bytes, applied
+  backpressure, and reported pixels complete only after `outer.h5` writes
+  succeeded. The measured benefit did not justify the async completion path,
+  failure surface, memory accounting, and profiling complexity.
+- Artifact staging stays out of the active implementation. The tested design
+  wrote flat `<outer_pix>.h5` files to an SSD staging folder and had the parent
+  promote them into canonical HEALPix paths before marking pixels done. After
+  switching derived artifacts to Blosc Zstd, staging showed no wall-time
+  benefit, so direct worker-owned writes remain the normal path.
+- Build-log batching stays low priority because successful progress logging is
+  already periodic; revisit only if measurement shows it contributes meaningful
+  overhead.
+- Higher-density memory pressure remains a Phase 15 problem. The Phase 13
+  optimization pass added coarse summary-based skipping and memory guards, but
+  the next algorithmic memory reductions should focus on bounded asterism
+  search, bounded inner/asterism context construction, and finer density
+  indexes.
+
+### Phase 14: Improve The Winning-Asterism Algorithm
 
 - Revisit the interim winning-asterism selection path after the preceding
   build-product and audit phases have exposed the remaining weaknesses.
@@ -397,9 +509,18 @@ wrapper code.
 - Improve the winner-selection algorithm itself rather than just reproducing
   the current legacy behavior.
 - Validate the improved winner path against the richer per-outer-pixel and
-  survey-scale products before compatibility adoption proceeds.
+  all-sky products before compatibility adoption proceeds.
 
-### Phase 13: Rebuild The Asterism Catalog Export Path
+### Phase 15: Explore Ways to Handle Higher Stellar Density
+
+- Currently the asterism code explodes when there are too many stars in an outer pixel
+- Explore ways to improve the algorithm so higher density fields can still be used
+- Revisit the coarse Gaia-summary density prefilter from the Phase 13
+  optimization pass and consider a finer persisted Gaia density index, such as
+  per-file FOV-level counts, so Traversal can avoid loading or preparing rows
+  from rejected high-density subcells rather than skipping whole outer pixels.
+
+### Phase 16: Rebuild The Asterism Catalog Export Path
 
 - Rebuild the asterism catalog export workflow on top of the richer `ao-sky`
   build products rather than the legacy `aomap` export path.
@@ -410,12 +531,7 @@ wrapper code.
 - Validate exported catalogs against the intended downstream use cases before
   compatibility adoption proceeds.
 
-### Phase 14: Explore Ways to Handle Higher Stellar Density
-
-- Currently the asterism code explodes when there are too many stars in an outer pixel
-- Explore ways to improve the algorithm so higher density fields can still be used
-
-### Phase 15: Define The WFS Photometric Proxy Layer
+### Phase 17: Define The WFS Photometric Proxy Layer
 
 - Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
   AO-system-specific photometric products.
@@ -430,7 +546,32 @@ wrapper code.
 - Define uncertainty handling and the downstream contract for asterism-building
   and AO-simulation consumers.
 
-### Phase 16: Compatibility Adoption In `survey_tools` And `girmos-aosims`
+### Phase 18: Add Build Provenance, Introspection, And Validation Support
+
+- Add a build-root provenance manifest that summarizes existing authoritative
+  metadata rather than replacing `build.h5`, `build.yaml`, Gaia
+  summaries, model manifests, map artifacts, or overlay datasets as sources of
+  truth.
+- Include enough manifest detail to audit and compare builds:
+  runtime-config path and content hash, merged build-config content hash, package
+  version or code identity, Gaia release and level, Gaia summary path, dust
+  dataset identity, model snapshot manifest, map levels, survey overlays, and
+  implemented build phase completion.
+- Add build introspection commands or APIs that can list available builds,
+  inspect one build's provenance and artifact completeness, and compare two
+  builds for meaningful policy, model, input, and artifact differences.
+- Keep introspection read-only and contract-focused; do not add implicit
+  migration, repair, or rebuild behavior to these commands.
+- Define a lightweight science-validation workspace and toolkit for comparing
+  important build outputs before compatibility adoption.
+- Standardize representative sample pixels, low-density smoke samples, map
+  comparison summaries, and human-inspection outputs so algorithm-changing
+  phases can be reviewed consistently.
+- Use this phase to make post-legacy comparisons reproducible after the
+  winner-algorithm and photometric-proxy phases intentionally move beyond exact
+  legacy parity.
+
+### Phase 19: Compatibility Adoption In `survey_tools` And `girmos-aosims`
 
 - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
 - Add the downstream adoption work needed for `girmos-aosims` to consume the
@@ -441,7 +582,7 @@ wrapper code.
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
 
-### Phase 17: Deduplication And Final Handoff
+### Phase 20: Deduplication And Final Handoff
 
 - Remove the superseded legacy implementation from `survey_tools`.
 - Retain only the compatibility surface that is still worth carrying.

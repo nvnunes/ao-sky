@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, Future, wait
 from collections.abc import Iterator
+import csv
+from dataclasses import dataclass
+import gc
 import multiprocessing
 from pathlib import Path
 from queue import Empty
+import resource
+import subprocess
+import sys
+import time
 
-from joblib.externals.loky import ProcessPoolExecutor
 import numpy as np
+from astropy.table import Table
 
+from ..dust import prepare_gaia_tge_a0_cache
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore
-from ..predict import configure_inference_threads, warm_model_cache
+from ..predict import PredictRuntime, configure_inference_threads, warm_model_cache
 from .augmentation import build_survey_extent_layers
 from .aggregation import build_maps
 from ._constants import (
@@ -29,7 +36,11 @@ from ._constants import (
     WORK_STATUS_RUNNING,
 )
 from ._exceptions import BuildError
-from .artifacts import write_outer_artifact
+from .artifacts import (
+    ArtifactMemoryProfile,
+    ArtifactWriteProfile,
+    write_outer_artifact_profiled,
+)
 from .config import (
     load_build_definition,
     resolve_build_root_only,
@@ -44,70 +55,128 @@ from .control import (
     load_build_definition as load_persisted_build_definition,
     load_build_roots,
     load_current_phase,
-    load_legacy_config_path,
+    load_runtime_config_path,
     load_state,
     outer_artifact_filename,
     phase_state_fields,
     set_current_phase,
+    set_dust_root,
     set_build_status,
     summarize_build,
     update_state_row,
+    write_state_rows,
 )
-from .legacy_config import load_native_runtime
+from .runtime_config import load_runtime_config, write_runtime_config
+from .model_snapshot import fetch_model_data
+from .survey_snapshot import fetch_survey_data
 from ._models import (
+    BuildDefinition,
     TraversalCacheStats,
     TraversalExecutionConfig,
+    TraversalMemorySample,
+    TraversalStageStats,
+    TraversalStructureStats,
     TraversalTaskContext,
     TraversalTaskResult,
     TraversalWorkerMessage,
+    TraversalWorkerMemorySample,
     TraversalWorkerPlan,
+    TraversalWorkerStats,
 )
 from .regional import build_regional_worker_plans
 from .runtime_gaia import RuntimeGaiaHealpixStore
-from .scheduler import OuterPixelScheduler
-from .traversal import TraversalGeometry, build_traversal_products
+from .traversal import (
+    TraversalGeometry,
+    TraversalMemoryProfile,
+    TraversalStageProfile,
+    TraversalStructureProfile,
+    build_traversal_products,
+    coarse_density_skip_outer_pixs,
+)
 
 TRAVERSAL_PROGRESS_LOG_INTERVAL = 100
 TRUNCATED_ERROR_SUFFIX = "... [truncated]"
+STATE_UPDATE_RETRY_ATTEMPTS = 20
+STATE_UPDATE_RETRY_DELAY_SECONDS = 0.05
+STATE_UPDATE_FLUSH_INTERVAL = 100
+PARENT_MEMORY_CHECK_INTERVAL_SECONDS = 1.0
 
 
 def init_build(
     *,
-    definition_filename: Path,
+    config_filename: Path,
     gaia_root: Path | None,
     build_root: Path | None,
-    dust_root: Path | None,
-    legacy_config_path: Path,
     model_root: Path | None = None,
-    aosky_conf: Path | None = None,
+    survey_root: Path | None = None,
+    aosky_yaml: Path | None = None,
 ) -> Path:
     """Create a new build root and seed its initial metadata/state."""
 
-    definition, definition_yaml = load_build_definition(definition_filename)
+    definition, definition_yaml = load_build_definition(config_filename)
     roots = resolve_build_roots(
         gaia_root=gaia_root,
         build_root=build_root,
-        dust_root=dust_root,
         model_root=model_root,
-        default_model_root=Path(legacy_config_path).resolve().parents[1] / "data" / "models",
-        aosky_conf=aosky_conf,
+        aosky_yaml=aosky_yaml,
     )
     _require_gaia_summary(
         gaia_root=roots.gaia_root,
         gaia_release=definition.gaia_release,
         outer_level=definition.outer_level,
     )
-    load_native_runtime(
-        definition,
-        legacy_config_path=legacy_config_path,
+    runtime = load_runtime_config(
+        config_filename,
         model_root=roots.model_root,
     )
-    return create_build_root(
+    _validate_runtime_matches_build_definition(definition, runtime)
+    build_path = create_build_root(
         definition=definition,
         definition_yaml=definition_yaml,
         roots=roots,
-        legacy_config_path=legacy_config_path,
+        runtime_config_source_path=config_filename,
     )
+    write_runtime_config(build_path, runtime)
+    try:
+        build_dust_root = build_path / "dust"
+        prepare_gaia_tge_a0_cache(
+            source_dust_root=roots.dust_root,
+            destination_dust_root=build_dust_root,
+            level=definition.max_data_level,
+        )
+        set_dust_root(build_path, build_dust_root)
+        fetch_model_data(
+            build_path,
+            model_root=roots.model_root,
+            aosky_yaml=aosky_yaml,
+        )
+        if definition.survey_extent_overlays:
+            fetch_survey_data(
+                build_path,
+                survey_root=survey_root,
+                aosky_yaml=aosky_yaml,
+            )
+    except Exception as exc:
+        set_build_status(build_path, BUILD_STATUS_FAILED)
+        append_build_log(build_path, f"init snapshot failed: {exc}")
+        raise
+    return build_path
+
+
+def _validate_runtime_matches_build_definition(
+    definition: BuildDefinition,
+    runtime: PredictRuntime,
+) -> None:
+    if int(runtime.outer_level) != int(definition.outer_level):
+        raise BuildError(
+            "Runtime config traversal.outer_level must match build definition "
+            f"outer_level ({runtime.outer_level} != {definition.outer_level})"
+        )
+    if int(runtime.inner_level) != int(definition.inner_level):
+        raise BuildError(
+            "Runtime config traversal.inner_level must match build definition "
+            f"inner_level ({runtime.inner_level} != {definition.inner_level})"
+        )
 
 
 def _load_gaia_star_counts(
@@ -169,7 +238,577 @@ def _load_traversal_task_context(build_path: Path) -> TraversalTaskContext:
         build_path=build_path,
         definition=load_persisted_build_definition(build_path),
         roots=load_build_roots(build_path),
-        legacy_config_path=load_legacy_config_path(build_path),
+        runtime_config_path=load_runtime_config_path(build_path),
+    )
+
+
+@dataclass(slots=True)
+class _StateUpdateTelemetry:
+    """Low-volume counters for parent-owned build-state updates."""
+
+    updates: int = 0
+    flushes: int = 0
+    rows_written: int = 0
+    total_seconds: float = 0.0
+    max_seconds: float = 0.0
+    lock_retries: int = 0
+    lock_wait_seconds: float = 0.0
+    dirty_rows_peak: int = 0
+
+
+@dataclass(slots=True)
+class _ArtifactWriteTelemetry:
+    """Accumulated worker-owned outer-artifact write timings."""
+
+    total_seconds: float = 0.0
+    convert_inner_seconds: float = 0.0
+    convert_asterisms_seconds: float = 0.0
+    hdf5_open_seconds: float = 0.0
+    hdf5_inner_seconds: float = 0.0
+    hdf5_asterisms_seconds: float = 0.0
+    hdf5_close_seconds: float = 0.0
+    replace_seconds: float = 0.0
+    output_bytes: int = 0
+    inner_input_bytes: int = 0
+    asterism_input_bytes: int = 0
+    inner_structured_bytes: int = 0
+    asterism_structured_bytes: int = 0
+    inner_rows: int = 0
+    asterism_rows: int = 0
+
+    def add(self, profile: ArtifactWriteProfile) -> None:
+        self.total_seconds += profile.total_seconds
+        self.convert_inner_seconds += profile.convert_inner_seconds
+        self.convert_asterisms_seconds += profile.convert_asterisms_seconds
+        self.hdf5_open_seconds += profile.hdf5_open_seconds
+        self.hdf5_inner_seconds += profile.hdf5_inner_seconds
+        self.hdf5_asterisms_seconds += profile.hdf5_asterisms_seconds
+        self.hdf5_close_seconds += profile.hdf5_close_seconds
+        self.replace_seconds += profile.replace_seconds
+        self.output_bytes += int(profile.output_bytes)
+        self.inner_input_bytes += int(profile.inner_input_bytes)
+        self.asterism_input_bytes += int(profile.asterism_input_bytes)
+        self.inner_structured_bytes += int(profile.inner_structured_bytes)
+        self.asterism_structured_bytes += int(profile.asterism_structured_bytes)
+        self.inner_rows += int(profile.inner_rows)
+        self.asterism_rows += int(profile.asterism_rows)
+
+
+@dataclass(slots=True)
+class _TraversalStageTelemetry:
+    """Accumulated worker-owned Traversal pipeline timings."""
+
+    star_selection_seconds: float = 0.0
+    candidate_generation_seconds: float = 0.0
+    filtering_seconds: float = 0.0
+    bright_star_filter_seconds: float = 0.0
+    overlap_quality_seconds: float = 0.0
+    overlap_geometry_seconds: float = 0.0
+    inner_assignment_seconds: float = 0.0
+    local_selection_seconds: float = 0.0
+    inner_table_seconds: float = 0.0
+    context_seconds: float = 0.0
+    point_prediction_seconds: float = 0.0
+    field_mean_prediction_seconds: float = 0.0
+    coverage_seconds: float = 0.0
+    dust_seconds: float = 0.0
+    persisted_asterisms_seconds: float = 0.0
+
+    def add(self, stats: TraversalStageStats) -> None:
+        self.star_selection_seconds += stats.star_selection_seconds
+        self.candidate_generation_seconds += stats.candidate_generation_seconds
+        self.filtering_seconds += stats.filtering_seconds
+        self.bright_star_filter_seconds += stats.bright_star_filter_seconds
+        self.overlap_quality_seconds += stats.overlap_quality_seconds
+        self.overlap_geometry_seconds += stats.overlap_geometry_seconds
+        self.inner_assignment_seconds += stats.inner_assignment_seconds
+        self.local_selection_seconds += stats.local_selection_seconds
+        self.inner_table_seconds += stats.inner_table_seconds
+        self.context_seconds += stats.context_seconds
+        self.point_prediction_seconds += stats.point_prediction_seconds
+        self.field_mean_prediction_seconds += stats.field_mean_prediction_seconds
+        self.coverage_seconds += stats.coverage_seconds
+        self.dust_seconds += stats.dust_seconds
+        self.persisted_asterisms_seconds += stats.persisted_asterisms_seconds
+
+    def to_stats(self) -> TraversalStageStats:
+        return TraversalStageStats(
+            star_selection_seconds=self.star_selection_seconds,
+            candidate_generation_seconds=self.candidate_generation_seconds,
+            filtering_seconds=self.filtering_seconds,
+            bright_star_filter_seconds=self.bright_star_filter_seconds,
+            overlap_quality_seconds=self.overlap_quality_seconds,
+            overlap_geometry_seconds=self.overlap_geometry_seconds,
+            inner_assignment_seconds=self.inner_assignment_seconds,
+            local_selection_seconds=self.local_selection_seconds,
+            inner_table_seconds=self.inner_table_seconds,
+            context_seconds=self.context_seconds,
+            point_prediction_seconds=self.point_prediction_seconds,
+            field_mean_prediction_seconds=self.field_mean_prediction_seconds,
+            coverage_seconds=self.coverage_seconds,
+            dust_seconds=self.dust_seconds,
+            persisted_asterisms_seconds=self.persisted_asterisms_seconds,
+        )
+
+
+@dataclass(slots=True)
+class _TraversalStructureTelemetry:
+    """Accumulated worker-owned Traversal intermediate cardinality counters."""
+
+    search_star_rows: int = 0
+    ngs_rows: int = 0
+    close_pair_rows: int = 0
+    self_pair_rows: int = 0
+    raw_asterism_rows: int = 0
+    dedupe_key_rows: int = 0
+    post_bright_asterism_rows: int = 0
+    post_overlap_asterism_rows: int = 0
+    local_asterism_rows: int = 0
+    context_pair_rows: int = 0
+    winner_rows: int = 0
+    winner_payload_rows: int = 0
+    search_star_rows_peak: int = 0
+    ngs_rows_peak: int = 0
+    close_pair_rows_peak: int = 0
+    context_pair_rows_peak: int = 0
+    raw_asterism_rows_peak: int = 0
+    local_asterism_rows_peak: int = 0
+    winner_payload_rows_peak: int = 0
+
+    def add(self, stats: TraversalStructureStats) -> None:
+        self.search_star_rows += int(stats.search_star_rows)
+        self.ngs_rows += int(stats.ngs_rows)
+        self.close_pair_rows += int(stats.close_pair_rows)
+        self.self_pair_rows += int(stats.self_pair_rows)
+        self.raw_asterism_rows += int(stats.raw_asterism_rows)
+        self.dedupe_key_rows += int(stats.dedupe_key_rows)
+        self.post_bright_asterism_rows += int(stats.post_bright_asterism_rows)
+        self.post_overlap_asterism_rows += int(stats.post_overlap_asterism_rows)
+        self.local_asterism_rows += int(stats.local_asterism_rows)
+        self.context_pair_rows += int(stats.context_pair_rows)
+        self.winner_rows += int(stats.winner_rows)
+        self.winner_payload_rows += int(stats.winner_payload_rows)
+        self.search_star_rows_peak = max(
+            self.search_star_rows_peak,
+            int(stats.search_star_rows_peak),
+        )
+        self.ngs_rows_peak = max(self.ngs_rows_peak, int(stats.ngs_rows_peak))
+        self.close_pair_rows_peak = max(
+            self.close_pair_rows_peak,
+            int(stats.close_pair_rows_peak),
+        )
+        self.context_pair_rows_peak = max(
+            self.context_pair_rows_peak,
+            int(stats.context_pair_rows_peak),
+        )
+        self.raw_asterism_rows_peak = max(
+            self.raw_asterism_rows_peak,
+            int(stats.raw_asterism_rows_peak),
+        )
+        self.local_asterism_rows_peak = max(
+            self.local_asterism_rows_peak,
+            int(stats.local_asterism_rows_peak),
+        )
+        self.winner_payload_rows_peak = max(
+            self.winner_payload_rows_peak,
+            int(stats.winner_payload_rows_peak),
+        )
+
+    def to_stats(self) -> TraversalStructureStats:
+        return TraversalStructureStats(
+            search_star_rows=self.search_star_rows,
+            ngs_rows=self.ngs_rows,
+            close_pair_rows=self.close_pair_rows,
+            self_pair_rows=self.self_pair_rows,
+            raw_asterism_rows=self.raw_asterism_rows,
+            dedupe_key_rows=self.dedupe_key_rows,
+            post_bright_asterism_rows=self.post_bright_asterism_rows,
+            post_overlap_asterism_rows=self.post_overlap_asterism_rows,
+            local_asterism_rows=self.local_asterism_rows,
+            context_pair_rows=self.context_pair_rows,
+            winner_rows=self.winner_rows,
+            winner_payload_rows=self.winner_payload_rows,
+            search_star_rows_peak=self.search_star_rows_peak,
+            ngs_rows_peak=self.ngs_rows_peak,
+            close_pair_rows_peak=self.close_pair_rows_peak,
+            context_pair_rows_peak=self.context_pair_rows_peak,
+            raw_asterism_rows_peak=self.raw_asterism_rows_peak,
+            local_asterism_rows_peak=self.local_asterism_rows_peak,
+            winner_payload_rows_peak=self.winner_payload_rows_peak,
+        )
+
+
+class _TraversalDiagnosticsWriter:
+    """Parent-owned CSV writer for opt-in per-pixel Traversal diagnostics."""
+
+    FIELDNAMES = (
+        "outer_pix",
+        "worker_id",
+        "success",
+        "pixel_seconds",
+        "artifact_write_seconds",
+        "artifact_rss_before_convert_inner_mb",
+        "artifact_peak_before_convert_inner_mb",
+        "artifact_rss_after_convert_inner_mb",
+        "artifact_peak_after_convert_inner_mb",
+        "artifact_rss_after_convert_asterisms_mb",
+        "artifact_peak_after_convert_asterisms_mb",
+        "artifact_rss_after_hdf5_open_mb",
+        "artifact_peak_after_hdf5_open_mb",
+        "artifact_rss_after_hdf5_inner_mb",
+        "artifact_peak_after_hdf5_inner_mb",
+        "artifact_rss_after_hdf5_asterisms_mb",
+        "artifact_peak_after_hdf5_asterisms_mb",
+        "artifact_rss_after_hdf5_close_mb",
+        "artifact_peak_after_hdf5_close_mb",
+        "artifact_rss_after_replace_mb",
+        "artifact_peak_after_replace_mb",
+        "rss_start_mb",
+        "peak_rss_start_mb",
+        "rss_after_star_selection_mb",
+        "peak_rss_after_star_selection_mb",
+        "rss_after_find_asterisms_mb",
+        "peak_rss_after_find_asterisms_mb",
+        "rss_after_filtering_mb",
+        "peak_rss_after_filtering_mb",
+        "rss_after_context_mb",
+        "peak_rss_after_context_mb",
+        "rss_after_point_prediction_mb",
+        "peak_rss_after_point_prediction_mb",
+        "rss_after_field_mean_mb",
+        "peak_rss_after_field_mean_mb",
+        "rss_after_coverage_mb",
+        "peak_rss_after_coverage_mb",
+        "rss_after_dust_mb",
+        "peak_rss_after_dust_mb",
+        "rss_after_persisted_asterisms_mb",
+        "peak_rss_after_persisted_asterisms_mb",
+        "rss_after_artifact_write_mb",
+        "peak_rss_after_artifact_write_mb",
+        "rss_after_gc_mb",
+        "peak_rss_after_gc_mb",
+        "search_star_rows",
+        "ngs_rows",
+        "close_pair_rows",
+        "raw_asterism_rows",
+        "post_overlap_asterism_rows",
+        "local_asterism_rows",
+        "context_pair_rows",
+        "winner_payload_rows",
+        "artifact_inner_structured_mib",
+        "artifact_asterism_structured_mib",
+        "error_message",
+    )
+    WORKER_FIELDNAMES = (
+        "worker_id",
+        "event",
+        "elapsed_seconds",
+        "rss_mb",
+        "peak_rss_mb",
+    )
+
+    def __init__(self, build_path: Path) -> None:
+        diagnostics_dir = build_path / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        self.filename = diagnostics_dir / "traversal-memory.csv"
+        self._handle = self.filename.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._handle, fieldnames=self.FIELDNAMES)
+        self._writer.writeheader()
+        self.worker_filename = diagnostics_dir / "traversal-worker-memory.csv"
+        self._worker_handle = self.worker_filename.open("w", newline="", encoding="utf-8")
+        self._worker_writer = csv.DictWriter(
+            self._worker_handle,
+            fieldnames=self.WORKER_FIELDNAMES,
+        )
+        self._worker_writer.writeheader()
+
+    def write(self, sample: TraversalMemorySample) -> None:
+        self._writer.writerow(
+            {
+                "outer_pix": sample.outer_pix,
+                "worker_id": sample.worker_id,
+                "success": int(sample.success),
+                "pixel_seconds": f"{sample.pixel_seconds:.6f}",
+                "artifact_write_seconds": f"{sample.artifact_write_seconds:.6f}",
+                "artifact_rss_before_convert_inner_mb": (
+                    f"{sample.artifact_rss_before_convert_inner_mb:.3f}"
+                ),
+                "artifact_peak_before_convert_inner_mb": (
+                    f"{sample.artifact_peak_before_convert_inner_mb:.3f}"
+                ),
+                "artifact_rss_after_convert_inner_mb": (
+                    f"{sample.artifact_rss_after_convert_inner_mb:.3f}"
+                ),
+                "artifact_peak_after_convert_inner_mb": (
+                    f"{sample.artifact_peak_after_convert_inner_mb:.3f}"
+                ),
+                "artifact_rss_after_convert_asterisms_mb": (
+                    f"{sample.artifact_rss_after_convert_asterisms_mb:.3f}"
+                ),
+                "artifact_peak_after_convert_asterisms_mb": (
+                    f"{sample.artifact_peak_after_convert_asterisms_mb:.3f}"
+                ),
+                "artifact_rss_after_hdf5_open_mb": (
+                    f"{sample.artifact_rss_after_hdf5_open_mb:.3f}"
+                ),
+                "artifact_peak_after_hdf5_open_mb": (
+                    f"{sample.artifact_peak_after_hdf5_open_mb:.3f}"
+                ),
+                "artifact_rss_after_hdf5_inner_mb": (
+                    f"{sample.artifact_rss_after_hdf5_inner_mb:.3f}"
+                ),
+                "artifact_peak_after_hdf5_inner_mb": (
+                    f"{sample.artifact_peak_after_hdf5_inner_mb:.3f}"
+                ),
+                "artifact_rss_after_hdf5_asterisms_mb": (
+                    f"{sample.artifact_rss_after_hdf5_asterisms_mb:.3f}"
+                ),
+                "artifact_peak_after_hdf5_asterisms_mb": (
+                    f"{sample.artifact_peak_after_hdf5_asterisms_mb:.3f}"
+                ),
+                "artifact_rss_after_hdf5_close_mb": (
+                    f"{sample.artifact_rss_after_hdf5_close_mb:.3f}"
+                ),
+                "artifact_peak_after_hdf5_close_mb": (
+                    f"{sample.artifact_peak_after_hdf5_close_mb:.3f}"
+                ),
+                "artifact_rss_after_replace_mb": (
+                    f"{sample.artifact_rss_after_replace_mb:.3f}"
+                ),
+                "artifact_peak_after_replace_mb": (
+                    f"{sample.artifact_peak_after_replace_mb:.3f}"
+                ),
+                "rss_start_mb": f"{sample.rss_start_mb:.3f}",
+                "peak_rss_start_mb": f"{sample.peak_rss_start_mb:.3f}",
+                "rss_after_star_selection_mb": f"{sample.rss_after_star_selection_mb:.3f}",
+                "peak_rss_after_star_selection_mb": (
+                    f"{sample.peak_rss_after_star_selection_mb:.3f}"
+                ),
+                "rss_after_find_asterisms_mb": f"{sample.rss_after_find_asterisms_mb:.3f}",
+                "peak_rss_after_find_asterisms_mb": (
+                    f"{sample.peak_rss_after_find_asterisms_mb:.3f}"
+                ),
+                "rss_after_filtering_mb": f"{sample.rss_after_filtering_mb:.3f}",
+                "peak_rss_after_filtering_mb": f"{sample.peak_rss_after_filtering_mb:.3f}",
+                "rss_after_context_mb": f"{sample.rss_after_context_mb:.3f}",
+                "peak_rss_after_context_mb": f"{sample.peak_rss_after_context_mb:.3f}",
+                "rss_after_point_prediction_mb": f"{sample.rss_after_point_prediction_mb:.3f}",
+                "peak_rss_after_point_prediction_mb": (
+                    f"{sample.peak_rss_after_point_prediction_mb:.3f}"
+                ),
+                "rss_after_field_mean_mb": f"{sample.rss_after_field_mean_mb:.3f}",
+                "peak_rss_after_field_mean_mb": (
+                    f"{sample.peak_rss_after_field_mean_mb:.3f}"
+                ),
+                "rss_after_coverage_mb": f"{sample.rss_after_coverage_mb:.3f}",
+                "peak_rss_after_coverage_mb": f"{sample.peak_rss_after_coverage_mb:.3f}",
+                "rss_after_dust_mb": f"{sample.rss_after_dust_mb:.3f}",
+                "peak_rss_after_dust_mb": f"{sample.peak_rss_after_dust_mb:.3f}",
+                "rss_after_persisted_asterisms_mb": (
+                    f"{sample.rss_after_persisted_asterisms_mb:.3f}"
+                ),
+                "peak_rss_after_persisted_asterisms_mb": (
+                    f"{sample.peak_rss_after_persisted_asterisms_mb:.3f}"
+                ),
+                "rss_after_artifact_write_mb": f"{sample.rss_after_artifact_write_mb:.3f}",
+                "peak_rss_after_artifact_write_mb": (
+                    f"{sample.peak_rss_after_artifact_write_mb:.3f}"
+                ),
+                "rss_after_gc_mb": f"{sample.rss_after_gc_mb:.3f}",
+                "peak_rss_after_gc_mb": f"{sample.peak_rss_after_gc_mb:.3f}",
+                "search_star_rows": sample.search_star_rows,
+                "ngs_rows": sample.ngs_rows,
+                "close_pair_rows": sample.close_pair_rows,
+                "raw_asterism_rows": sample.raw_asterism_rows,
+                "post_overlap_asterism_rows": sample.post_overlap_asterism_rows,
+                "local_asterism_rows": sample.local_asterism_rows,
+                "context_pair_rows": sample.context_pair_rows,
+                "winner_payload_rows": sample.winner_payload_rows,
+                "artifact_inner_structured_mib": (
+                    f"{sample.artifact_inner_structured_mib:.3f}"
+                ),
+                "artifact_asterism_structured_mib": (
+                    f"{sample.artifact_asterism_structured_mib:.3f}"
+                ),
+                "error_message": sample.error_message,
+            }
+        )
+
+    def write_worker(self, sample: TraversalWorkerMemorySample) -> None:
+        self._worker_writer.writerow(
+            {
+                "worker_id": sample.worker_id,
+                "event": sample.event,
+                "elapsed_seconds": f"{sample.elapsed_seconds:.6f}",
+                "rss_mb": f"{sample.rss_mb:.3f}",
+                "peak_rss_mb": f"{sample.peak_rss_mb:.3f}",
+            }
+        )
+
+    def flush(self) -> None:
+        self._handle.flush()
+        self._worker_handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+        self._worker_handle.close()
+
+    def __enter__(self) -> "_TraversalDiagnosticsWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+class _BufferedStateWriter:
+    """Batch parent-owned state row writes while keeping in-memory state current."""
+
+    def __init__(
+        self,
+        *,
+        build_path: Path,
+        state: np.ndarray,
+        telemetry: _StateUpdateTelemetry,
+        flush_interval: int = STATE_UPDATE_FLUSH_INTERVAL,
+    ) -> None:
+        self.build_path = build_path
+        self.state = state
+        self.telemetry = telemetry
+        self.flush_interval = max(1, int(flush_interval))
+        self._dirty_rows: set[int] = set()
+
+    @property
+    def dirty_count(self) -> int:
+        return len(self._dirty_rows)
+
+    def update(self, outer_pix: int, **updates: object) -> None:
+        row_index = int(outer_pix)
+        for key, value in updates.items():
+            self._set_state_value(row_index, key, value)
+        self._dirty_rows.add(row_index)
+        self.telemetry.updates += 1
+        self.telemetry.dirty_rows_peak = max(
+            self.telemetry.dirty_rows_peak,
+            len(self._dirty_rows),
+        )
+        if len(self._dirty_rows) >= self.flush_interval:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._dirty_rows:
+            return
+
+        row_indexes = np.asarray(sorted(self._dirty_rows), dtype=np.int64)
+        started = time.perf_counter()
+        retries = 0
+        waited = 0.0
+        while True:
+            try:
+                write_state_rows(self.build_path, row_indexes, self.state)
+                elapsed = time.perf_counter() - started
+                self.telemetry.flushes += 1
+                self.telemetry.rows_written += int(len(row_indexes))
+                self.telemetry.total_seconds += elapsed
+                self.telemetry.max_seconds = max(self.telemetry.max_seconds, elapsed)
+                self.telemetry.lock_retries += retries
+                self.telemetry.lock_wait_seconds += waited
+                self._dirty_rows.difference_update(int(row) for row in row_indexes)
+                return
+            except Exception as exc:
+                if not _is_hdf5_lock_error(exc) or retries >= STATE_UPDATE_RETRY_ATTEMPTS:
+                    raise
+                retries += 1
+                wait_seconds = STATE_UPDATE_RETRY_DELAY_SECONDS * retries
+                waited += wait_seconds
+                time.sleep(wait_seconds)
+
+    def _set_state_value(self, row_index: int, key: str, value: object) -> None:
+        if key not in self.state.dtype.names:
+            raise BuildError(f"Unknown state field {key!r}")
+        field_dtype = self.state.dtype[key]
+        if field_dtype.kind == "S":
+            self.state[key][row_index] = _encode_state_bytes(
+                value,
+                max_bytes=field_dtype.itemsize,
+                field_name=key,
+            )
+        else:
+            self.state[key][row_index] = value
+
+
+def _is_hdf5_lock_error(exc: BaseException) -> bool:
+    if isinstance(exc, BlockingIOError):
+        return True
+    message = str(exc).lower()
+    return "unable to lock file" in message or "resource temporarily unavailable" in message
+
+
+def _encode_state_bytes(
+    value: object,
+    *,
+    max_bytes: int,
+    field_name: str,
+) -> bytes:
+    if value is None:
+        return b""
+    encoded = str(value).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise BuildError(
+            f"{field_name} exceeds persisted limit of {max_bytes} bytes"
+        )
+    return encoded
+
+
+def _update_state_row_with_telemetry(
+    build_path: Path,
+    outer_pix: int,
+    telemetry: _StateUpdateTelemetry | None,
+    **updates: object,
+) -> None:
+    """Update one state row and record retry/timing counters for Traversal telemetry."""
+
+    started = time.perf_counter()
+    retries = 0
+    waited = 0.0
+    while True:
+        try:
+            update_state_row(build_path, outer_pix, **updates)
+            elapsed = time.perf_counter() - started
+            if telemetry is not None:
+                telemetry.updates += 1
+                telemetry.flushes += 1
+                telemetry.rows_written += 1
+                telemetry.total_seconds += elapsed
+                telemetry.max_seconds = max(telemetry.max_seconds, elapsed)
+                telemetry.lock_retries += retries
+                telemetry.lock_wait_seconds += waited
+                telemetry.dirty_rows_peak = max(telemetry.dirty_rows_peak, 1)
+            return
+        except Exception as exc:
+            if not _is_hdf5_lock_error(exc) or retries >= STATE_UPDATE_RETRY_ATTEMPTS:
+                raise
+            retries += 1
+            wait_seconds = STATE_UPDATE_RETRY_DELAY_SECONDS * retries
+            waited += wait_seconds
+            time.sleep(wait_seconds)
+
+
+def _append_state_update_telemetry(
+    build_path: Path,
+    telemetry: _StateUpdateTelemetry,
+) -> None:
+    append_build_log(
+        build_path,
+        "phase=traversal "
+        "state_update_stats "
+        f"updates={telemetry.updates} "
+        f"flushes={telemetry.flushes} "
+        f"rows_written={telemetry.rows_written} "
+        f"total_s={telemetry.total_seconds:.3f} "
+        f"max_s={telemetry.max_seconds:.3f} "
+        f"lock_retries={telemetry.lock_retries} "
+        f"lock_wait_s={telemetry.lock_wait_seconds:.3f} "
+        f"dirty_rows_peak={telemetry.dirty_rows_peak}",
     )
 
 
@@ -180,13 +819,46 @@ def _materialize_outer_pixel_products(
     runtime=None,
     store=None,
     geometry: TraversalGeometry | None = None,
-) -> None:
+    memory_profile: TraversalMemoryProfile | None = None,
+    artifact_memory_profile: ArtifactMemoryProfile | None = None,
+) -> tuple[ArtifactWriteProfile, TraversalStageStats, TraversalStructureStats]:
     """Run the Traversal pipeline for one outer pixel without mutating build state."""
 
+    filename, inner, asterisms, stage_stats, structure_stats = _build_outer_pixel_products(
+        context,
+        outer_pix,
+        runtime=runtime,
+        store=store,
+        geometry=geometry,
+        memory_profile=memory_profile,
+    )
+    write_profile = _write_outer_pixel_products(
+        filename,
+        inner=inner,
+        asterisms=asterisms,
+        measure_input_bytes=memory_profile is not None,
+        memory_profile=artifact_memory_profile,
+    )
+    if memory_profile is not None:
+        memory_profile.rss_after_artifact_write_mb = _current_rss_mb()
+        memory_profile.peak_rss_after_artifact_write_mb = _peak_rss_mb()
+    return write_profile, stage_stats, structure_stats
+
+
+def _build_outer_pixel_products(
+    context: TraversalTaskContext,
+    outer_pix: int,
+    *,
+    runtime=None,
+    store=None,
+    geometry: TraversalGeometry | None = None,
+    memory_profile: TraversalMemoryProfile | None = None,
+) -> tuple[Path, Table, Table, TraversalStageStats, TraversalStructureStats]:
+    """Build Traversal products for one outer pixel without writing artifacts."""
+
     if runtime is None:
-        runtime = load_native_runtime(
-            context.definition,
-            legacy_config_path=context.legacy_config_path,
+        runtime = load_runtime_config(
+            context.runtime_config_path,
             model_root=context.roots.model_root,
         )
         warm_model_cache(runtime)
@@ -206,6 +878,8 @@ def _materialize_outer_pixel_products(
         )
     if geometry is None:
         geometry = TraversalGeometry.from_runtime(runtime)
+    profile = TraversalStageProfile()
+    structure_profile = TraversalStructureProfile() if memory_profile is not None else None
     asterisms, inner = build_traversal_products(
         store,
         runtime,
@@ -213,9 +887,45 @@ def _materialize_outer_pixel_products(
         dust_root=context.roots.dust_root,
         max_data_level=context.definition.max_data_level,
         geometry=geometry,
+        profile=profile,
+        structure_profile=structure_profile,
+        memory_profile=memory_profile,
+        rss_sampler=_current_rss_mb if memory_profile is not None else None,
+        peak_sampler=_peak_rss_mb if memory_profile is not None else None,
+        asterism_skip_reason=(
+            "coarse_outer_density"
+            if int(outer_pix) in context.coarse_density_skip_outer_pixs
+            else None
+        ),
     )
     filename = outer_artifact_filename(context.build_path, context.definition, outer_pix)
-    write_outer_artifact(filename, inner=inner, asterisms=asterisms)
+    structure_stats = (
+        structure_profile.to_stats()
+        if structure_profile is not None
+        else TraversalStructureStats()
+    )
+    return filename, inner, asterisms, profile.to_stats(), structure_stats
+
+
+def _write_outer_pixel_products(
+    filename: Path,
+    *,
+    inner: Table,
+    asterisms: Table,
+    measure_input_bytes: bool = False,
+    memory_profile: ArtifactMemoryProfile | None = None,
+) -> ArtifactWriteProfile:
+    """Write one outer-pixel artifact and return artifact write profile."""
+
+    return write_outer_artifact_profiled(
+        filename,
+        inner=inner,
+        asterisms=asterisms,
+        measure_input_bytes=measure_input_bytes,
+        memory_profile=memory_profile,
+        rss_sampler=_current_rss_mb if memory_profile is not None else None,
+        peak_sampler=_peak_rss_mb if memory_profile is not None else None,
+    )
 
 
 def _run_outer_pixel_traversal_task(
@@ -236,59 +946,78 @@ def _run_outer_pixel_traversal_task(
     return TraversalTaskResult(outer_pix=int(outer_pix), success=True)
 
 
-def build_outer_pixel_products(build_path: Path, outer_pix: int) -> None:
-    """Run one outer-pixel Traversal task and update persisted build state."""
-
-    context = _load_traversal_task_context(build_path)
-    state = load_state(build_path)
-    _mark_outer_pixel_running(build_path, state, outer_pix)
-    result = _run_outer_pixel_traversal_task(context, outer_pix)
-    _record_traversal_result(build_path, state, result)
-
-
-def _mark_outer_pixel_running(build_path: Path, state: np.ndarray, outer_pix: int) -> None:
+def _mark_outer_pixel_running(
+    build_path: Path,
+    state: np.ndarray,
+    outer_pix: int,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
+) -> None:
     current_state = state[int(outer_pix)]
-    update_state_row(
-        build_path,
-        outer_pix,
+    updates = dict(
         traversal_status=WORK_STATUS_RUNNING,
         traversal_attempt_count=int(current_state["traversal_attempt_count"]) + 1,
         traversal_last_error_message="",
     )
-    state["traversal_status"][int(outer_pix)] = WORK_STATUS_RUNNING
-    state["traversal_attempt_count"][int(outer_pix)] = (
-        int(current_state["traversal_attempt_count"]) + 1
-    )
-    state["traversal_last_error_message"][int(outer_pix)] = b""
+    if state_writer is not None:
+        state_writer.update(outer_pix, **updates)
+    else:
+        _update_state_row_with_telemetry(
+            build_path,
+            outer_pix,
+            telemetry,
+            **updates,
+        )
+        state["traversal_status"][int(outer_pix)] = WORK_STATUS_RUNNING
+        state["traversal_attempt_count"][int(outer_pix)] = (
+            int(current_state["traversal_attempt_count"]) + 1
+        )
+        state["traversal_last_error_message"][int(outer_pix)] = b""
 
 
 def _record_traversal_result(
     build_path: Path,
     state: np.ndarray,
     result: TraversalTaskResult,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
 ) -> None:
     if result.success:
-        update_state_row(
-            build_path,
-            result.outer_pix,
+        updates = dict(
             traversal_status=WORK_STATUS_DONE,
             traversal_last_error_message="",
         )
-        state["traversal_status"][int(result.outer_pix)] = WORK_STATUS_DONE
-        state["traversal_last_error_message"][int(result.outer_pix)] = b""
+        if state_writer is not None:
+            state_writer.update(result.outer_pix, **updates)
+        else:
+            _update_state_row_with_telemetry(
+                build_path,
+                result.outer_pix,
+                telemetry,
+                **updates,
+            )
+            state["traversal_status"][int(result.outer_pix)] = WORK_STATUS_DONE
+            state["traversal_last_error_message"][int(result.outer_pix)] = b""
         return
 
     error_message = _truncate_state_error_message(result.error_message)
-    update_state_row(
-        build_path,
-        result.outer_pix,
+    updates = dict(
         traversal_status=WORK_STATUS_FAILED,
         traversal_last_error_message=error_message,
     )
-    state["traversal_status"][int(result.outer_pix)] = WORK_STATUS_FAILED
-    state["traversal_last_error_message"][int(result.outer_pix)] = error_message.encode(
-        "utf-8"
-    )
+    if state_writer is not None:
+        state_writer.update(result.outer_pix, **updates)
+    else:
+        _update_state_row_with_telemetry(
+            build_path,
+            result.outer_pix,
+            telemetry,
+            **updates,
+        )
+        state["traversal_status"][int(result.outer_pix)] = WORK_STATUS_FAILED
+        state["traversal_last_error_message"][int(result.outer_pix)] = error_message.encode(
+            "utf-8"
+        )
 
 
 def _truncate_state_error_message(message: object) -> str:
@@ -305,27 +1034,33 @@ def _truncate_state_error_message(message: object) -> str:
     return truncated + TRUNCATED_ERROR_SUFFIX
 
 
-def _create_traversal_executor(workers: int) -> ProcessPoolExecutor:
-    """Create the loky process pool used by the parallel Traversal runner."""
-
-    return ProcessPoolExecutor(max_workers=int(workers))
-
-
 def _create_regional_process_context():
     """Return the process context used by cache-aware regional Traversal."""
 
     return multiprocessing.get_context("spawn")
 
 
-def _repair_stale_running_rows(build_path: Path, *, status_field: str) -> int:
-    state = load_state(build_path)
+def _repair_stale_running_rows(
+    build_path: Path,
+    state: np.ndarray,
+    *,
+    status_field: str,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
+) -> int:
     stale = np.flatnonzero(state[status_field] == WORK_STATUS_RUNNING)
     for outer_pix in stale:
-        update_state_row(
-            build_path,
-            int(outer_pix),
-            **{status_field: WORK_STATUS_PENDING},
-        )
+        updates = {status_field: WORK_STATUS_PENDING}
+        if state_writer is not None:
+            state_writer.update(int(outer_pix), **updates)
+        else:
+            _update_state_row_with_telemetry(
+                build_path,
+                int(outer_pix),
+                telemetry,
+                **updates,
+            )
+            state[status_field][int(outer_pix)] = WORK_STATUS_PENDING
     return int(len(stale))
 
 
@@ -335,48 +1070,27 @@ def _reset_running_rows(
     *,
     status_field: str,
     error_field: str,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
 ) -> int:
     running = np.flatnonzero(state[status_field] == WORK_STATUS_RUNNING)
     for outer_pix in running:
-        update_state_row(
-            build_path,
-            int(outer_pix),
-            **{
-                status_field: WORK_STATUS_PENDING,
-                error_field: "",
-            },
-        )
-        state[status_field][int(outer_pix)] = WORK_STATUS_PENDING
-        state[error_field][int(outer_pix)] = b""
+        updates = {
+            status_field: WORK_STATUS_PENDING,
+            error_field: "",
+        }
+        if state_writer is not None:
+            state_writer.update(int(outer_pix), **updates)
+        else:
+            _update_state_row_with_telemetry(
+                build_path,
+                int(outer_pix),
+                telemetry,
+                **updates,
+            )
+            state[status_field][int(outer_pix)] = WORK_STATUS_PENDING
+            state[error_field][int(outer_pix)] = b""
     return int(len(running))
-
-
-def _dispatch_parallel_outer_pixel(
-    *,
-    build_path: Path,
-    context: TraversalTaskContext,
-    state: np.ndarray,
-    scheduler: OuterPixelScheduler,
-    executor: ProcessPoolExecutor,
-    workers: int,
-    active: dict[Future[TraversalTaskResult], int],
-    dispatch_after_outer_pix: int | None,
-) -> None:
-    while len(active) < workers:
-        outer_pix = scheduler.select_next_outer_pixel(
-            state,
-            last_completed_outer_pix=dispatch_after_outer_pix,
-        )
-        dispatch_after_outer_pix = None
-        if outer_pix is None:
-            return
-        _mark_outer_pixel_running(build_path, state, outer_pix)
-        future = executor.submit(_run_outer_pixel_traversal_task, context, outer_pix)
-        active[future] = int(outer_pix)
-
-
-def _gaia_cache_enabled(config: TraversalExecutionConfig) -> bool:
-    return config.gaia_cache_entries > 0 and config.gaia_cache_mb > 0
 
 
 def _run_regional_traversal_worker(
@@ -395,6 +1109,367 @@ def _run_regional_traversal_worker(
         result_queue.put(message)
 
 
+def _peak_rss_mb() -> float:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    if sys.platform == "darwin":
+        return float(usage.ru_maxrss) / (1024.0 * 1024.0)
+    return float(usage.ru_maxrss) / 1024.0
+
+
+def _current_rss_mb() -> float:
+    """Return current worker RSS when available; fall back to peak RSS."""
+
+    if sys.platform == "darwin":
+        try:
+            return _darwin_current_rss_mb()
+        except Exception:
+            return _peak_rss_mb()
+    statm = Path("/proc/self/statm")
+    if statm.is_file():
+        try:
+            rss_pages = int(statm.read_text(encoding="utf-8").split()[1])
+            page_size = resource.getpagesize()
+            return rss_pages * page_size / (1024.0 * 1024.0)
+        except Exception:
+            return _peak_rss_mb()
+    return _peak_rss_mb()
+
+
+def _process_current_rss_mb(pid: int) -> float:
+    """Return current RSS for one process id when available."""
+
+    if int(pid) <= 0:
+        return 0.0
+    statm = Path(f"/proc/{int(pid)}/statm")
+    if statm.is_file():
+        try:
+            rss_pages = int(statm.read_text(encoding="utf-8").split()[1])
+            page_size = resource.getpagesize()
+            return rss_pages * page_size / (1024.0 * 1024.0)
+        except Exception:
+            return 0.0
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(int(pid))],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return 0.0
+    if completed.returncode != 0:
+        return 0.0
+    text = completed.stdout.strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text.splitlines()[0].strip()) / 1024.0
+    except ValueError:
+        return 0.0
+
+
+def _parent_total_current_rss_mb(processes: tuple | list = ()) -> float:
+    total = _current_rss_mb()
+    for process in processes:
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            continue
+        total += _process_current_rss_mb(int(pid))
+    return total
+
+
+def _raise_if_parent_memory_limit_exceeded(
+    execution_config: TraversalExecutionConfig,
+    processes: tuple | list = (),
+) -> None:
+    limit = int(execution_config.parent_memory_limit_mb)
+    if limit <= 0:
+        return
+    total_mb = _parent_total_current_rss_mb(processes)
+    if total_mb > float(limit):
+        raise BuildError(
+            f"parent memory limit exceeded: current RSS {total_mb:.1f} MiB "
+            f"> {limit} MiB"
+        )
+
+
+def _darwin_current_rss_mb() -> float:
+    """Return current RSS on macOS using Mach task_info."""
+
+    import ctypes
+
+    class TimeValue(ctypes.Structure):
+        _fields_ = [("seconds", ctypes.c_int32), ("microseconds", ctypes.c_int32)]
+
+    class MachTaskBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("virtual_size", ctypes.c_uint64),
+            ("resident_size", ctypes.c_uint64),
+            ("resident_size_max", ctypes.c_uint64),
+            ("user_time", TimeValue),
+            ("system_time", TimeValue),
+            ("policy", ctypes.c_int32),
+            ("suspend_count", ctypes.c_int32),
+        ]
+
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    task = ctypes.c_uint32.in_dll(libc, "mach_task_self_").value
+    info = MachTaskBasicInfo()
+    count = ctypes.c_uint32(ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_uint32))
+    result = libc.task_info(
+        ctypes.c_uint32(task),
+        ctypes.c_int(20),  # MACH_TASK_BASIC_INFO
+        ctypes.byref(info),
+        ctypes.byref(count),
+    )
+    if result != 0:
+        raise OSError(f"task_info failed with status {result}")
+    return float(info.resident_size) / (1024.0 * 1024.0)
+
+
+def _traversal_cache_stats(store: RuntimeGaiaHealpixStore) -> TraversalCacheStats:
+    stats = store.stats()
+    return TraversalCacheStats(
+        hits=stats.hits,
+        misses=stats.misses,
+        evictions=stats.evictions,
+        oversized_skips=stats.oversized_skips,
+        current_bytes=stats.current_bytes,
+        peak_bytes=stats.peak_bytes,
+        entries=stats.entries,
+        load_seconds=stats.load_seconds,
+        raw_load_seconds=stats.raw_load_seconds,
+        prepare_seconds=stats.prepare_seconds,
+    )
+
+
+def _traversal_worker_stats_message(
+    *,
+    worker_id: int,
+    completed: int,
+    failed: int,
+    run_started: float,
+    pixel_seconds: float,
+    artifact_write_telemetry: _ArtifactWriteTelemetry,
+    stage_telemetry: _TraversalStageTelemetry,
+    structure_telemetry: _TraversalStructureTelemetry,
+    store: RuntimeGaiaHealpixStore,
+) -> TraversalWorkerMessage:
+    return TraversalWorkerMessage(
+        worker_id=worker_id,
+        kind="profile",
+        worker_stats=TraversalWorkerStats(
+            completed=completed,
+            failed=failed,
+            elapsed_seconds=time.perf_counter() - run_started,
+            pixel_seconds=pixel_seconds,
+            artifact_write_seconds=artifact_write_telemetry.total_seconds,
+            artifact_convert_inner_seconds=artifact_write_telemetry.convert_inner_seconds,
+            artifact_convert_asterisms_seconds=(
+                artifact_write_telemetry.convert_asterisms_seconds
+            ),
+            artifact_hdf5_open_seconds=artifact_write_telemetry.hdf5_open_seconds,
+            artifact_hdf5_inner_seconds=artifact_write_telemetry.hdf5_inner_seconds,
+            artifact_hdf5_asterisms_seconds=(
+                artifact_write_telemetry.hdf5_asterisms_seconds
+            ),
+            artifact_hdf5_close_seconds=artifact_write_telemetry.hdf5_close_seconds,
+            artifact_replace_seconds=artifact_write_telemetry.replace_seconds,
+            artifact_bytes=artifact_write_telemetry.output_bytes,
+            artifact_inner_input_bytes=artifact_write_telemetry.inner_input_bytes,
+            artifact_asterism_input_bytes=artifact_write_telemetry.asterism_input_bytes,
+            artifact_inner_structured_bytes=artifact_write_telemetry.inner_structured_bytes,
+            artifact_asterism_structured_bytes=(
+                artifact_write_telemetry.asterism_structured_bytes
+            ),
+            artifact_inner_rows=artifact_write_telemetry.inner_rows,
+            artifact_asterism_rows=artifact_write_telemetry.asterism_rows,
+            stage_stats=stage_telemetry.to_stats(),
+            structure_stats=structure_telemetry.to_stats(),
+            peak_rss_mb=_peak_rss_mb(),
+            cache_stats=_traversal_cache_stats(store),
+        ),
+    )
+
+
+def _worker_memory_limit_exceeded(
+    execution_config: TraversalExecutionConfig,
+) -> bool:
+    limit = int(execution_config.worker_memory_limit_mb)
+    return limit > 0 and _peak_rss_mb() > float(limit)
+
+
+def _build_memory_sample(
+    *,
+    outer_pix: int,
+    worker_id: int,
+    success: bool,
+    pixel_seconds: float,
+    artifact_write_profile: ArtifactWriteProfile | None,
+    artifact_memory_profile: ArtifactMemoryProfile | None,
+    structure_stats: TraversalStructureStats | None,
+    memory_profile: TraversalMemoryProfile,
+    error_message: str = "",
+) -> TraversalMemorySample:
+    artifact_write_seconds = 0.0
+    artifact_inner_structured_mib = 0.0
+    artifact_asterism_structured_mib = 0.0
+    if artifact_write_profile is not None:
+        artifact_write_seconds = artifact_write_profile.total_seconds
+        artifact_inner_structured_mib = artifact_write_profile.inner_structured_bytes / (
+            1024.0 * 1024.0
+        )
+        artifact_asterism_structured_mib = (
+            artifact_write_profile.asterism_structured_bytes / (1024.0 * 1024.0)
+        )
+    if structure_stats is None:
+        structure_stats = TraversalStructureStats()
+    return TraversalMemorySample(
+        outer_pix=int(outer_pix),
+        worker_id=int(worker_id),
+        success=success,
+        pixel_seconds=float(pixel_seconds),
+        artifact_write_seconds=float(artifact_write_seconds),
+        artifact_rss_before_convert_inner_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_before_convert_inner_mb
+        ),
+        artifact_peak_before_convert_inner_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_before_convert_inner_mb
+        ),
+        artifact_rss_after_convert_inner_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_after_convert_inner_mb
+        ),
+        artifact_peak_after_convert_inner_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_after_convert_inner_mb
+        ),
+        artifact_rss_after_convert_asterisms_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_after_convert_asterisms_mb
+        ),
+        artifact_peak_after_convert_asterisms_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_after_convert_asterisms_mb
+        ),
+        artifact_rss_after_hdf5_open_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_after_hdf5_open_mb
+        ),
+        artifact_peak_after_hdf5_open_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_after_hdf5_open_mb
+        ),
+        artifact_rss_after_hdf5_inner_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_after_hdf5_inner_mb
+        ),
+        artifact_peak_after_hdf5_inner_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_after_hdf5_inner_mb
+        ),
+        artifact_rss_after_hdf5_asterisms_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_after_hdf5_asterisms_mb
+        ),
+        artifact_peak_after_hdf5_asterisms_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_after_hdf5_asterisms_mb
+        ),
+        artifact_rss_after_hdf5_close_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_after_hdf5_close_mb
+        ),
+        artifact_peak_after_hdf5_close_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_after_hdf5_close_mb
+        ),
+        artifact_rss_after_replace_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.rss_after_replace_mb
+        ),
+        artifact_peak_after_replace_mb=(
+            0.0
+            if artifact_memory_profile is None
+            else artifact_memory_profile.peak_after_replace_mb
+        ),
+        rss_start_mb=memory_profile.rss_start_mb,
+        peak_rss_start_mb=memory_profile.peak_rss_start_mb,
+        rss_after_star_selection_mb=memory_profile.rss_after_star_selection_mb,
+        peak_rss_after_star_selection_mb=memory_profile.peak_rss_after_star_selection_mb,
+        rss_after_find_asterisms_mb=memory_profile.rss_after_find_asterisms_mb,
+        peak_rss_after_find_asterisms_mb=memory_profile.peak_rss_after_find_asterisms_mb,
+        rss_after_filtering_mb=memory_profile.rss_after_filtering_mb,
+        peak_rss_after_filtering_mb=memory_profile.peak_rss_after_filtering_mb,
+        rss_after_context_mb=memory_profile.rss_after_context_mb,
+        peak_rss_after_context_mb=memory_profile.peak_rss_after_context_mb,
+        rss_after_point_prediction_mb=memory_profile.rss_after_point_prediction_mb,
+        peak_rss_after_point_prediction_mb=memory_profile.peak_rss_after_point_prediction_mb,
+        rss_after_field_mean_mb=memory_profile.rss_after_field_mean_mb,
+        peak_rss_after_field_mean_mb=memory_profile.peak_rss_after_field_mean_mb,
+        rss_after_coverage_mb=memory_profile.rss_after_coverage_mb,
+        peak_rss_after_coverage_mb=memory_profile.peak_rss_after_coverage_mb,
+        rss_after_dust_mb=memory_profile.rss_after_dust_mb,
+        peak_rss_after_dust_mb=memory_profile.peak_rss_after_dust_mb,
+        rss_after_persisted_asterisms_mb=memory_profile.rss_after_persisted_asterisms_mb,
+        peak_rss_after_persisted_asterisms_mb=(
+            memory_profile.peak_rss_after_persisted_asterisms_mb
+        ),
+        rss_after_artifact_write_mb=memory_profile.rss_after_artifact_write_mb,
+        peak_rss_after_artifact_write_mb=memory_profile.peak_rss_after_artifact_write_mb,
+        rss_after_gc_mb=memory_profile.rss_after_gc_mb,
+        peak_rss_after_gc_mb=memory_profile.peak_rss_after_gc_mb,
+        search_star_rows=structure_stats.search_star_rows,
+        ngs_rows=structure_stats.ngs_rows,
+        close_pair_rows=structure_stats.close_pair_rows,
+        raw_asterism_rows=structure_stats.raw_asterism_rows,
+        post_overlap_asterism_rows=structure_stats.post_overlap_asterism_rows,
+        local_asterism_rows=structure_stats.local_asterism_rows,
+        context_pair_rows=structure_stats.context_pair_rows,
+        winner_payload_rows=structure_stats.winner_payload_rows,
+        artifact_inner_structured_mib=float(artifact_inner_structured_mib),
+        artifact_asterism_structured_mib=float(artifact_asterism_structured_mib),
+        error_message=error_message,
+    )
+
+
+def _worker_memory_sample(
+    *,
+    worker_id: int,
+    event: str,
+    run_started: float,
+) -> TraversalWorkerMessage:
+    return TraversalWorkerMessage(
+        worker_id=worker_id,
+        kind="worker_memory_sample",
+        worker_memory_sample=TraversalWorkerMemorySample(
+            worker_id=int(worker_id),
+            event=event,
+            elapsed_seconds=time.perf_counter() - run_started,
+            rss_mb=_current_rss_mb(),
+            peak_rss_mb=_peak_rss_mb(),
+        ),
+    )
+
+
 def _iter_long_lived_traversal_worker_messages(
     context: TraversalTaskContext,
     plan: TraversalWorkerPlan,
@@ -402,13 +1477,38 @@ def _iter_long_lived_traversal_worker_messages(
 ) -> Iterator[TraversalWorkerMessage]:
     """Yield Traversal messages from one reusable worker runtime."""
 
+    run_started = time.perf_counter()
+    detailed = execution_config.telemetry == "detailed"
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=plan.worker_id,
+            event="worker_start",
+            run_started=run_started,
+        )
     configure_inference_threads(1)
-    runtime = load_native_runtime(
-        context.definition,
-        legacy_config_path=context.legacy_config_path,
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=plan.worker_id,
+            event="after_inference_thread_config",
+            run_started=run_started,
+        )
+    runtime = load_runtime_config(
+        context.runtime_config_path,
         model_root=context.roots.model_root,
     )
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=plan.worker_id,
+            event="after_runtime_config",
+            run_started=run_started,
+        )
     warm_model_cache(runtime)
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=plan.worker_id,
+            event="after_model_warmup",
+            run_started=run_started,
+        )
     base_store = GaiaHealpixStore(
         GaiaStoreConfig(
             root=context.roots.gaia_root,
@@ -416,13 +1516,37 @@ def _iter_long_lived_traversal_worker_messages(
             healpix_level=context.definition.outer_level,
         )
     )
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=plan.worker_id,
+            event="after_base_store",
+            run_started=run_started,
+        )
     store = RuntimeGaiaHealpixStore(
         base_store,
         runtime,
         max_entries=execution_config.gaia_cache_entries,
         max_bytes=execution_config.gaia_cache_mb * 1024 * 1024,
     )
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=plan.worker_id,
+            event="after_runtime_gaia_store",
+            run_started=run_started,
+        )
     geometry = TraversalGeometry.from_runtime(runtime)
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=plan.worker_id,
+            event="after_geometry",
+            run_started=run_started,
+        )
+    completed = 0
+    failed = 0
+    pixel_seconds = 0.0
+    artifact_write_telemetry = _ArtifactWriteTelemetry()
+    stage_telemetry = _TraversalStageTelemetry()
+    structure_telemetry = _TraversalStructureTelemetry()
 
     for outer_pix in plan.outer_pixs:
         yield TraversalWorkerMessage(
@@ -430,15 +1554,50 @@ def _iter_long_lived_traversal_worker_messages(
             kind="started",
             outer_pix=int(outer_pix),
         )
+        pixel_started = time.perf_counter()
+        memory_profile = None
+        artifact_memory_profile = None
+        if execution_config.telemetry == "detailed":
+            memory_profile = TraversalMemoryProfile(
+                rss_start_mb=_current_rss_mb(),
+                peak_rss_start_mb=_peak_rss_mb(),
+            )
+            artifact_memory_profile = ArtifactMemoryProfile()
         try:
-            _materialize_outer_pixel_products(
+            write_profile, stage_stats, structure_stats = _materialize_outer_pixel_products(
                 context,
                 int(outer_pix),
                 runtime=runtime,
                 store=store,
                 geometry=geometry,
+                memory_profile=memory_profile,
+                artifact_memory_profile=artifact_memory_profile,
             )
+            artifact_write_telemetry.add(write_profile)
+            stage_telemetry.add(stage_stats)
+            structure_telemetry.add(structure_stats)
         except Exception as exc:
+            pixel_seconds += time.perf_counter() - pixel_started
+            failed += 1
+            gc.collect()
+            if memory_profile is not None:
+                memory_profile.rss_after_gc_mb = _current_rss_mb()
+                memory_profile.peak_rss_after_gc_mb = _peak_rss_mb()
+                yield TraversalWorkerMessage(
+                    worker_id=plan.worker_id,
+                    kind="memory_sample",
+                    memory_sample=_build_memory_sample(
+                        outer_pix=int(outer_pix),
+                        worker_id=plan.worker_id,
+                        success=False,
+                        pixel_seconds=time.perf_counter() - pixel_started,
+                        artifact_write_profile=None,
+                        artifact_memory_profile=artifact_memory_profile,
+                        structure_stats=None,
+                        memory_profile=memory_profile,
+                        error_message=str(exc),
+                    ),
+                )
             yield TraversalWorkerMessage(
                 worker_id=plan.worker_id,
                 kind="failed",
@@ -449,27 +1608,98 @@ def _iter_long_lived_traversal_worker_messages(
                     error_message=str(exc),
                 ),
             )
+            if (completed + failed) % TRAVERSAL_PROGRESS_LOG_INTERVAL == 0:
+                yield _traversal_worker_stats_message(
+                    worker_id=plan.worker_id,
+                    completed=completed,
+                    failed=failed,
+                    run_started=run_started,
+                    pixel_seconds=pixel_seconds,
+                    artifact_write_telemetry=artifact_write_telemetry,
+                    stage_telemetry=stage_telemetry,
+                    structure_telemetry=structure_telemetry,
+                    store=store,
+                )
+            if _worker_memory_limit_exceeded(execution_config):
+                yield TraversalWorkerMessage(
+                    worker_id=plan.worker_id,
+                    kind="memory_limit",
+                    error_message=(
+                        "worker peak RSS exceeded "
+                        f"{execution_config.worker_memory_limit_mb} MiB"
+                    ),
+                )
+                return
             continue
+        pixel_seconds += time.perf_counter() - pixel_started
+        completed += 1
+        gc.collect()
+        if memory_profile is not None:
+            memory_profile.rss_after_gc_mb = _current_rss_mb()
+            memory_profile.peak_rss_after_gc_mb = _peak_rss_mb()
+            yield TraversalWorkerMessage(
+                worker_id=plan.worker_id,
+                kind="memory_sample",
+                memory_sample=_build_memory_sample(
+                    outer_pix=int(outer_pix),
+                    worker_id=plan.worker_id,
+                    success=True,
+                    pixel_seconds=time.perf_counter() - pixel_started,
+                    artifact_write_profile=write_profile,
+                    artifact_memory_profile=artifact_memory_profile,
+                    structure_stats=structure_stats,
+                    memory_profile=memory_profile,
+                ),
+            )
         yield TraversalWorkerMessage(
             worker_id=plan.worker_id,
             kind="completed",
             outer_pix=int(outer_pix),
-            result=TraversalTaskResult(outer_pix=int(outer_pix), success=True),
+            result=TraversalTaskResult(
+                outer_pix=int(outer_pix),
+                success=True,
+            ),
         )
+        if (completed + failed) % TRAVERSAL_PROGRESS_LOG_INTERVAL == 0:
+            yield _traversal_worker_stats_message(
+                worker_id=plan.worker_id,
+                completed=completed,
+                failed=failed,
+                run_started=run_started,
+                pixel_seconds=pixel_seconds,
+                artifact_write_telemetry=artifact_write_telemetry,
+                stage_telemetry=stage_telemetry,
+                structure_telemetry=structure_telemetry,
+                store=store,
+            )
+        if _worker_memory_limit_exceeded(execution_config):
+            yield TraversalWorkerMessage(
+                worker_id=plan.worker_id,
+                kind="memory_limit",
+                error_message=(
+                    "worker peak RSS exceeded "
+                    f"{execution_config.worker_memory_limit_mb} MiB"
+                ),
+            )
+            return
+
+    yield _traversal_worker_stats_message(
+        worker_id=plan.worker_id,
+        completed=completed,
+        failed=failed,
+        run_started=run_started,
+        pixel_seconds=pixel_seconds,
+        artifact_write_telemetry=artifact_write_telemetry,
+        stage_telemetry=stage_telemetry,
+        structure_telemetry=structure_telemetry,
+        store=store,
+    )
 
     if isinstance(store, RuntimeGaiaHealpixStore) and store.enabled:
-        stats = store.stats()
         yield TraversalWorkerMessage(
             worker_id=plan.worker_id,
             kind="cache_stats",
-            cache_stats=TraversalCacheStats(
-                hits=stats.hits,
-                misses=stats.misses,
-                evictions=stats.evictions,
-                current_bytes=stats.current_bytes,
-                peak_bytes=stats.peak_bytes,
-                entries=stats.entries,
-            ),
+            cache_stats=_traversal_cache_stats(store),
         )
     yield TraversalWorkerMessage(worker_id=plan.worker_id, kind="done")
 
@@ -481,6 +1711,9 @@ def _handle_regional_worker_message(
     message: TraversalWorkerMessage,
     progress: dict[int, dict[str, int]] | None = None,
     progress_interval: int = TRAVERSAL_PROGRESS_LOG_INTERVAL,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
+    diagnostics_writer: _TraversalDiagnosticsWriter | None = None,
 ) -> bool:
     """Apply one regional worker message. Return whether it marks a failure."""
 
@@ -494,13 +1727,25 @@ def _handle_regional_worker_message(
     if message.kind == "started":
         if message.outer_pix is None:
             raise BuildError("Regional worker start message is missing outer_pix")
-        _mark_outer_pixel_running(build_path, state, int(message.outer_pix))
+        _mark_outer_pixel_running(
+            build_path,
+            state,
+            int(message.outer_pix),
+            telemetry,
+            state_writer=state_writer,
+        )
         return False
 
     if message.kind in ("completed", "failed"):
         if message.result is None:
             raise BuildError(f"Regional worker {message.kind} message is missing result")
-        _record_traversal_result(build_path, state, message.result)
+        _record_traversal_result(
+            build_path,
+            state,
+            message.result,
+            telemetry,
+            state_writer=state_writer,
+        )
         if message.result.success:
             if worker_progress is not None:
                 worker_progress["completed"] += 1
@@ -513,16 +1758,24 @@ def _handle_regional_worker_message(
                         "phase=traversal "
                         f"worker={message.worker_id} "
                         f"progress completed={worker_progress['completed']} "
-                        f"failed={worker_progress['failed']} "
-                        f"last_outer_pix={message.result.outer_pix}",
+                            f"failed={worker_progress['failed']} "
+                            f"last_outer_pix={message.result.outer_pix}",
                     )
+                    if state_writer is not None:
+                        state_writer.flush()
+                    if telemetry is not None:
+                        _append_state_update_telemetry(build_path, telemetry)
             return False
         if worker_progress is not None:
             worker_progress["failed"] += 1
+        if state_writer is not None:
+            state_writer.flush()
         append_build_log(
             build_path,
             f"phase=traversal worker={message.worker_id} outer_pix={message.result.outer_pix} failed: {message.result.error_message}",
         )
+        if telemetry is not None:
+            _append_state_update_telemetry(build_path, telemetry)
         return True
 
     if message.kind == "cache_stats":
@@ -537,11 +1790,179 @@ def _handle_regional_worker_message(
             f"hits={stats.hits} "
             f"misses={stats.misses} "
             f"evictions={stats.evictions} "
+            f"oversized_skips={stats.oversized_skips} "
             f"entries={stats.entries} "
             f"current_bytes={stats.current_bytes} "
-            f"peak_bytes={stats.peak_bytes}",
+            f"peak_bytes={stats.peak_bytes} "
+            f"load_s={stats.load_seconds:.3f} "
+            f"raw_load_s={stats.raw_load_seconds:.3f} "
+            f"prepare_s={stats.prepare_seconds:.3f}",
         )
         return False
+
+    if message.kind == "profile":
+        stats = message.worker_stats
+        if stats is None:
+            raise BuildError("Regional worker profile message is missing stats")
+        cache_stats = stats.cache_stats
+        processed = stats.completed + stats.failed
+        average_pixel_seconds = stats.pixel_seconds / processed if processed else 0.0
+        average_write_seconds = stats.artifact_write_seconds / processed if processed else 0.0
+        artifact_convert_seconds = (
+            stats.artifact_convert_inner_seconds
+            + stats.artifact_convert_asterisms_seconds
+        )
+        artifact_hdf5_seconds = (
+            stats.artifact_hdf5_open_seconds
+            + stats.artifact_hdf5_inner_seconds
+            + stats.artifact_hdf5_asterisms_seconds
+            + stats.artifact_hdf5_close_seconds
+        )
+        stage_stats = stats.stage_stats
+        structure_stats = stats.structure_stats
+        traversal_profiled_seconds = (
+            stage_stats.star_selection_seconds
+            + stage_stats.candidate_generation_seconds
+            + stage_stats.filtering_seconds
+            + stage_stats.local_selection_seconds
+            + stage_stats.inner_table_seconds
+            + stage_stats.context_seconds
+            + stage_stats.point_prediction_seconds
+            + stage_stats.field_mean_prediction_seconds
+            + stage_stats.coverage_seconds
+            + stage_stats.dust_seconds
+            + stage_stats.persisted_asterisms_seconds
+        )
+        traversal_other_seconds = (
+            stats.pixel_seconds
+            - stats.artifact_write_seconds
+            - cache_stats.load_seconds
+        )
+        traversal_unprofiled_seconds = (
+            stats.pixel_seconds
+            - stats.artifact_write_seconds
+            - traversal_profiled_seconds
+        )
+        average_other_seconds = traversal_other_seconds / processed if processed else 0.0
+        cache_mb = cache_stats.current_bytes / (1024.0 * 1024.0)
+        peak_cache_mb = cache_stats.peak_bytes / (1024.0 * 1024.0)
+        artifact_mib = stats.artifact_bytes / (1024.0 * 1024.0)
+        artifact_inner_input_mib = stats.artifact_inner_input_bytes / (1024.0 * 1024.0)
+        artifact_asterism_input_mib = stats.artifact_asterism_input_bytes / (
+            1024.0 * 1024.0
+        )
+        artifact_inner_structured_mib = stats.artifact_inner_structured_bytes / (
+            1024.0 * 1024.0
+        )
+        artifact_asterism_structured_mib = stats.artifact_asterism_structured_bytes / (
+            1024.0 * 1024.0
+        )
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={message.worker_id} "
+            "profile "
+            f"completed={stats.completed} "
+            f"failed={stats.failed} "
+            f"elapsed_s={stats.elapsed_seconds:.3f} "
+            f"pixel_s={stats.pixel_seconds:.3f} "
+            f"avg_pixel_s={average_pixel_seconds:.3f} "
+            f"traversal_other_s={traversal_other_seconds:.3f} "
+            f"avg_traversal_other_s={average_other_seconds:.3f} "
+            f"traversal_profiled_s={traversal_profiled_seconds:.3f} "
+            f"traversal_unprofiled_s={traversal_unprofiled_seconds:.3f} "
+            f"stage_star_selection_s={stage_stats.star_selection_seconds:.3f} "
+            f"stage_candidate_generation_s={stage_stats.candidate_generation_seconds:.3f} "
+            f"stage_filtering_s={stage_stats.filtering_seconds:.3f} "
+            f"stage_bright_star_filter_s={stage_stats.bright_star_filter_seconds:.3f} "
+            f"stage_overlap_quality_s={stage_stats.overlap_quality_seconds:.3f} "
+            f"stage_overlap_geometry_s={stage_stats.overlap_geometry_seconds:.3f} "
+            f"stage_inner_assignment_s={stage_stats.inner_assignment_seconds:.3f} "
+            f"stage_local_selection_s={stage_stats.local_selection_seconds:.3f} "
+            f"stage_inner_table_s={stage_stats.inner_table_seconds:.3f} "
+            f"stage_context_s={stage_stats.context_seconds:.3f} "
+            f"stage_point_prediction_s={stage_stats.point_prediction_seconds:.3f} "
+            f"stage_field_mean_prediction_s={stage_stats.field_mean_prediction_seconds:.3f} "
+            f"stage_coverage_s={stage_stats.coverage_seconds:.3f} "
+            f"stage_dust_s={stage_stats.dust_seconds:.3f} "
+            f"stage_persisted_asterisms_s={stage_stats.persisted_asterisms_seconds:.3f} "
+            f"artifact_write_s={stats.artifact_write_seconds:.3f} "
+            f"avg_artifact_write_s={average_write_seconds:.3f} "
+            f"artifact_convert_s={artifact_convert_seconds:.3f} "
+            f"artifact_convert_inner_s={stats.artifact_convert_inner_seconds:.3f} "
+            f"artifact_convert_asterisms_s={stats.artifact_convert_asterisms_seconds:.3f} "
+            f"artifact_hdf5_s={artifact_hdf5_seconds:.3f} "
+            f"artifact_hdf5_open_s={stats.artifact_hdf5_open_seconds:.3f} "
+            f"artifact_hdf5_inner_s={stats.artifact_hdf5_inner_seconds:.3f} "
+            f"artifact_hdf5_asterisms_s={stats.artifact_hdf5_asterisms_seconds:.3f} "
+            f"artifact_hdf5_close_s={stats.artifact_hdf5_close_seconds:.3f} "
+            f"artifact_replace_s={stats.artifact_replace_seconds:.3f} "
+            f"artifact_mib={artifact_mib:.1f} "
+            f"artifact_inner_input_mib={artifact_inner_input_mib:.1f} "
+            f"artifact_asterism_input_mib={artifact_asterism_input_mib:.1f} "
+            f"artifact_inner_structured_mib={artifact_inner_structured_mib:.1f} "
+            f"artifact_asterism_structured_mib={artifact_asterism_structured_mib:.1f} "
+            f"artifact_inner_rows={stats.artifact_inner_rows} "
+            f"artifact_asterism_rows={stats.artifact_asterism_rows} "
+            f"search_star_rows={structure_stats.search_star_rows} "
+            f"ngs_rows={structure_stats.ngs_rows} "
+            f"close_pair_rows={structure_stats.close_pair_rows} "
+            f"self_pair_rows={structure_stats.self_pair_rows} "
+            f"raw_asterism_rows={structure_stats.raw_asterism_rows} "
+            f"dedupe_key_rows={structure_stats.dedupe_key_rows} "
+            f"post_bright_asterism_rows={structure_stats.post_bright_asterism_rows} "
+            f"post_overlap_asterism_rows={structure_stats.post_overlap_asterism_rows} "
+            f"local_asterism_rows={structure_stats.local_asterism_rows} "
+            f"context_pair_rows={structure_stats.context_pair_rows} "
+            f"winner_rows={structure_stats.winner_rows} "
+            f"winner_payload_rows={structure_stats.winner_payload_rows} "
+            f"search_star_rows_peak={structure_stats.search_star_rows_peak} "
+            f"ngs_rows_peak={structure_stats.ngs_rows_peak} "
+            f"close_pair_rows_peak={structure_stats.close_pair_rows_peak} "
+            f"context_pair_rows_peak={structure_stats.context_pair_rows_peak} "
+            f"raw_asterism_rows_peak={structure_stats.raw_asterism_rows_peak} "
+            f"local_asterism_rows_peak={structure_stats.local_asterism_rows_peak} "
+            f"winner_payload_rows_peak={structure_stats.winner_payload_rows_peak} "
+            f"peak_rss_mb={stats.peak_rss_mb:.1f} "
+            f"cache_hits={cache_stats.hits} "
+            f"cache_misses={cache_stats.misses} "
+            f"cache_evictions={cache_stats.evictions} "
+            f"cache_oversized_skips={cache_stats.oversized_skips} "
+            f"cache_entries={cache_stats.entries} "
+            f"cache_mb={cache_mb:.1f} "
+            f"cache_peak_mb={peak_cache_mb:.1f} "
+            f"gaia_load_s={cache_stats.load_seconds:.3f} "
+            f"gaia_raw_load_s={cache_stats.raw_load_seconds:.3f} "
+            f"gaia_prepare_s={cache_stats.prepare_seconds:.3f}",
+        )
+        return False
+
+    if message.kind == "memory_sample":
+        if message.memory_sample is None:
+            raise BuildError("Regional worker memory_sample message is missing sample")
+        if diagnostics_writer is not None:
+            diagnostics_writer.write(message.memory_sample)
+        return False
+
+    if message.kind == "worker_memory_sample":
+        if message.worker_memory_sample is None:
+            raise BuildError("Regional worker worker_memory_sample message is missing sample")
+        if diagnostics_writer is not None:
+            diagnostics_writer.write_worker(message.worker_memory_sample)
+        return False
+
+    if message.kind == "memory_limit":
+        message_text = (
+            message.error_message
+            or f"worker {message.worker_id} exceeded memory limit"
+        )
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={message.worker_id} "
+            f"memory_limit: {message_text}",
+        )
+        raise BuildError(message_text)
 
     if message.kind == "done":
         return False
@@ -556,6 +1977,9 @@ def _run_regional_traversal_workers(
     state: np.ndarray,
     plans: tuple[TraversalWorkerPlan, ...],
     execution_config: TraversalExecutionConfig,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
+    diagnostics_writer: _TraversalDiagnosticsWriter | None = None,
 ) -> bool:
     """Run long-lived region-owned Traversal workers."""
 
@@ -570,6 +1994,7 @@ def _run_regional_traversal_workers(
         plan.worker_id: {"completed": 0, "failed": 0} for plan in plans
     }
     failed = False
+    last_parent_memory_check = 0.0
 
     for plan in plans:
         append_build_log(
@@ -589,6 +2014,10 @@ def _run_regional_traversal_workers(
 
     try:
         while active_worker_ids:
+            now = time.perf_counter()
+            if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                _raise_if_parent_memory_limit_exceeded(execution_config, processes)
+                last_parent_memory_check = now
             try:
                 message = result_queue.get(timeout=0.1)
             except Empty:
@@ -606,7 +2035,14 @@ def _run_regional_traversal_workers(
                 state=state,
                 message=message,
                 progress=progress,
+                telemetry=telemetry,
+                state_writer=state_writer,
+                diagnostics_writer=diagnostics_writer,
             ) or failed
+            now = time.perf_counter()
+            if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                _raise_if_parent_memory_limit_exceeded(execution_config, processes)
+                last_parent_memory_check = now
             if message.kind == "done":
                 active_worker_ids.discard(message.worker_id)
                 worker_progress = progress[message.worker_id]
@@ -635,6 +2071,9 @@ def _run_in_process_traversal_worker(
     state: np.ndarray,
     plan: TraversalWorkerPlan,
     execution_config: TraversalExecutionConfig,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
+    diagnostics_writer: _TraversalDiagnosticsWriter | None = None,
 ) -> bool:
     """Run one long-lived Traversal worker in the parent process."""
 
@@ -655,11 +2094,15 @@ def _run_in_process_traversal_worker(
         plan,
         execution_config,
     ):
+        _raise_if_parent_memory_limit_exceeded(execution_config)
         failed = _handle_regional_worker_message(
             build_path=build_path,
             state=state,
             message=message,
             progress=progress,
+            telemetry=telemetry,
+            state_writer=state_writer,
+            diagnostics_writer=diagnostics_writer,
         ) or failed
         if message.kind == "done":
             worker_progress = progress[message.worker_id]
@@ -694,16 +2137,38 @@ def _run_traversal_phase(
         build_path=build_path,
         definition=definition,
         roots=roots,
-        legacy_config_path=load_legacy_config_path(build_path),
+        runtime_config_path=load_runtime_config_path(build_path),
     )
     star_counts = _load_gaia_star_counts(
         gaia_root=roots.gaia_root,
         gaia_release=definition.gaia_release,
         outer_level=definition.outer_level,
     )
+    runtime = load_runtime_config(context.runtime_config_path, model_root=roots.model_root)
+    coarse_density_skips = coarse_density_skip_outer_pixs(runtime, star_counts)
+    context = TraversalTaskContext(
+        build_path=build_path,
+        definition=definition,
+        roots=roots,
+        runtime_config_path=context.runtime_config_path,
+        coarse_density_skip_outer_pixs=coarse_density_skips,
+    )
 
-    repaired = _repair_stale_running_rows(build_path, status_field=status_field)
     state = load_state(build_path)
+    state_telemetry = _StateUpdateTelemetry()
+    state_writer = _BufferedStateWriter(
+        build_path=build_path,
+        state=state,
+        telemetry=state_telemetry,
+    )
+    repaired = _repair_stale_running_rows(
+        build_path,
+        state,
+        status_field=status_field,
+        telemetry=state_telemetry,
+        state_writer=state_writer,
+    )
+    state_writer.flush()
     set_build_status(build_path, BUILD_STATUS_RUNNING)
     append_build_log(
         build_path,
@@ -711,17 +2176,20 @@ def _run_traversal_phase(
         f"phase={current_phase} "
         f"repaired_stale_running={repaired} "
         f"workers={execution_config.workers} "
-        f"region_level={execution_config.region_level} "
+        f"derived_region_level={execution_config.region_level} "
         f"gaia_cache_entries={execution_config.gaia_cache_entries} "
-        f"gaia_cache_mb={execution_config.gaia_cache_mb}",
-    )
-
-    scheduler = OuterPixelScheduler(
-        outer_level=definition.outer_level,
-        status_field=status_field,
-        star_counts=star_counts,
+        f"gaia_cache_mb={execution_config.gaia_cache_mb} "
+        f"worker_memory_limit_mb={execution_config.worker_memory_limit_mb} "
+        f"parent_memory_limit_mb={execution_config.parent_memory_limit_mb} "
+        f"telemetry={execution_config.telemetry} "
+        f"coarse_density_skipped={len(coarse_density_skips)}",
     )
     failed = False
+    diagnostics_writer = (
+        _TraversalDiagnosticsWriter(build_path)
+        if execution_config.telemetry == "detailed"
+        else None
+    )
 
     if execution_config.workers == 1:
         try:
@@ -740,16 +2208,25 @@ def _run_traversal_phase(
                     state=state,
                     plan=plans[0],
                     execution_config=execution_config,
+                    telemetry=state_telemetry,
+                    state_writer=state_writer,
+                    diagnostics_writer=diagnostics_writer,
                 ) or failed
         except Exception as exc:
+            if diagnostics_writer is not None:
+                diagnostics_writer.close()
             reset_running = _reset_running_rows(
                 build_path,
                 state,
                 status_field=status_field,
                 error_field=error_field,
+                telemetry=state_telemetry,
+                state_writer=state_writer,
             )
+            state_writer.flush()
             set_build_status(build_path, BUILD_STATUS_FAILED)
             append_build_log(build_path, f"phase=traversal infrastructure failed: {exc}")
+            _append_state_update_telemetry(build_path, state_telemetry)
             append_build_log(
                 build_path,
                 "run complete "
@@ -758,7 +2235,7 @@ def _run_traversal_phase(
                 f"reset_running={reset_running}",
             )
             raise
-    elif _gaia_cache_enabled(execution_config):
+    else:
         try:
             plans = build_regional_worker_plans(
                 state=state,
@@ -774,102 +2251,25 @@ def _run_traversal_phase(
                 state=state,
                 plans=plans,
                 execution_config=execution_config,
+                telemetry=state_telemetry,
+                state_writer=state_writer,
+                diagnostics_writer=diagnostics_writer,
             ) or failed
         except Exception as exc:
+            if diagnostics_writer is not None:
+                diagnostics_writer.close()
             reset_running = _reset_running_rows(
                 build_path,
                 state,
                 status_field=status_field,
                 error_field=error_field,
+                telemetry=state_telemetry,
+                state_writer=state_writer,
             )
+            state_writer.flush()
             set_build_status(build_path, BUILD_STATUS_FAILED)
             append_build_log(build_path, f"phase=traversal infrastructure failed: {exc}")
-            append_build_log(
-                build_path,
-                "run complete "
-                "phase=traversal "
-                "status=failed "
-                f"reset_running={reset_running}",
-            )
-            raise
-    else:
-        executor = None
-        try:
-            executor = _create_traversal_executor(execution_config.workers)
-            active: dict[Future[TraversalTaskResult], int] = {}
-            completed_successes = 0
-            _dispatch_parallel_outer_pixel(
-                build_path=build_path,
-                context=context,
-                state=state,
-                scheduler=scheduler,
-                executor=executor,
-                workers=execution_config.workers,
-                active=active,
-                dispatch_after_outer_pix=None,
-            )
-
-            while active:
-                completed, _ = wait(active, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    outer_pix = active.pop(future)
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        result = TraversalTaskResult(
-                            outer_pix=outer_pix,
-                            success=False,
-                            error_message=str(exc),
-                        )
-
-                    _record_traversal_result(build_path, state, result)
-                    if result.success:
-                        completed_successes += 1
-                        if completed_successes % TRAVERSAL_PROGRESS_LOG_INTERVAL == 0:
-                            append_build_log(
-                                build_path,
-                                "phase=traversal "
-                                f"progress completed={completed_successes} "
-                                f"last_outer_pix={result.outer_pix}",
-                            )
-                        dispatch_after_outer_pix: int | None = result.outer_pix
-                    else:
-                        failed = True
-                        append_build_log(
-                            build_path,
-                            f"phase=traversal outer_pix={result.outer_pix} failed: {result.error_message}",
-                        )
-                        dispatch_after_outer_pix = None
-
-                    _dispatch_parallel_outer_pixel(
-                        build_path=build_path,
-                        context=context,
-                        state=state,
-                        scheduler=scheduler,
-                        executor=executor,
-                        workers=execution_config.workers,
-                        active=active,
-                        dispatch_after_outer_pix=dispatch_after_outer_pix,
-                    )
-            executor.shutdown(wait=True, kill_workers=True)
-            executor = None
-        except Exception as exc:
-            if executor is not None:
-                try:
-                    executor.shutdown(wait=False, kill_workers=True)
-                except Exception as shutdown_exc:
-                    append_build_log(
-                        build_path,
-                        f"phase=traversal executor shutdown failed: {shutdown_exc}",
-                    )
-            reset_running = _reset_running_rows(
-                build_path,
-                state,
-                status_field=status_field,
-                error_field=error_field,
-            )
-            set_build_status(build_path, BUILD_STATUS_FAILED)
-            append_build_log(build_path, f"phase=traversal infrastructure failed: {exc}")
+            _append_state_update_telemetry(build_path, state_telemetry)
             append_build_log(
                 build_path,
                 "run complete "
@@ -879,6 +2279,7 @@ def _run_traversal_phase(
             )
             raise
 
+    state_writer.flush()
     phase_counts = {
         "pending": int(np.count_nonzero(state[status_field] == WORK_STATUS_PENDING)),
         "running": int(np.count_nonzero(state[status_field] == WORK_STATUS_RUNNING)),
@@ -887,6 +2288,10 @@ def _run_traversal_phase(
     }
     final_status = BUILD_STATUS_FAILED if failed or phase_counts["failed"] else BUILD_STATUS_RUNNING
     set_build_status(build_path, final_status)
+    if diagnostics_writer is not None:
+        diagnostics_writer.flush()
+        diagnostics_writer.close()
+    _append_state_update_telemetry(build_path, state_telemetry)
     append_build_log(
         build_path,
         "run complete "
@@ -958,11 +2363,13 @@ def _run_augmentation_phase(build_path: Path) -> None:
 def run_build(
     build_path: Path,
     *,
-    workers: int | None = 1,
+    workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
-    region_level: int | None = None,
-    aosky_conf: Path | None = None,
+    worker_memory_limit_mb: int | None = None,
+    parent_memory_limit_mb: int | None = None,
+    telemetry: str | None = None,
+    aosky_yaml: Path | None = None,
 ) -> Path:
     """Run all unfinished build work through the implemented phases."""
 
@@ -990,8 +2397,10 @@ def run_build(
             workers=workers,
             gaia_cache_entries=gaia_cache_entries,
             gaia_cache_mb=gaia_cache_mb,
-            region_level=region_level,
-            aosky_conf=aosky_conf,
+            worker_memory_limit_mb=worker_memory_limit_mb,
+            parent_memory_limit_mb=parent_memory_limit_mb,
+            telemetry=telemetry,
+            aosky_yaml=aosky_yaml,
         )
         traversal_complete, _ = _run_traversal_phase(
             build_path,
@@ -1015,33 +2424,35 @@ def run_build(
 
 def restart_build(
     *,
-    ao_system_short_name: str,
-    config_short_name: str,
+    lineage_name: str,
     build_root: Path | None,
-    aosky_conf: Path | None = None,
-    workers: int | None = 1,
+    aosky_yaml: Path | None = None,
+    workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
-    region_level: int | None = None,
+    worker_memory_limit_mb: int | None = None,
+    parent_memory_limit_mb: int | None = None,
+    telemetry: str | None = None,
 ) -> Path:
     """Restart the latest build in one lineage."""
 
     resolved_build_root = resolve_build_root_only(
         build_root=build_root,
-        aosky_conf=aosky_conf,
+        aosky_yaml=aosky_yaml,
     )
     build_path = latest_build_path(
         resolved_build_root,
-        ao_system_short_name=ao_system_short_name,
-        config_short_name=config_short_name,
+        lineage_name=lineage_name,
     )
     return run_build(
         build_path,
         workers=workers,
         gaia_cache_entries=gaia_cache_entries,
         gaia_cache_mb=gaia_cache_mb,
-        region_level=region_level,
-        aosky_conf=aosky_conf,
+        worker_memory_limit_mb=worker_memory_limit_mb,
+        parent_memory_limit_mb=parent_memory_limit_mb,
+        telemetry=telemetry,
+        aosky_yaml=aosky_yaml,
     )
 
 

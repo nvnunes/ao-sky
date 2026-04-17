@@ -4,7 +4,9 @@ from ._exceptions import DustError
 from .gaia_tge import (
     add_gaia_a0_to_inner,
     fetch_gaia_tge_dataset,
+    gaia_tge_a0_cache_filename,
     gaia_tge_map_filename,
+    prepare_gaia_tge_a0_cache,
     sample_gaia_a0_for_outer_pixel,
 )
 
@@ -12,6 +14,8 @@ __all__ = [
     "DustError",
     "add_gaia_a0_to_inner",
     "fetch_gaia_tge_dataset",
+    "gaia_tge_a0_cache_filename",
     "gaia_tge_map_filename",
+    "prepare_gaia_tge_a0_cache",
     "sample_gaia_a0_for_outer_pixel",
 ]

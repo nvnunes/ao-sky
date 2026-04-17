@@ -16,14 +16,11 @@ from ._constants import (
     BUILD_FILENAME,
     BUILD_LAYOUT_VERSION,
     BUILD_LOG_FILENAME,
-    BUILD_PHASE_AGGREGATION,
-    BUILD_PHASE_AUGMENTATION,
     BUILD_PHASE_GAIA_LOADING,
     BUILD_PHASE_TRAVERSAL,
-    BUILD_STATUS_COMPLETED,
-    BUILD_STATUS_FAILED,
     BUILD_STATUS_INITIALIZED,
     MAPS_FILENAME_TEMPLATE,
+    RUNTIME_CONFIG_FILENAME,
     STATE_DTYPE,
     WORK_STATUS_DONE,
     WORK_STATUS_FAILED,
@@ -83,22 +80,32 @@ def _serialize_survey_extent_overlays(definition: BuildDefinition) -> str:
     return yaml.safe_dump(payload, sort_keys=False)
 
 
+def _build_relative_or_resolved_path(build_path: Path, path: Path) -> str:
+    resolved_build_path = Path(build_path).resolve()
+    resolved_path = Path(path).expanduser().resolve()
+    try:
+        return resolved_path.relative_to(resolved_build_path).as_posix()
+    except ValueError:
+        return str(resolved_path)
+
+
+def _resolve_build_metadata_path(build_path: Path, value: object) -> Path:
+    path = Path(str(_decode_bytes(value))).expanduser()
+    if path.is_absolute():
+        return path
+    return (Path(build_path).resolve() / path).resolve()
+
+
 def build_root_name(definition: BuildDefinition, version: int) -> str:
     """Return the canonical folder name for one build version."""
 
-    return (
-        f"{definition.ao_system_short_name}-"
-        f"{definition.config_short_name}-v{int(version)}"
-    )
+    return f"v{int(version)}"
 
 
 def next_lineage_version(build_root: Path, definition: BuildDefinition) -> int:
     """Return the next free version number for one build lineage."""
 
-    pattern = re.compile(
-        rf"^{re.escape(definition.ao_system_short_name)}-"
-        rf"{re.escape(definition.config_short_name)}-v(?P<version>\d+)$"
-    )
+    pattern = re.compile(r"^v(?P<version>\d+)$")
     max_version = 0
     if build_root.is_dir():
         for child in build_root.iterdir():
@@ -108,13 +115,10 @@ def next_lineage_version(build_root: Path, definition: BuildDefinition) -> int:
     return max_version + 1
 
 
-def latest_build_path(build_root: Path, ao_system_short_name: str, config_short_name: str) -> Path:
+def latest_build_path(build_root: Path, lineage_name: str) -> Path:
     """Return the latest build directory for one lineage."""
 
-    pattern = re.compile(
-        rf"^{re.escape(ao_system_short_name)}-"
-        rf"{re.escape(config_short_name)}-v(?P<version>\d+)$"
-    )
+    pattern = re.compile(r"^v(?P<version>\d+)$")
     candidates: list[tuple[int, Path]] = []
     if build_root.is_dir():
         for child in build_root.iterdir():
@@ -122,9 +126,7 @@ def latest_build_path(build_root: Path, ao_system_short_name: str, config_short_
             if match is not None:
                 candidates.append((int(match.group("version")), child))
     if not candidates:
-        raise BuildError(
-            f"No builds found for lineage {ao_system_short_name}-{config_short_name}"
-        )
+        raise BuildError(f"No builds found under {build_root} for lineage {lineage_name}")
     return max(candidates, key=lambda item: item[0])[1]
 
 
@@ -155,7 +157,7 @@ def create_build_root(
     definition: BuildDefinition,
     definition_yaml: str,
     roots: BuildPaths,
-    legacy_config_path: Path,
+    runtime_config_source_path: Path,
 ) -> Path:
     """Create a new build root with initialized metadata and state."""
 
@@ -184,22 +186,18 @@ def create_build_root(
         config_group = metadata_group.create_group("config")
         normalized = {
             "build_name": build_path.name,
-            "ao_system_short_name": definition.ao_system_short_name,
-            "config_short_name": definition.config_short_name,
+            "lineage_name": definition.lineage_name,
             "lineage_version": version,
-            "epoch": definition.epoch,
             "gaia_release": definition.gaia_release,
             "gaia_root": str(roots.gaia_root),
             "build_root": str(roots.build_root),
             "dust_root": str(roots.dust_root),
             "model_root": str(roots.model_root),
-            "legacy_config_path": str(Path(legacy_config_path).resolve()),
+            "runtime_config_path": str((build_path / RUNTIME_CONFIG_FILENAME).resolve()),
+            "runtime_config_source_path": str(Path(runtime_config_source_path).resolve()),
             "outer_level": definition.outer_level,
             "inner_level": definition.inner_level,
             "max_data_level": definition.max_data_level,
-            "min_galactic_latitude": (
-                "" if definition.min_galactic_latitude is None else definition.min_galactic_latitude
-            ),
             "survey_extent_overlays_yaml": _serialize_survey_extent_overlays(definition),
             "layout_version": BUILD_LAYOUT_VERSION,
             "build_status": BUILD_STATUS_INITIALIZED,
@@ -227,18 +225,11 @@ def load_build_definition(build_path: Path) -> BuildDefinition:
         except SurveyError as exc:
             raise BuildError(str(exc)) from exc
         return BuildDefinition(
-            ao_system_short_name=str(_decode_bytes(config_group["ao_system_short_name"][()])),
-            config_short_name=str(_decode_bytes(config_group["config_short_name"][()])),
+            lineage_name=str(_decode_bytes(config_group["lineage_name"][()])),
             gaia_release=str(_decode_bytes(config_group["gaia_release"][()])),
             outer_level=int(config_group["outer_level"][()]),
             inner_level=int(config_group["inner_level"][()]),
             max_data_level=int(config_group["max_data_level"][()]),
-            epoch=float(config_group["epoch"][()]),
-            min_galactic_latitude=(
-                None
-                if str(_decode_bytes(config_group["min_galactic_latitude"][()])) == ""
-                else float(config_group["min_galactic_latitude"][()])
-            ),
             survey_extent_overlays=overlays,
         )
 
@@ -251,25 +242,82 @@ def load_build_roots(build_path: Path) -> BuildPaths:
         return BuildPaths(
             gaia_root=Path(str(_decode_bytes(config_group["gaia_root"][()]))),
             build_root=Path(str(_decode_bytes(config_group["build_root"][()]))),
-            dust_root=Path(str(_decode_bytes(config_group["dust_root"][()]))),
-            model_root=Path(str(_decode_bytes(config_group["model_root"][()]))),
+            dust_root=_resolve_build_metadata_path(
+                build_path,
+                config_group["dust_root"][()],
+            ),
+            model_root=_resolve_build_metadata_path(
+                build_path,
+                config_group["model_root"][()],
+            ),
         )
 
 
 def set_model_root(build_path: Path, model_root: Path) -> None:
     """Update the persisted model root for one build."""
 
-    resolved = Path(model_root).expanduser().resolve()
+    persisted = _build_relative_or_resolved_path(build_path, Path(model_root))
     with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
         dataset = handle["metadata"]["config"]["model_root"]
-        dataset[()] = np.asarray(str(resolved), dtype=h5py.string_dtype("utf-8"))
+        dataset[()] = np.asarray(persisted, dtype=h5py.string_dtype("utf-8"))
 
 
-def load_legacy_config_path(build_path: Path) -> Path:
-    """Load the persisted legacy-config path for one build."""
+def set_dust_root(build_path: Path, dust_root: Path) -> None:
+    """Update the persisted dust root for one build."""
+
+    persisted = _build_relative_or_resolved_path(build_path, Path(dust_root))
+    with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
+        dataset = handle["metadata"]["config"]["dust_root"]
+        dataset[()] = np.asarray(persisted, dtype=h5py.string_dtype("utf-8"))
+
+
+def load_survey_extent_overlay_sources(build_path: Path) -> tuple:
+    """Load persisted survey overlays without resolving relative MOC paths."""
 
     with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
-        value = handle["metadata"]["config"]["legacy_config_path"][()]
+        config_group = handle["metadata"]["config"]
+        overlays_yaml = str(_decode_bytes(config_group["survey_extent_overlays_yaml"][()]))
+    try:
+        return normalize_survey_extent_overlays(
+            yaml.safe_load(overlays_yaml) or [],
+            base_dir=build_path,
+            resolve_paths=False,
+        )
+    except SurveyError as exc:
+        raise BuildError(str(exc)) from exc
+
+
+def set_survey_extent_overlays(build_path: Path, overlays: tuple) -> None:
+    """Update persisted survey overlay metadata for one build."""
+
+    definition = load_build_definition(build_path)
+    updated = BuildDefinition(
+        lineage_name=definition.lineage_name,
+        gaia_release=definition.gaia_release,
+        outer_level=definition.outer_level,
+        inner_level=definition.inner_level,
+        max_data_level=definition.max_data_level,
+        survey_extent_overlays=overlays,
+    )
+    serialized = _serialize_survey_extent_overlays(updated)
+    with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
+        dataset = handle["metadata"]["config"]["survey_extent_overlays_yaml"]
+        dataset[()] = np.asarray(serialized, dtype=h5py.string_dtype("utf-8"))
+
+
+def load_runtime_config_path(build_path: Path) -> Path:
+    """Load the persisted native runtime-config path for one build."""
+
+    with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
+        value = handle["metadata"]["config"]["runtime_config_path"][()]
+        return Path(str(_decode_bytes(value)))
+
+
+def load_runtime_config_source_path(build_path: Path) -> Path:
+    """Load the source path used to create the native runtime config."""
+
+    with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
+        value = handle["metadata"]["config"]["runtime_config_source_path"][()]
         return Path(str(_decode_bytes(value)))
 
 
@@ -298,6 +346,20 @@ def update_state_row(build_path: Path, outer_pix: int, **updates: object) -> Non
             else:
                 row[key] = value
         dataset[int(outer_pix)] = row
+
+
+def write_state_rows(
+    build_path: Path,
+    row_indexes: np.ndarray,
+    state: np.ndarray,
+) -> None:
+    """Write selected rows from the in-memory outer-pixel state table."""
+
+    if len(row_indexes) == 0:
+        return
+    with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
+        dataset = handle["state"]["outer_pixels"]
+        dataset[row_indexes] = state[row_indexes]
 
 
 def set_build_status(build_path: Path, status: str) -> None:
@@ -368,25 +430,3 @@ def summarize_build(build_path: Path) -> dict[str, object]:
         "current_phase": current_phase,
         "phase_counts": phase_counts,
     }
-
-
-def refresh_build_status(build_path: Path) -> str:
-    """Derive and persist the current build-level status from outer-pixel rows."""
-
-    state = load_state(build_path)
-    current_phase = load_current_phase(build_path)
-    fields = phase_state_fields(current_phase)
-    if fields is None:
-        if current_phase in (BUILD_PHASE_AGGREGATION, BUILD_PHASE_AUGMENTATION):
-            with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
-                value = handle["metadata"]["config"]["build_status"][()]
-            return str(_decode_bytes(value))
-        raise BuildError(f"Unknown build phase {current_phase!r}")
-
-    status_field, _, _ = fields
-    if np.any(state[status_field] == WORK_STATUS_FAILED):
-        status = BUILD_STATUS_FAILED
-    else:
-        status = BUILD_STATUS_INITIALIZED
-    set_build_status(build_path, status)
-    return status

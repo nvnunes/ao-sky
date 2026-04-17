@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future
 import io
 import json
 from pathlib import Path
 from gzip import open as gzip_open
 
 import h5py
+import astropy.units as u
 import numpy as np
 import pytest
 import yaml
@@ -17,9 +17,7 @@ from mocpy import MOC
 
 from ao_sky.build import (
     check_runtime_roots,
-    fetch_dust_data,
     fetch_gaia_data,
-    fetch_model_data,
     init_build as real_init_build,
     restart_build,
     run_build,
@@ -46,7 +44,6 @@ from ao_sky.build._constants import (
 from ao_sky.build._exceptions import BuildError
 from ao_sky.build.config import (
     load_build_definition as load_build_definition_yaml,
-    resolve_dust_root_only,
     resolve_gaia_root_only,
     resolve_runtime_root_candidates,
     resolve_traversal_execution_config,
@@ -54,6 +51,8 @@ from ao_sky.build.config import (
 from ao_sky.build.control import (
     load_build_definition,
     load_build_roots,
+    load_runtime_config_path,
+    load_runtime_config_source_path,
     load_state,
     maps_artifact_filename,
     outer_artifact_filename,
@@ -61,79 +60,27 @@ from ao_sky.build.control import (
     summarize_build,
     update_state_row,
 )
+from ao_sky.build.runtime_config import load_runtime_config, runtime_to_config, write_runtime_config
+from ao_sky.build.model_snapshot import fetch_model_data
+from ao_sky.build.survey_snapshot import fetch_survey_data
 from ao_sky.build.scheduler import OuterPixelScheduler
 from ao_sky.build.regional import build_regional_worker_plans, order_region_outer_pixs
-from ao_sky.build.artifacts import write_outer_artifact
-from ao_sky.build._models import TraversalExecutionConfig, TraversalTaskResult
-from ao_sky.gaia import CachedGaiaHealpixStore, GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore
+from ao_sky.build.artifacts import (
+    DEFAULT_ARTIFACT_BLOSC_LEVEL,
+    HDF5_BLOSC_FILTER_ID,
+    write_outer_artifact,
+    write_outer_artifact_profiled,
+)
+from ao_sky.build._models import BuildDefinition, TraversalExecutionConfig, TraversalTaskResult
+from ao_sky.build.traversal import coarse_density_skip_outer_pixs
+from ao_sky.dust import gaia_tge_a0_cache_filename, prepare_gaia_tge_a0_cache
+from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
+from ao_sky.predict import AOSystemRuntime, PredictRuntime
 
 
-class _ImmediateExecutor:
-    def __init__(self, workers: int) -> None:
-        self.workers = workers
-        self.submitted: list[int] = []
-
-    def __enter__(self) -> "_ImmediateExecutor":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        return None
-
-    def shutdown(self, *, wait: bool = True, kill_workers: bool = False) -> None:
-        return None
-
-    def submit(self, fn, context, outer_pix: int) -> Future:
-        self.submitted.append(int(outer_pix))
-        future: Future = Future()
-        try:
-            future.set_result(fn(context, outer_pix))
-        except Exception as exc:
-            future.set_exception(exc)
-        return future
-
-
-class _FailingSubmitExecutor:
-    def __init__(self) -> None:
-        self.shutdown_calls: list[tuple[bool, bool]] = []
-
-    def shutdown(self, *, wait: bool = True, kill_workers: bool = False) -> None:
-        self.shutdown_calls.append((wait, kill_workers))
-
-    def submit(self, fn, context, outer_pix: int) -> Future:
-        raise RuntimeError("pool submit broke")
-
-
-class _FakeGaiaStore:
-    def __init__(self) -> None:
-        self.config = GaiaStoreConfig(root="data", release="dr3", healpix_level=0)
-        self.loads: list[int] = []
-        self.tables: dict[int, Table] = {}
-
-    def healpix_filename(self, outer_pix: int) -> Path:
-        return Path(f"{outer_pix}/gaia.h5")
-
-    def load_healpix(
-        self,
-        outer_pix: int,
-        *,
-        force_reload: bool = False,
-        read_only: bool = False,
-    ) -> Table:
-        self.loads.append(int(outer_pix))
-        table = self.tables.get(int(outer_pix))
-        if table is not None:
-            result = table.copy(copy_data=True)
-            if read_only:
-                for name in result.colnames:
-                    result[name].flags.writeable = False
-            return result
-        result = Table()
-        result["source_id"] = np.arange(int(outer_pix) + 1, dtype=np.int64)
-        result["ra"] = np.zeros(int(outer_pix) + 1, dtype=np.float64)
-        if read_only:
-            for name in result.colnames:
-                result[name].flags.writeable = False
-        return result
+@pytest.fixture(autouse=True)
+def _disable_runner_model_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ao_sky.build.runner.warm_model_cache", lambda runtime: None)
 
 
 def _write_build_definition(
@@ -141,49 +88,95 @@ def _write_build_definition(
     *,
     outer_level: int = 0,
     inner_level: int = 1,
-    min_galactic_latitude: float | None = None,
     max_data_level: int = 1,
-    survey_extent_overlays: list[dict[str, object]] | None = None,
+    survey_overlays: list[dict[str, object]] | None = None,
 ) -> Path:
     payload: dict[str, object] = {
-        "ao_system_short_name": "GNAO",
-        "config_short_name": "baseline",
-        "gaia_release": "dr3",
-        "outer_level": outer_level,
-        "inner_level": inner_level,
-        "max_data_level": max_data_level,
-        "epoch": 2028.0,
+        "schema_version": 1,
+        "build": {},
+        "ao_system": {
+            "band": "R",
+            "fov_arcsec": 120.0,
+            "lgs": [],
+            "min_wfs": 2,
+            "max_wfs": 3,
+            "min_mag": 8.0,
+            "max_mag": 18.5,
+            "min_sep_arcsec": 5.0,
+        },
+        "prediction": {
+            "wavelength_micron": 1.654,
+            "resolved_models": {
+                "2star": "point_two",
+                "3star": "point_three",
+            },
+            "averaged_models": {
+                "2star": "mean_two",
+                "3star": "mean_three",
+            },
+        },
+        "traversal": {
+            "outer_level": outer_level,
+            "inner_level": inner_level,
+        },
+        "gaia": {
+            "release": "dr3",
+            "epoch": 2028.0,
+            "min_galactic_latitude_deg": None,
+            "max_star_density": 6.0,
+            "max_bright_star_mag": 8.0,
+        },
+        "maps": {"max_level": max_data_level},
+        "asterism": {"max_overlap": 0.66},
+        "best": {
+            "seeing_baseline": {
+                "wavelength_micron": 0.5,
+                "sr": 0.0,
+                "ee": 0.02,
+                "fwhm_mas": 650.0,
+            },
+        },
+        "coverage": {
+            "resolved_ee_threshold": 0.4,
+            "averaged_ee_threshold": 0.3,
+        },
     }
-    if min_galactic_latitude is not None:
-        payload["min_galactic_latitude"] = min_galactic_latitude
-    if survey_extent_overlays is not None:
-        payload["survey_extent_overlays"] = survey_extent_overlays
+    if survey_overlays is not None:
+        payload["survey_overlays"] = survey_overlays
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return path
 
 
-def _write_legacy_config(path: Path) -> Path:
-    path.write_text(
-        """
+def _write_legacy_config(
+    path: Path,
+    *,
+    min_galactic_latitude: float | None = None,
+) -> Path:
+    text = """
 ao_systems:
   - name: GNAO
     band: R
     fov: 120.0
-    fov_1ngs: 60.0
     min_wfs: 2
     max_wfs: 3
     min_mag: 8.0
-    nom_mag: 16.0
     max_mag: 18.5
     min_sep: 5.0
-    max_sep: 120.0
+    point_models:
+      2star: point_two
+      3star: point_three
+    models:
+      2star: mean_two
+      3star: mean_three
 asterisms_max_star_density: 6.0
 asterisms_max_bright_star_mag: 8.0
 asterisms_max_overlap: 0.66
+coverage_ee_threshold_resolved: 0.4
+coverage_ee_threshold_mean: 0.3
 """.strip()
-        + "\n",
-        encoding="utf-8",
-    )
+    if min_galactic_latitude is not None:
+        text += f"\nasterisms_min_galactic_latitude: {float(min_galactic_latitude)}"
+    path.write_text(text + "\n", encoding="utf-8")
     return path
 
 
@@ -194,14 +187,11 @@ ao_systems:
   - name: GNAO
     band: R
     fov: 120.0
-    fov_1ngs: 60.0
     min_wfs: 2
     max_wfs: 3
     min_mag: 8.0
-    nom_mag: 16.0
     max_mag: 18.5
     min_sep: 5.0
-    max_sep: 120.0
     point_models:
       2star: point_two
       3star: shared_three
@@ -211,6 +201,8 @@ ao_systems:
 asterisms_max_star_density: 6.0
 asterisms_max_bright_star_mag: 8.0
 asterisms_max_overlap: 0.66
+coverage_ee_threshold_resolved: 0.4
+coverage_ee_threshold_mean: 0.3
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -218,19 +210,87 @@ asterisms_max_overlap: 0.66
     return path
 
 
+def load_native_runtime(
+    definition: BuildDefinition,
+    *,
+    legacy_config_path: Path,
+    model_root: Path,
+) -> PredictRuntime:
+    with Path(legacy_config_path).open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    system = raw["ao_systems"][0]
+    ao_system = AOSystemRuntime(
+        band=str(system["band"]),
+        fov=float(system["fov"]) * u.arcsec,
+        lgs=(),
+        min_wfs=int(system["min_wfs"]),
+        max_wfs=int(system["max_wfs"]),
+        min_mag=float(system["min_mag"]),
+        max_mag=float(system["max_mag"]),
+        min_sep=float(system["min_sep"]) * u.arcsec,
+    )
+    return PredictRuntime(
+        ao_system=ao_system,
+        outer_level=definition.outer_level,
+        inner_level=definition.inner_level,
+        epoch=float(raw.get("asterism_epoch", 2028.0)),
+        min_galactic_latitude=(
+            None
+            if raw.get("asterisms_min_galactic_latitude") is None
+            else float(raw["asterisms_min_galactic_latitude"])
+        ),
+        max_star_density=float(raw.get("asterisms_max_star_density", 2.0)),
+        max_bright_star_mag=(
+            None
+            if raw.get("asterisms_max_bright_star_mag") is None
+            else float(raw["asterisms_max_bright_star_mag"])
+        ),
+        max_overlap=(
+            None
+            if raw.get("asterisms_max_overlap") is None
+            else float(raw["asterisms_max_overlap"])
+        ),
+        prediction_wavelength=1.654 * u.micron,
+        resolved_models={
+            str(key): str(value)
+            for key, value in (system.get("point_models") or {}).items()
+        },
+        averaged_models={
+            str(key): str(value)
+            for key, value in (system.get("models") or {}).items()
+        },
+        seeing_reference_wavelength=0.5 * u.micron,
+        seeing_reference_sr=0.0,
+        seeing_reference_ee=0.02,
+        seeing_reference_fwhm=650.0,
+        coverage_ee_threshold_resolved=float(
+            raw.get("coverage_ee_threshold_resolved", 0.25)
+        ),
+        coverage_ee_threshold_averaged=float(raw.get("coverage_ee_threshold_mean", 0.25)),
+        model_root=Path(model_root).resolve(),
+    )
+
+
 def _write_model_bundle(
     model_root: Path,
     model_name: str,
     *,
-    include_data: bool = True,
     payload: bytes | None = None,
 ) -> None:
     model_root.mkdir(parents=True, exist_ok=True)
     content = payload if payload is not None else model_name.encode("utf-8")
     (model_root / f"{model_name}.pt").write_bytes(content + b":pt")
     (model_root / f"{model_name}_metadata.pkl").write_bytes(content + b":metadata")
-    if include_data:
-        (model_root / f"{model_name}_data.pkl").write_bytes(content + b":data")
+
+
+def _write_required_model_files(model_root: Path, model_name: str) -> None:
+    model_root.mkdir(parents=True, exist_ok=True)
+    pt_file = model_root / f"{model_name}.pt"
+    metadata_file = model_root / f"{model_name}_metadata.pkl"
+    if not pt_file.exists():
+        pt_file.write_bytes(model_name.encode("utf-8") + b":pt")
+    if not metadata_file.exists():
+        metadata_file.write_bytes(model_name.encode("utf-8") + b":metadata")
 
 
 def _write_gaia_summary(
@@ -265,15 +325,38 @@ def init_build(
     dust_root: Path | None,
     legacy_config_path: Path,
     model_root: Path | None = None,
-    aosky_conf: Path | None = None,
+    survey_root: Path | None = None,
+    aosky_yaml: Path | None = None,
+    ensure_model_files: bool = True,
 ) -> Path:
     definition, _ = load_build_definition_yaml(definition_filename)
+    effective_model_root = model_root or Path(legacy_config_path).parent / "models"
+    runtime = load_native_runtime(
+        definition,
+        legacy_config_path=legacy_config_path,
+        model_root=effective_model_root,
+    )
+    if ensure_model_files:
+        for model_name in set(runtime.resolved_models.values()) | set(
+            runtime.averaged_models.values()
+        ):
+            _write_required_model_files(effective_model_root, model_name)
+    build_config = yaml.safe_load(Path(definition_filename).read_text(encoding="utf-8"))
+    payload = runtime_to_config(runtime)
+    payload["build"] = {**payload.get("build", {}), **build_config.get("build", {})}
+    payload["gaia"]["release"] = build_config["gaia"]["release"]
+    payload["maps"] = build_config["maps"]
+    if "survey_overlays" in build_config:
+        payload["survey_overlays"] = build_config["survey_overlays"]
+    Path(definition_filename).write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
     resolved_roots = resolve_runtime_root_candidates(
         gaia_root=gaia_root,
         build_root=build_root,
-        dust_root=dust_root,
-        model_root=model_root,
-        aosky_conf=aosky_conf,
+        model_root=effective_model_root,
+        aosky_yaml=aosky_yaml,
     )
     resolved_gaia_root = resolved_roots["gaia_root"]
     if resolved_gaia_root is not None:
@@ -282,18 +365,29 @@ def init_build(
             release=definition.gaia_release,
             outer_level=definition.outer_level,
         )
+        _write_gaia_tge_map(
+            resolved_gaia_root,
+            [
+                (healpix_id, definition.max_data_level, healpix_id + 0.5)
+                for healpix_id in range(12 * (4 ** definition.max_data_level))
+            ],
+        )
     return real_init_build(
-        definition_filename=definition_filename,
+        config_filename=definition_filename,
         gaia_root=gaia_root,
         build_root=build_root,
-        dust_root=dust_root,
-        legacy_config_path=legacy_config_path,
-        model_root=model_root,
-        aosky_conf=aosky_conf,
+        model_root=effective_model_root,
+        survey_root=survey_root,
+        aosky_yaml=aosky_yaml,
     )
 
 
-def _init_model_snapshot_build(tmp_path: Path, model_root: Path | None = None) -> Path:
+def _init_model_snapshot_build(
+    tmp_path: Path,
+    model_root: Path | None = None,
+    *,
+    ensure_model_files: bool = True,
+) -> Path:
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config_with_models(tmp_path / "legacy.yaml")
     return init_build(
@@ -303,6 +397,7 @@ def _init_model_snapshot_build(tmp_path: Path, model_root: Path | None = None) -
         dust_root=tmp_path / "dust",
         model_root=model_root or tmp_path / "source-models",
         legacy_config_path=legacy,
+        ensure_model_files=ensure_model_files,
     )
 
 
@@ -483,7 +578,7 @@ def _make_asterisms(*, empty: bool = False) -> Table:
 
 
 def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
-    definition = _write_build_definition(tmp_path / "build.yaml", min_galactic_latitude=90.0)
+    definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
         definition_filename=definition,
@@ -493,9 +588,10 @@ def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
         legacy_config_path=legacy,
     )
 
-    assert build_path.name == "GNAO-baseline-v1"
+    assert build_path.name == "v1"
     assert (build_path / BUILD_FILENAME).is_file()
     assert (build_path / "build.log").is_file()
+    assert (build_path / "build.yaml").is_file()
     assert (build_path / "hpx0-1").is_dir()
 
     state = load_state(build_path)
@@ -509,17 +605,30 @@ def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
     assert summary["build_status"] == "initialized"
     assert summary["current_phase"] == BUILD_PHASE_TRAVERSAL
 
+    runtime_config_path = load_runtime_config_path(build_path)
+    runtime = load_runtime_config(
+        runtime_config_path,
+        model_root=load_build_roots(build_path).model_root,
+    )
+    runtime_payload = yaml.safe_load(runtime_config_path.read_text(encoding="utf-8"))
+    assert runtime_config_path == (build_path / "build.yaml").resolve()
+    assert load_runtime_config_source_path(build_path) == definition.resolve()
+    assert "source" not in runtime_payload
+    assert "build" not in runtime_payload
+    assert runtime.ao_system.band == "R"
+    assert runtime.max_star_density == pytest.approx(6.0)
 
-def test_init_build_uses_aosky_conf_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_init_build_uses_ao_sky_yaml_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     project_root = tmp_path / "project"
     project_root.mkdir()
-    (project_root / "aosky.conf").write_text(
+    (project_root / "ao-sky.yaml").write_text(
         (
-            f"gaia_root: {tmp_path / 'gaia'}\n"
-            f"build_root: {tmp_path / 'builds'}\n"
-            f"dust_root: {tmp_path / 'dust'}\n"
+            "build:\n"
+            "  roots:\n"
+            f"    gaia: {tmp_path / 'gaia'}\n"
         ),
         encoding="utf-8",
     )
@@ -533,33 +642,18 @@ def test_init_build_uses_aosky_conf_roots(tmp_path: Path, monkeypatch: pytest.Mo
         legacy_config_path=legacy,
     )
 
-    assert build_path.parent == (tmp_path / "builds").resolve()
+    assert build_path.parent == project_root.resolve()
+    roots = load_build_roots(build_path)
+    assert roots.dust_root == (build_path / "dust").resolve()
+    assert gaia_tge_a0_cache_filename(roots.dust_root, 1).is_file()
 
 
-def test_resolve_dust_root_only_uses_aosky_conf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    project_root = tmp_path / "project"
-    project_root.mkdir()
-    expected = tmp_path / "dust"
-    (project_root / "aosky.conf").write_text(
-        f"dust_root: {expected}\n",
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(project_root)
-
-    assert resolve_dust_root_only(dust_root=None) == expected.resolve()
-
-
-def test_resolve_dust_root_only_requires_cli_or_conf(tmp_path: Path) -> None:
-    with pytest.raises(BuildError, match="dust_root must be provided"):
-        resolve_dust_root_only(dust_root=None, cwd=tmp_path)
-
-
-def test_resolve_gaia_root_only_uses_aosky_conf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_gaia_root_only_uses_ao_sky_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project_root = tmp_path / "project"
     project_root.mkdir()
     expected = tmp_path / "gaia"
-    (project_root / "aosky.conf").write_text(
-        f"gaia_root: {expected}\n",
+    (project_root / "ao-sky.yaml").write_text(
+        f"build:\n  roots:\n    gaia: {expected}\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(project_root)
@@ -575,17 +669,15 @@ def test_resolve_gaia_root_only_requires_cli_or_conf(tmp_path: Path) -> None:
 def test_check_runtime_roots_reports_ok_and_missing(tmp_path: Path) -> None:
     gaia_root = tmp_path / "gaia"
     build_root = tmp_path / "builds"
-    dust_root = tmp_path / "dust"
     model_root = tmp_path / "models"
     gaia_root.mkdir()
     build_root.mkdir()
     model_root.mkdir()
-    _write_gaia_tge_map(dust_root, [(healpix_id, 1, 0.5) for healpix_id in range(48)])
+    _write_gaia_tge_map(gaia_root, [(healpix_id, 1, 0.5) for healpix_id in range(48)])
 
     ok, report = check_runtime_roots(
         gaia_root=gaia_root,
         build_root=build_root,
-        dust_root=dust_root,
         model_root=model_root,
     )
 
@@ -593,62 +685,54 @@ def test_check_runtime_roots_reports_ok_and_missing(tmp_path: Path) -> None:
     assert report.splitlines() == [
         f"gaia_root: OK {gaia_root.resolve()}",
         f"build_root: OK {build_root.resolve()}",
-        f"dust_root: OK {dust_root.resolve()}",
+        f"dust_root: OK {gaia_root.resolve()}",
         f"model_root: OK {model_root.resolve()}",
     ]
 
+    missing_gaia_root = tmp_path / "missing-gaia"
     ok, report = check_runtime_roots(
-        gaia_root=gaia_root,
+        gaia_root=missing_gaia_root,
         build_root=build_root,
-        dust_root=tmp_path / "missing-dust",
         model_root=None,
     )
 
     assert not ok
-    assert f"dust_root: MISSING {(tmp_path / 'missing-dust').resolve()}" in report
+    assert f"gaia_root: MISSING {missing_gaia_root.resolve()}" in report
+    assert f"dust_root: MISSING {missing_gaia_root.resolve()}" in report
     assert "model_root: MISSING <unset>" in report
 
     empty_dust_root = tmp_path / "empty-dust"
     empty_dust_root.mkdir()
     ok, report = check_runtime_roots(
-        gaia_root=gaia_root,
+        gaia_root=empty_dust_root,
         build_root=build_root,
-        dust_root=empty_dust_root,
         model_root=model_root,
     )
     assert not ok
     assert f"dust_root: MISSING {empty_dust_root.resolve()}" in report
 
-
-def test_fetch_dust_data_resolves_dust_root_from_aosky_conf(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_root = tmp_path / "project"
-    project_root.mkdir()
-    expected = tmp_path / "dust" / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
-    (project_root / "aosky.conf").write_text(
-        f"dust_root: {tmp_path / 'dust'}\n",
-        encoding="utf-8",
+    file_root = tmp_path / "not-a-directory"
+    file_root.write_text("not a root\n", encoding="utf-8")
+    ok, report = check_runtime_roots(
+        gaia_root=file_root,
+        build_root=build_root,
+        model_root=model_root,
     )
-    monkeypatch.chdir(project_root)
-    monkeypatch.setattr(
-        "ao_sky.build.environment.fetch_gaia_tge_dataset",
-        lambda dust_root: expected.resolve(),
-    )
-
-    assert fetch_dust_data(dust_root=None) == expected.resolve()
+    assert not ok
+    assert f"gaia_root: MISSING {file_root.resolve()}" in report
 
 
-def test_fetch_gaia_data_resolves_gaia_root_from_aosky_conf(
+def test_fetch_gaia_data_resolves_gaia_root_from_ao_sky_yaml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project_root = tmp_path / "project"
     project_root.mkdir()
     expected = tmp_path / "gaia" / "gaia-dr3-hpx0" / "summary.h5"
-    (project_root / "aosky.conf").write_text(
-        f"gaia_root: {tmp_path / 'gaia'}\n",
+    (project_root / "ao-sky.yaml").write_text(
+        "build:\n"
+        "  roots:\n"
+        f"    gaia: {tmp_path / 'gaia'}\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(project_root)
@@ -656,8 +740,19 @@ def test_fetch_gaia_data_resolves_gaia_root_from_aosky_conf(
         "ao_sky.build.environment.fetch_gaia_store",
         lambda config, force_reload=False, output=None: expected.resolve(),
     )
+    monkeypatch.setattr(
+        "ao_sky.build.environment.fetch_gaia_tge_dataset",
+        lambda dust_root: tmp_path / "gaia" / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz",
+    )
 
-    assert fetch_gaia_data(gaia_root=None, gaia_release="dr3", outer_level=0) == expected.resolve()
+    assert (
+        fetch_gaia_data(
+            gaia_root=None,
+            gaia_release="dr3",
+            outer_level=0,
+        )
+        == expected.resolve()
+    )
 
 
 def test_fetch_gaia_data_propagates_force_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -672,6 +767,10 @@ def test_fetch_gaia_data_propagates_force_flag(tmp_path: Path, monkeypatch: pyte
         return tmp_path / "gaia" / "gaia-dr3-hpx0" / "summary.h5"
 
     monkeypatch.setattr("ao_sky.build.environment.fetch_gaia_store", fake_fetch)
+    monkeypatch.setattr(
+        "ao_sky.build.environment.fetch_gaia_tge_dataset",
+        lambda dust_root: tmp_path / "gaia" / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz",
+    )
 
     output = io.StringIO()
 
@@ -692,44 +791,51 @@ def test_fetch_gaia_data_propagates_force_flag(tmp_path: Path, monkeypatch: pyte
     }
 
 
-def test_resolve_traversal_execution_config_uses_defaults_and_aosky_conf(
+def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
     tmp_path: Path,
 ) -> None:
-    conf = tmp_path / "aosky.conf"
+    conf = tmp_path / "ao-sky.yaml"
     conf.write_text(
         "\n".join(
             (
-                "workers: 5",
+                "build:",
+                "  workers: 5",
+                "  worker_memory_limit_mb: 8192",
+                "  parent_memory_limit_mb: 12288",
                 "gaia_cache_entries: 128",
                 "gaia_cache_mb: 4096",
-                "region_level: 3",
             )
         )
         + "\n",
         encoding="utf-8",
     )
 
-    config = resolve_traversal_execution_config(outer_level=6, aosky_conf=conf)
+    config = resolve_traversal_execution_config(outer_level=6, aosky_yaml=conf)
 
     assert config == TraversalExecutionConfig(
         workers=5,
         gaia_cache_entries=128,
         gaia_cache_mb=4096,
         region_level=3,
+        worker_memory_limit_mb=8192,
+        parent_memory_limit_mb=12288,
     )
     override = resolve_traversal_execution_config(
         outer_level=6,
         workers=3,
         gaia_cache_entries=64,
         gaia_cache_mb=2048,
-        region_level=4,
-        aosky_conf=conf,
+        worker_memory_limit_mb=4096,
+        parent_memory_limit_mb=8192,
+        aosky_yaml=conf,
     )
     assert override == TraversalExecutionConfig(
         workers=3,
         gaia_cache_entries=64,
         gaia_cache_mb=2048,
         region_level=4,
+        worker_memory_limit_mb=4096,
+        parent_memory_limit_mb=8192,
     )
 
 
@@ -738,77 +844,12 @@ def test_resolve_traversal_execution_config_validates_values() -> None:
         resolve_traversal_execution_config(outer_level=2, workers=0)
     with pytest.raises(BuildError, match="gaia_cache_entries must be non-negative"):
         resolve_traversal_execution_config(outer_level=2, gaia_cache_entries=-1)
-    with pytest.raises(BuildError, match="region_level must be between 0 and outer_level"):
-        resolve_traversal_execution_config(outer_level=2, region_level=3)
-
-
-def test_cached_gaia_store_hits_misses_and_read_only_reuse() -> None:
-    store = _FakeGaiaStore()
-    cached = CachedGaiaHealpixStore(store, max_entries=4, max_bytes=1024 * 1024)
-
-    first = cached.load_healpix(1)
-    second = cached.load_healpix(1)
-    mutable = cached.load_healpix(1, read_only=False)
-    mutable["ra"][0] = 99.0
-    third = cached.load_healpix(1)
-
-    assert store.loads == [1]
-    assert first is second
-    assert second is third
-    with pytest.raises(ValueError, match="read-only"):
-        first["ra"][0] = 99.0
-    assert float(third["ra"][0]) == 0.0
-    stats = cached.stats()
-    assert stats.hits == 3
-    assert stats.misses == 1
-    assert stats.evictions == 0
-    assert stats.entries == 1
-
-
-def test_cached_gaia_store_force_reload_replaces_cached_table() -> None:
-    store = _FakeGaiaStore()
-    cached = CachedGaiaHealpixStore(store, max_entries=4, max_bytes=1024 * 1024)
-
-    first = cached.load_healpix(1)
-    updated = Table()
-    updated["source_id"] = np.array([42], dtype=np.int64)
-    updated["ra"] = np.array([42.0], dtype=np.float64)
-    store.tables[1] = updated
-    refreshed = cached.load_healpix(1, force_reload=True)
-    again = cached.load_healpix(1)
-
-    assert store.loads == [1, 1]
-    assert first is not refreshed
-    assert refreshed is again
-    assert float(again["ra"][0]) == pytest.approx(42.0)
-
-
-def test_cached_gaia_store_evicts_by_entries_and_bytes() -> None:
-    store = _FakeGaiaStore()
-    by_entries = CachedGaiaHealpixStore(store, max_entries=1, max_bytes=1024 * 1024)
-    by_entries.load_healpix(0)
-    by_entries.load_healpix(1)
-    by_entries.load_healpix(0)
-
-    assert store.loads == [0, 1, 0]
-    assert by_entries.stats().evictions == 2
-
-    byte_store = _FakeGaiaStore()
-    byte_limited = CachedGaiaHealpixStore(byte_store, max_entries=10, max_bytes=16)
-    byte_limited.load_healpix(2)
-    assert byte_limited.stats().entries == 0
-    assert byte_limited.stats().evictions == 1
-
-
-def test_cached_gaia_store_can_be_disabled() -> None:
-    store = _FakeGaiaStore()
-    cached = CachedGaiaHealpixStore(store, max_entries=0, max_bytes=1024)
-
-    cached.load_healpix(1)
-    cached.load_healpix(1)
-
-    assert store.loads == [1, 1]
-    assert cached.stats().entries == 0
+    with pytest.raises(BuildError, match="worker_memory_limit_mb must be non-negative"):
+        resolve_traversal_execution_config(outer_level=2, worker_memory_limit_mb=-1)
+    with pytest.raises(BuildError, match="parent_memory_limit_mb must be non-negative"):
+        resolve_traversal_execution_config(outer_level=2, parent_memory_limit_mb=-1)
+    with pytest.raises(BuildError, match="telemetry must be either"):
+        resolve_traversal_execution_config(outer_level=2, telemetry="verbose")
 
 
 def test_regional_worker_plans_balance_regions_by_star_count() -> None:
@@ -856,7 +897,8 @@ def test_fetch_model_data_copies_configured_model_bundle_and_updates_metadata(
 ) -> None:
     source_root = tmp_path / "source-models"
     _write_model_bundle(source_root, "point_two")
-    _write_model_bundle(source_root, "mean_two", include_data=False)
+    (source_root / "point_two_data.pkl").write_bytes(b"unused provenance")
+    _write_model_bundle(source_root, "mean_two")
     _write_model_bundle(source_root, "shared_three")
     build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
 
@@ -867,20 +909,19 @@ def test_fetch_model_data_copies_configured_model_bundle_and_updates_metadata(
     assert load_build_roots(build_path).model_root == destination_root
     assert (destination_root / "point_two.pt").is_file()
     assert (destination_root / "point_two_metadata.pkl").is_file()
-    assert (destination_root / "point_two_data.pkl").is_file()
+    assert not (destination_root / "point_two_data.pkl").exists()
     assert (destination_root / "mean_two.pt").is_file()
     assert (destination_root / "mean_two_metadata.pkl").is_file()
-    assert not (destination_root / "mean_two_data.pkl").exists()
     assert (destination_root / "shared_three.pt").is_file()
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 1
     assert manifest["source_model_root"] == str(source_root.resolve())
-    assert manifest["model_root"] == str(destination_root)
-    assert manifest["ao_system"] == "GNAO"
+    assert manifest["model_root"] == "models"
+    assert manifest["runtime_config_path"] == str(load_runtime_config_path(build_path))
     models = {item["name"]: item for item in manifest["models"]}
     assert set(models) == {"point_two", "mean_two", "shared_three"}
-    assert models["shared_three"]["roles"] == ["mean:3star", "point:3star"]
+    assert models["shared_three"]["roles"] == ["averaged:3star", "resolved:3star"]
     assert all(
         len(file_info["sha256"]) == 64
         for model_info in models.values()
@@ -888,7 +929,7 @@ def test_fetch_model_data_copies_configured_model_bundle_and_updates_metadata(
     )
 
 
-def test_fetch_model_data_uses_aosky_conf_model_root(
+def test_fetch_model_data_uses_ao_sky_yaml_model_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -899,8 +940,8 @@ def test_fetch_model_data_uses_aosky_conf_model_root(
     build_path = _init_model_snapshot_build(tmp_path, model_root=persisted_root)
     project_root = tmp_path / "project"
     project_root.mkdir()
-    (project_root / "aosky.conf").write_text(
-        f"model_root: {source_root}\n",
+    (project_root / "ao-sky.yaml").write_text(
+        f"build:\n  roots:\n    model: {source_root}\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(project_root)
@@ -918,12 +959,12 @@ def test_fetch_model_data_fails_when_required_model_file_is_missing(
     _write_model_bundle(source_root, "point_two")
     _write_model_bundle(source_root, "shared_three")
     (source_root / "mean_two.pt").write_bytes(b"missing metadata")
-    build_path = _init_model_snapshot_build(tmp_path, model_root=source_root)
-
     with pytest.raises(BuildError, match="Required model file is missing"):
-        fetch_model_data(build_path)
-
-    assert load_build_roots(build_path).model_root == source_root.resolve()
+        _init_model_snapshot_build(
+            tmp_path,
+            model_root=source_root,
+            ensure_model_files=False,
+        )
 
 
 def test_fetch_model_data_requires_force_for_differing_existing_files(
@@ -969,14 +1010,14 @@ def test_fetch_model_data_rejects_build_after_traversal_started(tmp_path: Path) 
     with pytest.raises(BuildError, match="before Traversal has started"):
         fetch_model_data(build_path)
 
-    assert not (build_path / "models").exists()
+    assert (build_path / "models" / "manifest.json").is_file()
 
 
 def test_run_build_uses_build_local_model_root_after_fetch_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ao_sky.build.legacy_config import load_native_runtime as real_load_native_runtime
+    from ao_sky.build.runtime_config import load_runtime_config as real_load_runtime_config
 
     source_root = tmp_path / "source-models"
     for model_name in ("point_two", "mean_two", "shared_three"):
@@ -985,15 +1026,14 @@ def test_run_build_uses_build_local_model_root_after_fetch_model(
     fetch_model_data(build_path)
     seen_model_roots: list[Path] = []
 
-    def capture_runtime(definition, *, legacy_config_path: Path, model_root: Path):
+    def capture_runtime(runtime_config_path: Path, *, model_root: Path):
         seen_model_roots.append(Path(model_root).resolve())
-        return real_load_native_runtime(
-            definition,
-            legacy_config_path=legacy_config_path,
+        return real_load_runtime_config(
+            runtime_config_path,
             model_root=model_root,
         )
 
-    monkeypatch.setattr("ao_sky.build.runner.load_native_runtime", capture_runtime)
+    monkeypatch.setattr("ao_sky.build.runner.load_runtime_config", capture_runtime)
     monkeypatch.setattr("ao_sky.build.runner.warm_model_cache", lambda runtime: None)
     monkeypatch.setattr(
         "ao_sky.build.runner.build_traversal_products",
@@ -1007,13 +1047,13 @@ def test_run_build_uses_build_local_model_root_after_fetch_model(
     assert set(seen_model_roots) == {(build_path / "models").resolve()}
 
 
-def test_load_build_definition_parses_overlay_specs_and_resolves_relative_paths(
+def test_load_build_definition_parses_overlay_specs_and_preserves_relative_paths(
     tmp_path: Path,
 ) -> None:
     moc = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1])
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[
+        survey_overlays=[
             {
                 "name": "EWS-Yr1",
                 "moc_files": [str(moc.relative_to(tmp_path))],
@@ -1026,7 +1066,115 @@ def test_load_build_definition_parses_overlay_specs_and_resolves_relative_paths(
     assert len(loaded.survey_extent_overlays) == 1
     overlay = loaded.survey_extent_overlays[0]
     assert overlay.name == "ews_yr1"
-    assert overlay.moc_files == (moc.resolve(),)
+    assert overlay.moc_files == (Path("mocs/ews.fits"),)
+
+
+def test_fetch_survey_data_copies_overlay_files_and_updates_metadata(
+    tmp_path: Path,
+) -> None:
+    survey_root = tmp_path / "source-surveys"
+    _write_moc(survey_root / "year1.fits", level=1, pixs=[1])
+    _write_moc(survey_root / "year2.fits", level=1, pixs=[2])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_overlays=[
+            {
+                "name": "EWS",
+                "moc_files": [
+                    "year1.fits",
+                    "year2.fits",
+                ],
+            }
+        ],
+    )
+    legacy = _write_legacy_config_with_models(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        model_root=tmp_path / "models",
+        survey_root=survey_root,
+        legacy_config_path=legacy,
+    )
+
+    manifest_path = fetch_survey_data(build_path, survey_root=survey_root)
+
+    assert manifest_path == build_path / "surveys" / "manifest.json"
+    assert (build_path / "surveys" / "year1.fits").is_file()
+    assert (build_path / "surveys" / "year2.fits").is_file()
+    loaded = load_build_definition(build_path)
+    assert loaded.survey_extent_overlays[0].moc_files == (
+        (build_path / "surveys" / "year1.fits").resolve(),
+        (build_path / "surveys" / "year2.fits").resolve(),
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_survey_root"] == str(survey_root.resolve())
+    assert manifest["survey_root"] == "surveys"
+    assert manifest["overlays"][0]["name"] == "ews"
+    assert manifest["overlays"][0]["files"][0]["path"] == "surveys/year1.fits"
+
+
+def test_fetch_survey_data_uses_ao_sky_yaml_survey_root(tmp_path: Path) -> None:
+    survey_root = tmp_path / "source-surveys"
+    _write_moc(survey_root / "ews.fits", level=1, pixs=[1])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_overlays=[
+            {"name": "ews", "moc_files": ["ews.fits"]},
+        ],
+    )
+    legacy = _write_legacy_config_with_models(tmp_path / "legacy.yaml")
+    conf = tmp_path / "ao-sky.yaml"
+    conf.write_text(f"build:\n  roots:\n    survey: {survey_root}\n", encoding="utf-8")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        model_root=tmp_path / "models",
+        legacy_config_path=legacy,
+        aosky_yaml=conf,
+    )
+
+    manifest_path = fetch_survey_data(build_path, aosky_yaml=conf)
+
+    assert manifest_path.is_file()
+    assert (build_path / "surveys" / "ews.fits").is_file()
+
+
+def test_fetch_survey_data_requires_force_for_differing_existing_files(
+    tmp_path: Path,
+) -> None:
+    survey_root = tmp_path / "source-surveys"
+    _write_moc(survey_root / "ews.fits", level=1, pixs=[1])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_overlays=[
+            {"name": "ews", "moc_files": ["ews.fits"]},
+        ],
+    )
+    legacy = _write_legacy_config_with_models(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        model_root=tmp_path / "models",
+        survey_root=survey_root,
+        legacy_config_path=legacy,
+    )
+    fetch_survey_data(build_path, survey_root=survey_root)
+    destination = build_path / "surveys" / "ews.fits"
+    original = destination.read_bytes()
+    destination.write_bytes(b"different")
+
+    with pytest.raises(BuildError, match="rerun with --force"):
+        fetch_survey_data(build_path, survey_root=survey_root)
+
+    assert destination.read_bytes() == b"different"
+    fetch_survey_data(build_path, survey_root=survey_root, force=True)
+    assert destination.read_bytes() == original
 
 
 def test_load_build_definition_rejects_duplicate_overlay_names(tmp_path: Path) -> None:
@@ -1034,7 +1182,7 @@ def test_load_build_definition_rejects_duplicate_overlay_names(tmp_path: Path) -
     moc_b = _write_moc(tmp_path / "mocs" / "b.fits", level=1, pixs=[2])
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[
+        survey_overlays=[
             {"name": "EWS-Yr1", "moc_files": [str(moc_a)]},
             {"name": "ews_yr1", "moc_files": [str(moc_b)]},
         ],
@@ -1047,7 +1195,7 @@ def test_load_build_definition_rejects_duplicate_overlay_names(tmp_path: Path) -
 def test_load_build_definition_requires_non_empty_overlay_paths(tmp_path: Path) -> None:
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[{"name": "ews", "moc_files": []}],
+        survey_overlays=[{"name": "ews", "moc_files": []}],
     )
 
     with pytest.raises(BuildError, match="moc_files must not be empty"):
@@ -1055,53 +1203,19 @@ def test_load_build_definition_requires_non_empty_overlay_paths(tmp_path: Path) 
 
 
 def test_load_build_definition_rejects_blank_gaia_release(tmp_path: Path) -> None:
-    definition = tmp_path / "build.yaml"
-    definition.write_text(
-        "\n".join(
-            (
-                "ao_system_short_name: GNAO",
-                "config_short_name: baseline",
-                "gaia_release: '   '",
-                "outer_level: 0",
-                "inner_level: 1",
-                "max_data_level: 1",
-                "epoch: 2028.0",
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    payload = yaml.safe_load(definition.read_text(encoding="utf-8"))
+    payload["gaia"]["release"] = "   "
+    definition.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(BuildError, match="gaia_release must be a non-empty string"):
-        load_build_definition_yaml(definition)
-
-
-def test_load_build_definition_rejects_non_finite_epoch(tmp_path: Path) -> None:
-    definition = tmp_path / "build.yaml"
-    definition.write_text(
-        "\n".join(
-            (
-                "ao_system_short_name: GNAO",
-                "config_short_name: baseline",
-                "gaia_release: dr3",
-                "outer_level: 0",
-                "inner_level: 1",
-                "max_data_level: 1",
-                "epoch: .nan",
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(BuildError, match="epoch must be a finite number"):
+    with pytest.raises(BuildError, match="gaia.release must be a non-empty string"):
         load_build_definition_yaml(definition)
 
 
 def test_load_build_definition_rejects_max_data_level_above_inner_level(tmp_path: Path) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml", max_data_level=2)
 
-    with pytest.raises(BuildError, match="max_data_level must be less than or equal to inner_level"):
+    with pytest.raises(BuildError, match="maps.max_level must be less than or equal to traversal.inner_level"):
         load_build_definition_yaml(definition)
 
 
@@ -1190,14 +1304,22 @@ def test_scheduler_does_not_retry_failed_pixel_in_same_run(
 def test_init_build_requires_matching_gaia_summary(tmp_path: Path) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    runtime = load_native_runtime(
+        load_build_definition_yaml(definition)[0],
+        legacy_config_path=legacy,
+        model_root=tmp_path / "models",
+    )
+    for model_name in set(runtime.resolved_models.values()) | set(
+        runtime.averaged_models.values()
+    ):
+        _write_required_model_files(tmp_path / "models", model_name)
 
     with pytest.raises(BuildError, match="fetch-gaia --gaia-release dr3 --outer-level 0"):
         real_init_build(
-            definition_filename=definition,
+            config_filename=definition,
             gaia_root=tmp_path / "gaia",
             build_root=tmp_path / "builds",
-            dust_root=tmp_path / "dust",
-            legacy_config_path=legacy,
+            model_root=tmp_path / "models",
         )
 
 
@@ -1295,12 +1417,17 @@ def test_run_build_uses_gaia_summary_star_counts_for_initial_seed(
     )
     visited: list[int] = []
 
-    def fake_materialize(context, outer_pix: int, **kwargs: object) -> None:
+    def fake_build(context, outer_pix: int, **kwargs: object):
         visited.append(int(outer_pix))
+        return tmp_path / f"outer-{outer_pix}.h5", Table({"pix": [outer_pix]}), Table()
 
     monkeypatch.setattr(
-        "ao_sky.build.runner._materialize_outer_pixel_products",
-        fake_materialize,
+        "ao_sky.build.runner._build_outer_pixel_products",
+        fake_build,
+    )
+    monkeypatch.setattr(
+        "ao_sky.build.runner._write_outer_pixel_products",
+        lambda filename, *, inner, asterisms: 0.0,
     )
     monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
 
@@ -1320,6 +1447,8 @@ def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_s
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from ao_sky.build import runner as runner_module
+
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -1329,25 +1458,59 @@ def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_s
         dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
-    executors: list[_ImmediateExecutor] = []
+    seen_workers: list[int] = []
+    seen_outer_pixs: list[int] = []
 
-    def fake_executor(workers: int) -> _ImmediateExecutor:
-        executor = _ImmediateExecutor(workers)
-        executors.append(executor)
-        return executor
+    def fake_regional_workers(
+        *,
+        build_path: Path,
+        context,
+        state,
+        plans,
+        execution_config,
+        telemetry,
+        state_writer,
+        **kwargs,
+    ) -> bool:
+        seen_workers.extend(plan.worker_id for plan in plans)
+        for plan in plans:
+            for outer_pix in plan.outer_pixs:
+                seen_outer_pixs.append(int(outer_pix))
+                runner_module._handle_regional_worker_message(
+                    build_path=build_path,
+                    state=state,
+                    message=runner_module.TraversalWorkerMessage(
+                        worker_id=plan.worker_id,
+                        kind="started",
+                        outer_pix=int(outer_pix),
+                    ),
+                    telemetry=telemetry,
+                    state_writer=state_writer,
+                )
+                runner_module._handle_regional_worker_message(
+                    build_path=build_path,
+                    state=state,
+                    message=runner_module.TraversalWorkerMessage(
+                        worker_id=plan.worker_id,
+                        kind="completed",
+                        result=TraversalTaskResult(outer_pix=int(outer_pix), success=True),
+                    ),
+                    telemetry=telemetry,
+                    state_writer=state_writer,
+                )
+        return False
 
-    def fake_task(context, outer_pix: int) -> TraversalTaskResult:
-        return TraversalTaskResult(outer_pix=int(outer_pix), success=True)
-
-    monkeypatch.setattr("ao_sky.build.runner._create_traversal_executor", fake_executor)
-    monkeypatch.setattr("ao_sky.build.runner._run_outer_pixel_traversal_task", fake_task)
+    monkeypatch.setattr(
+        "ao_sky.build.runner._run_regional_traversal_workers",
+        fake_regional_workers,
+    )
     monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
     monkeypatch.setattr("ao_sky.build.runner.TRAVERSAL_PROGRESS_LOG_INTERVAL", 5)
 
     run_build(build_path, workers=3, gaia_cache_entries=0)
 
-    assert executors[0].workers == 3
-    assert sorted(executors[0].submitted) == list(range(12))
+    assert seen_workers == [0]
+    assert sorted(seen_outer_pixs) == list(range(12))
     state = load_state(build_path)
     assert np.all(state["traversal_status"] == WORK_STATUS_DONE)
     assert np.all(np.asarray(state["traversal_attempt_count"], dtype=np.int64) == 1)
@@ -1356,15 +1519,66 @@ def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_s
     assert summary["current_phase"] == BUILD_PHASE_AGGREGATION
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
     assert "run start phase=traversal repaired_stale_running=0 workers=3" in log_text
-    assert "phase=traversal progress completed=5" in log_text
+    assert "phase=traversal progress completed=5" not in log_text
     assert "phase=traversal outer_pix=0 dispatched" not in log_text
     assert "phase=traversal outer_pix=0 completed" not in log_text
+
+
+def test_run_build_uses_ao_sky_yaml_execution_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    config = tmp_path / "ao-sky.yaml"
+    config.write_text(
+        "\n".join(
+            (
+                "build:",
+                "  workers: 5",
+                "  worker_memory_limit_mb: 2048",
+                "  parent_memory_limit_mb: 12288",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, TraversalExecutionConfig] = {}
+
+    def fake_run_traversal_phase(
+        build_path: Path,
+        *,
+        execution_config: TraversalExecutionConfig,
+    ) -> tuple[bool, dict[str, int]]:
+        captured["execution_config"] = execution_config
+        return False, {}
+
+    monkeypatch.setattr(
+        "ao_sky.build.runner._run_traversal_phase",
+        fake_run_traversal_phase,
+    )
+
+    run_build(build_path, aosky_yaml=config)
+
+    execution_config = captured["execution_config"]
+    assert execution_config.workers == 5
+    assert execution_config.worker_memory_limit_mb == 2048
+    assert execution_config.parent_memory_limit_mb == 12288
 
 
 def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from ao_sky.build import runner as runner_module
+
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -1378,17 +1592,57 @@ def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
     for outer_pix in range(3, len(state)):
         update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
 
+    def fake_regional_workers(
+        *,
+        build_path: Path,
+        context,
+        state,
+        plans,
+        execution_config,
+        telemetry,
+        state_writer,
+        **kwargs,
+    ) -> bool:
+        failed = False
+        for plan in plans:
+            for outer_pix in plan.outer_pixs:
+                runner_module._handle_regional_worker_message(
+                    build_path=build_path,
+                    state=state,
+                    message=runner_module.TraversalWorkerMessage(
+                        worker_id=plan.worker_id,
+                        kind="started",
+                        outer_pix=int(outer_pix),
+                    ),
+                    telemetry=telemetry,
+                    state_writer=state_writer,
+                )
+                result = (
+                    TraversalTaskResult(
+                        outer_pix=int(outer_pix),
+                        success=False,
+                        error_message="boom",
+                    )
+                    if int(outer_pix) == 0
+                    else TraversalTaskResult(outer_pix=int(outer_pix), success=True)
+                )
+                failed = runner_module._handle_regional_worker_message(
+                    build_path=build_path,
+                    state=state,
+                    message=runner_module.TraversalWorkerMessage(
+                        worker_id=plan.worker_id,
+                        kind="failed" if not result.success else "completed",
+                        result=result,
+                    ),
+                    telemetry=telemetry,
+                    state_writer=state_writer,
+                ) or failed
+        return failed
+
     monkeypatch.setattr(
-        "ao_sky.build.runner._create_traversal_executor",
-        lambda workers: _ImmediateExecutor(workers),
+        "ao_sky.build.runner._run_regional_traversal_workers",
+        fake_regional_workers,
     )
-
-    def fake_task(context, outer_pix: int) -> TraversalTaskResult:
-        if outer_pix == 0:
-            return TraversalTaskResult(outer_pix=outer_pix, success=False, error_message="boom")
-        return TraversalTaskResult(outer_pix=outer_pix, success=True)
-
-    monkeypatch.setattr("ao_sky.build.runner._run_outer_pixel_traversal_task", fake_task)
 
     run_build(build_path, workers=3, gaia_cache_entries=0)
 
@@ -1399,7 +1653,7 @@ def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
     summary = summarize_build(build_path)
     assert summary["build_status"] == "failed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "phase=traversal outer_pix=0 failed: boom" in log_text
+    assert "phase=traversal worker=0 outer_pix=0 failed: boom" in log_text
     assert "run complete phase=traversal status=failed" in log_text
 
 
@@ -1462,6 +1716,9 @@ def test_run_build_regional_cache_path_updates_parent_state(
         state: np.ndarray,
         plans,
         execution_config: TraversalExecutionConfig,
+        telemetry=None,
+        state_writer=None,
+        **kwargs,
     ) -> bool:
         seen_configs.append(execution_config)
         for plan in plans:
@@ -1474,6 +1731,8 @@ def test_run_build_regional_cache_path_updates_parent_state(
                         kind="started",
                         outer_pix=outer_pix,
                     ),
+                    telemetry=telemetry,
+                    state_writer=state_writer,
                 )
                 runner_module._handle_regional_worker_message(
                     build_path=build_path,
@@ -1484,6 +1743,8 @@ def test_run_build_regional_cache_path_updates_parent_state(
                         outer_pix=outer_pix,
                         result=TraversalTaskResult(outer_pix=outer_pix, success=True),
                     ),
+                    telemetry=telemetry,
+                    state_writer=state_writer,
                 )
         return False
 
@@ -1501,6 +1762,8 @@ def test_run_build_regional_cache_path_updates_parent_state(
             gaia_cache_entries=64,
             gaia_cache_mb=2048,
             region_level=0,
+            worker_memory_limit_mb=0,
+            parent_memory_limit_mb=0,
         )
     ]
     state = load_state(build_path)
@@ -1510,7 +1773,288 @@ def test_run_build_regional_cache_path_updates_parent_state(
     assert summarize_build(build_path)["build_status"] == "completed"
 
 
-def test_run_build_parallel_executor_creation_failure_marks_build_failed(
+def test_regional_worker_memory_limit_message_fails_infrastructure(
+    tmp_path: Path,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    state = load_state(build_path)
+
+    with pytest.raises(BuildError, match="worker peak RSS exceeded 4096 MiB"):
+        runner_module._handle_regional_worker_message(
+            build_path=build_path,
+            state=state,
+            message=runner_module.TraversalWorkerMessage(
+                worker_id=2,
+                kind="memory_limit",
+                error_message="worker peak RSS exceeded 4096 MiB",
+            ),
+        )
+
+    log_text = (build_path / "build.log").read_text(encoding="utf-8")
+    assert "worker=2 memory_limit: worker peak RSS exceeded 4096 MiB" in log_text
+
+
+def test_parent_memory_limit_uses_parent_plus_worker_current_rss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    class FakeProcess:
+        pid = 123
+
+    monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 4096.0)
+    monkeypatch.setattr(runner_module, "_process_current_rss_mb", lambda pid: 9000.0)
+
+    with pytest.raises(BuildError, match="parent memory limit exceeded"):
+        runner_module._raise_if_parent_memory_limit_exceeded(
+            TraversalExecutionConfig(parent_memory_limit_mb=12288),
+            [FakeProcess()],
+        )
+
+    runner_module._raise_if_parent_memory_limit_exceeded(
+        TraversalExecutionConfig(parent_memory_limit_mb=14000),
+        [FakeProcess()],
+    )
+
+
+def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    state = load_state(build_path)
+
+    runner_module._handle_regional_worker_message(
+        build_path=build_path,
+        state=state,
+        message=runner_module.TraversalWorkerMessage(
+            worker_id=1,
+            kind="profile",
+            worker_stats=runner_module.TraversalWorkerStats(
+                completed=2,
+                failed=0,
+                elapsed_seconds=5.0,
+                pixel_seconds=4.0,
+                artifact_write_seconds=0.5,
+                artifact_inner_input_bytes=2 * 1024 * 1024,
+                artifact_asterism_input_bytes=1024 * 1024,
+                artifact_inner_structured_bytes=3 * 1024 * 1024,
+                artifact_asterism_structured_bytes=4 * 1024 * 1024,
+                stage_stats=runner_module.TraversalStageStats(
+                    star_selection_seconds=0.1,
+                    candidate_generation_seconds=0.2,
+                    filtering_seconds=0.3,
+                    bright_star_filter_seconds=0.01,
+                    overlap_quality_seconds=0.02,
+                    overlap_geometry_seconds=0.03,
+                    inner_assignment_seconds=0.04,
+                    local_selection_seconds=0.05,
+                    inner_table_seconds=0.4,
+                    context_seconds=0.5,
+                    point_prediction_seconds=0.6,
+                    field_mean_prediction_seconds=0.7,
+                    coverage_seconds=0.8,
+                    dust_seconds=0.9,
+                    persisted_asterisms_seconds=1.0,
+                ),
+                structure_stats=runner_module.TraversalStructureStats(
+                    search_star_rows=11,
+                    ngs_rows=12,
+                    close_pair_rows=13,
+                    context_pair_rows=14,
+                    winner_payload_rows=15,
+                    close_pair_rows_peak=16,
+                    context_pair_rows_peak=17,
+                    winner_payload_rows_peak=18,
+                ),
+                cache_stats=runner_module.TraversalCacheStats(
+                    hits=1,
+                    misses=2,
+                    evictions=3,
+                    oversized_skips=4,
+                ),
+            ),
+        ),
+    )
+
+    log_text = (build_path / "build.log").read_text(encoding="utf-8")
+    assert "traversal_profiled_s=5.550" in log_text
+    assert "stage_star_selection_s=0.100" in log_text
+    assert "stage_filtering_s=0.300" in log_text
+    assert "stage_overlap_quality_s=0.020" in log_text
+    assert "stage_overlap_geometry_s=0.030" in log_text
+    assert "stage_local_selection_s=0.050" in log_text
+    assert "stage_point_prediction_s=0.600" in log_text
+    assert "stage_dust_s=0.900" in log_text
+    assert "artifact_write_s=0.500" in log_text
+    assert "avg_artifact_write_s=0.250" in log_text
+    assert "artifact_inner_input_mib=2.0" in log_text
+    assert "artifact_asterism_structured_mib=4.0" in log_text
+    assert "search_star_rows=11" in log_text
+    assert "close_pair_rows_peak=16" in log_text
+    assert "context_pair_rows_peak=17" in log_text
+    assert "winner_payload_rows_peak=18" in log_text
+    assert "cache_oversized_skips=4" in log_text
+
+
+def test_detailed_traversal_telemetry_writes_memory_diagnostics(tmp_path: Path) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    state = load_state(build_path)
+
+    with runner_module._TraversalDiagnosticsWriter(build_path) as writer:
+        runner_module._handle_regional_worker_message(
+            build_path=build_path,
+            state=state,
+            message=runner_module.TraversalWorkerMessage(
+                worker_id=2,
+                kind="memory_sample",
+                memory_sample=runner_module.TraversalMemorySample(
+                    outer_pix=7,
+                    worker_id=2,
+                    success=True,
+                    rss_start_mb=100.0,
+                    rss_after_context_mb=150.0,
+                    context_pair_rows=123,
+                    winner_payload_rows=45,
+                ),
+            ),
+            diagnostics_writer=writer,
+        )
+
+    diagnostics = build_path / "diagnostics" / "traversal-memory.csv"
+    text = diagnostics.read_text(encoding="utf-8")
+    assert "outer_pix,worker_id,success" in text
+    assert "7,2,1" in text
+    assert ",123,45," in text
+
+
+def test_state_update_telemetry_retries_hdf5_lock_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    calls = 0
+    real_update = runner_module.update_state_row
+
+    def flaky_update_state_row(build_path, outer_pix, **updates):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise BlockingIOError("unable to lock file, Resource temporarily unavailable")
+        return real_update(build_path, outer_pix, **updates)
+
+    monkeypatch.setattr(runner_module, "update_state_row", flaky_update_state_row)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: None)
+    telemetry = runner_module._StateUpdateTelemetry()
+
+    runner_module._mark_outer_pixel_running(build_path, load_state(build_path), 0, telemetry)
+
+    assert telemetry.updates == 1
+    assert telemetry.flushes == 1
+    assert telemetry.rows_written == 1
+    assert telemetry.lock_retries == 1
+    assert telemetry.lock_wait_seconds == pytest.approx(
+        runner_module.STATE_UPDATE_RETRY_DELAY_SECONDS
+    )
+
+
+def test_buffered_state_writer_coalesces_rows_before_flush(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    real_write_state_rows = runner_module.write_state_rows
+    flushed_rows: list[tuple[int, ...]] = []
+
+    def recording_write_state_rows(build_path, row_indexes, state):
+        flushed_rows.append(tuple(int(row) for row in row_indexes))
+        return real_write_state_rows(build_path, row_indexes, state)
+
+    monkeypatch.setattr(runner_module, "write_state_rows", recording_write_state_rows)
+    state = load_state(build_path)
+    telemetry = runner_module._StateUpdateTelemetry()
+    writer = runner_module._BufferedStateWriter(
+        build_path=build_path,
+        state=state,
+        telemetry=telemetry,
+        flush_interval=2,
+    )
+
+    writer.update(0, traversal_status=WORK_STATUS_RUNNING)
+    writer.update(0, traversal_status=WORK_STATUS_DONE)
+    assert flushed_rows == []
+    assert load_state(build_path)["traversal_status"][0] == WORK_STATUS_PENDING
+
+    writer.update(1, traversal_status=WORK_STATUS_RUNNING)
+
+    persisted = load_state(build_path)
+    assert flushed_rows == [(0, 1)]
+    assert persisted["traversal_status"][0] == WORK_STATUS_DONE
+    assert persisted["traversal_status"][1] == WORK_STATUS_RUNNING
+    assert telemetry.updates == 3
+    assert telemetry.flushes == 1
+    assert telemetry.rows_written == 2
+    assert telemetry.dirty_rows_peak == 2
+
+    writer.update(1, traversal_status=WORK_STATUS_DONE)
+    writer.flush()
+
+    persisted = load_state(build_path)
+    assert flushed_rows == [(0, 1), (1,)]
+    assert persisted["traversal_status"][1] == WORK_STATUS_DONE
+    assert telemetry.updates == 4
+    assert telemetry.flushes == 2
+    assert telemetry.rows_written == 3
+
+
+def test_run_build_regional_infrastructure_failure_marks_build_failed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1524,10 +2068,13 @@ def test_run_build_parallel_executor_creation_failure_marks_build_failed(
         legacy_config_path=legacy,
     )
 
-    def fail_create(workers: int):
+    def fail_regional_workers(**kwargs):
         raise RuntimeError("semaphore denied")
 
-    monkeypatch.setattr("ao_sky.build.runner._create_traversal_executor", fail_create)
+    monkeypatch.setattr(
+        "ao_sky.build.runner._run_regional_traversal_workers",
+        fail_regional_workers,
+    )
 
     with pytest.raises(RuntimeError, match="semaphore denied"):
         run_build(build_path, workers=3, gaia_cache_entries=0)
@@ -1541,10 +2088,12 @@ def test_run_build_parallel_executor_creation_failure_marks_build_failed(
     assert "run complete phase=traversal status=failed reset_running=0" in log_text
 
 
-def test_run_build_parallel_submit_failure_resets_running_rows(
+def test_run_build_regional_failure_resets_running_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from ao_sky.build import runner as runner_module
+
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -1557,16 +2106,39 @@ def test_run_build_parallel_submit_failure_resets_running_rows(
     state = load_state(build_path)
     for outer_pix in range(1, len(state)):
         update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
-    executor = _FailingSubmitExecutor()
+
+    def fail_after_start(
+        *,
+        build_path: Path,
+        context,
+        state,
+        plans,
+        execution_config,
+        telemetry,
+        state_writer,
+        **kwargs,
+    ) -> bool:
+        runner_module._handle_regional_worker_message(
+            build_path=build_path,
+            state=state,
+            message=runner_module.TraversalWorkerMessage(
+                worker_id=plans[0].worker_id,
+                kind="started",
+                outer_pix=0,
+            ),
+            telemetry=telemetry,
+            state_writer=state_writer,
+        )
+        raise RuntimeError("regional worker broke")
+
     monkeypatch.setattr(
-        "ao_sky.build.runner._create_traversal_executor",
-        lambda workers: executor,
+        "ao_sky.build.runner._run_regional_traversal_workers",
+        fail_after_start,
     )
 
-    with pytest.raises(RuntimeError, match="pool submit broke"):
+    with pytest.raises(RuntimeError, match="regional worker broke"):
         run_build(build_path, workers=3, gaia_cache_entries=0)
 
-    assert executor.shutdown_calls == [(False, True)]
     state = load_state(build_path)
     assert int(state["traversal_status"][0]) == WORK_STATUS_PENDING
     assert int(state["traversal_attempt_count"][0]) == 1
@@ -1574,7 +2146,7 @@ def test_run_build_parallel_submit_failure_resets_running_rows(
     summary = summarize_build(build_path)
     assert summary["build_status"] == "failed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "phase=traversal infrastructure failed: pool submit broke" in log_text
+    assert "phase=traversal infrastructure failed: regional worker broke" in log_text
     assert "run complete phase=traversal status=failed reset_running=1" in log_text
 
 
@@ -1616,8 +2188,8 @@ def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    definition = _write_build_definition(tmp_path / "build.yaml", min_galactic_latitude=90.0)
-    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml", min_galactic_latitude=90.0)
     build_path = init_build(
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
@@ -1647,13 +2219,125 @@ def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
         assert len(handle[OUTER_DATASET_ASTERISMS]) == 0
 
 
+def test_outer_artifact_compression_can_be_disabled_for_benchmarks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AO_SKY_ARTIFACT_COMPRESSION", "none")
+
+    profile = write_outer_artifact_profiled(
+        tmp_path / "outer.h5",
+        inner=_make_inner(),
+        asterisms=_make_asterisms(empty=True),
+    )
+
+    assert profile.output_bytes > 0
+    with h5py.File(tmp_path / "outer.h5", "r") as handle:
+        assert handle[OUTER_DATASET_INNER].compression is None
+        assert handle[OUTER_DATASET_ASTERISMS].compression is None
+
+
+def test_outer_artifact_uses_blosc_zstd_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AO_SKY_ARTIFACT_COMPRESSION", raising=False)
+
+    write_outer_artifact_profiled(
+        tmp_path / "outer.h5",
+        inner=_make_inner(),
+        asterisms=_make_asterisms(empty=True),
+    )
+
+    with h5py.File(tmp_path / "outer.h5", "r") as handle:
+        dataset = handle[OUTER_DATASET_INNER]
+        filter_id, _, filter_values, filter_name = dataset.id.get_create_plist().get_filter(0)
+        assert dataset.compression == "unknown"
+        assert filter_id == HDF5_BLOSC_FILTER_ID
+        assert filter_name == b"blosc"
+        assert filter_values[4] == DEFAULT_ARTIFACT_BLOSC_LEVEL
+        assert filter_values[5] == 1
+
+
+def test_coarse_density_skip_outer_pixs_uses_gaia_summary_density(
+    tmp_path: Path,
+) -> None:
+    definition = BuildDefinition(
+        lineage_name="test",
+        gaia_release="dr3",
+        outer_level=1,
+        inner_level=2,
+        max_data_level=2,
+    )
+    runtime = load_native_runtime(
+        definition,
+        legacy_config_path=_write_legacy_config(tmp_path / "legacy.yaml"),
+        model_root=tmp_path / "models",
+    )
+
+    star_counts = np.zeros(12 * (4 ** definition.outer_level), dtype=np.int64)
+    star_counts[3] = 10**9
+
+    assert coarse_density_skip_outer_pixs(runtime, star_counts) == frozenset({3})
+
+
+def test_run_build_passes_coarse_density_skip_to_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        outer_level=1,
+        inner_level=2,
+        max_data_level=2,
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    persisted_definition = load_build_definition(build_path)
+    star_counts = [0] * (12 * (4 ** persisted_definition.outer_level))
+    star_counts[0] = 10**9
+    _write_gaia_summary(
+        tmp_path / "gaia",
+        release=persisted_definition.gaia_release,
+        outer_level=persisted_definition.outer_level,
+        star_counts=star_counts,
+    )
+    state = load_state(build_path)
+    for outer_pix in range(1, len(state)):
+        update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
+
+    seen_skip_reasons: list[str | None] = []
+
+    def fake_build_traversal_products(store, runtime, outer_pix, **kwargs):
+        seen_skip_reasons.append(kwargs.get("asterism_skip_reason"))
+        return _make_asterisms(empty=True), _make_inner()
+
+    monkeypatch.setattr(
+        "ao_sky.build.runner.build_traversal_products",
+        fake_build_traversal_products,
+    )
+    monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
+
+    run_build(build_path, gaia_cache_entries=0)
+
+    assert seen_skip_reasons == ["coarse_outer_density"]
+    log_text = (build_path / "build.log").read_text(encoding="utf-8")
+    assert "coarse_density_skipped=1" in log_text
+
+
 def test_restart_build_uses_latest_lineage_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     build_root = tmp_path / "builds"
-    (build_root / "GNAO-baseline-v1").mkdir(parents=True)
-    latest = build_root / "GNAO-baseline-v2"
+    (build_root / "v1").mkdir(parents=True)
+    latest = build_root / "v2"
     latest.mkdir(parents=True)
 
     captured: dict[str, object] = {}
@@ -1661,24 +2345,27 @@ def test_restart_build_uses_latest_lineage_version(
     def fake_run_build(
         build_path: Path,
         *,
-        workers: int | None = 1,
+        workers: int | None = None,
         gaia_cache_entries: int | None = None,
         gaia_cache_mb: int | None = None,
-        region_level: int | None = None,
-        aosky_conf: Path | None = None,
+        worker_memory_limit_mb: int | None = None,
+        parent_memory_limit_mb: int | None = None,
+        telemetry: str | None = None,
+        aosky_yaml: Path | None = None,
     ) -> Path:
         captured["workers"] = workers
         captured["gaia_cache_entries"] = gaia_cache_entries
         captured["gaia_cache_mb"] = gaia_cache_mb
-        captured["region_level"] = region_level
-        captured["aosky_conf"] = aosky_conf
+        captured["worker_memory_limit_mb"] = worker_memory_limit_mb
+        captured["parent_memory_limit_mb"] = parent_memory_limit_mb
+        captured["telemetry"] = telemetry
+        captured["aosky_yaml"] = aosky_yaml
         return build_path
 
     monkeypatch.setattr("ao_sky.build.runner.run_build", fake_run_build)
 
     restarted = restart_build(
-        ao_system_short_name="GNAO",
-        config_short_name="baseline",
+        lineage_name="baseline",
         build_root=build_root,
         workers=3,
     )
@@ -1688,8 +2375,10 @@ def test_restart_build_uses_latest_lineage_version(
         "workers": 3,
         "gaia_cache_entries": None,
         "gaia_cache_mb": None,
-        "region_level": None,
-        "aosky_conf": None,
+        "worker_memory_limit_mb": None,
+        "parent_memory_limit_mb": None,
+        "telemetry": None,
+        "aosky_yaml": None,
     }
 
 
@@ -1780,7 +2469,7 @@ def test_run_build_continues_after_failure_and_marks_build_failed(
         outer_pix: int,
         **kwargs: object,
     ) -> tuple[Table, Table]:
-        assert kwargs["dust_root"] == tmp_path / "dust"
+        assert kwargs["dust_root"] == (build_path / "dust").resolve()
         assert kwargs["max_data_level"] == 1
         if outer_pix == 0:
             raise RuntimeError("boom")
@@ -1814,7 +2503,7 @@ def test_run_build_auto_advances_to_aggregation_and_writes_maps(
         legacy_config_path=legacy,
     )
     _write_gaia_tge_map(
-        tmp_path / "dust",
+        tmp_path / "gaia",
         [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
     )
 
@@ -1857,7 +2546,7 @@ def test_run_build_auto_advances_to_augmentation_when_overlays_exist(
     overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1, 3])
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
+        survey_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
     )
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -1868,7 +2557,7 @@ def test_run_build_auto_advances_to_augmentation_when_overlays_exist(
         legacy_config_path=legacy,
     )
     _write_gaia_tge_map(
-        tmp_path / "dust",
+        tmp_path / "gaia",
         [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
     )
 
@@ -1918,7 +2607,7 @@ def test_run_build_restarts_from_aggregation_and_overwrites_maps(
         legacy_config_path=legacy,
     )
     _write_gaia_tge_map(
-        tmp_path / "dust",
+        tmp_path / "gaia",
         [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
     )
     for outer_pix in range(12):
@@ -1948,7 +2637,7 @@ def test_run_build_restarts_from_augmentation_and_overwrites_overlay_dataset(
     overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1, 3])
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
+        survey_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
     )
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -2015,7 +2704,7 @@ def test_run_build_marks_build_failed_when_augmentation_fails(
     overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1])
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
+        survey_overlays=[{"name": "ews", "moc_files": [str(overlay)]}],
     )
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -2079,9 +2768,10 @@ def test_show_build_omits_phase_counts_for_aggregation(tmp_path: Path) -> None:
 
 
 def test_show_build_omits_phase_counts_for_augmentation(tmp_path: Path) -> None:
+    overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1])
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[{"name": "ews", "moc_files": ["/tmp/ews.fits"]}],
+        survey_overlays=[{"name": "ews", "moc_files": [overlay.name]}],
     )
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -2089,6 +2779,7 @@ def test_show_build_omits_phase_counts_for_augmentation(tmp_path: Path) -> None:
         gaia_root=tmp_path / "gaia",
         build_root=tmp_path / "builds",
         dust_root=tmp_path / "dust",
+        survey_root=overlay.parent,
         legacy_config_path=legacy,
     )
     set_current_phase(build_path, BUILD_PHASE_AUGMENTATION)
@@ -2130,12 +2821,18 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Pat
         legacy_config_path=legacy,
     )
     _write_gaia_tge_map(
-        tmp_path / "dust",
+        tmp_path / "gaia",
         [
             (0, 1, 0.5),
             (1, 1, 1.5),
             (2, 1, 2.5),
         ],
+    )
+    prepare_gaia_tge_a0_cache(
+        source_dust_root=tmp_path / "gaia",
+        destination_dust_root=load_build_roots(build_path).dust_root,
+        level=1,
+        force=True,
     )
     inner = Table(
         [
@@ -2216,7 +2913,7 @@ def test_build_maps_writes_dense_maps_artifacts_with_expected_contract(tmp_path:
         legacy_config_path=legacy,
     )
     _write_gaia_tge_map(
-        tmp_path / "dust",
+        tmp_path / "gaia",
         [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)],
     )
     for outer_pix in range(12):
@@ -2258,7 +2955,7 @@ def test_build_survey_extent_layers_preserves_maps_and_writes_dense_dataset(
     overlay_b = _write_moc(tmp_path / "mocs" / "b.fits", level=1, pixs=[2])
     definition = _write_build_definition(
         tmp_path / "build.yaml",
-        survey_extent_overlays=[
+        survey_overlays=[
             {"name": "ews", "moc_files": [str(overlay_a), str(overlay_b)]},
             {"name": "edf-north", "moc_files": [str(overlay_a)]},
         ],

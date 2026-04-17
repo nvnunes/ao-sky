@@ -58,20 +58,6 @@ def get_prediction(*args, **kwargs):
     return training.get_prediction(*args, **kwargs)
 
 
-def wrap_angle_rad(*args, **kwargs):
-    """Delegate angle wrapping to `ao_tools.training`."""
-
-    training = _get_training_module()
-    return training.wrap_angle_rad(*args, **kwargs)
-
-
-def get_ngs_theta_indexes(*args, **kwargs):
-    """Delegate theta-index lookup to `ao_tools.training`."""
-
-    training = _get_training_module()
-    return training.get_ngs_theta_indexes(*args, **kwargs)
-
-
 def get_sr_index() -> int:
     """Return the SR output index used by the current backend."""
 

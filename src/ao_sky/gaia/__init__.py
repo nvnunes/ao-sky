@@ -11,12 +11,11 @@ from ._constants import (
     HDF5_SHUFFLE,
 )
 from ._exceptions import GaiaError
-from .cache import CachedGaiaHealpixStore, GaiaTableCacheStats
+from .cache import GaiaTableCacheStats
 from .store import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore, fetch_gaia_store
-from .transform import apply_proper_motion, compute_legacy_r_magnitude
+from .transform import apply_proper_motion, compute_r_magnitude
 
 __all__ = [
-    "CachedGaiaHealpixStore",
     "GAIA_SUMMARY_DATASET_NAME",
     "GAIA_SUMMARY_DTYPE",
     "GAIA_SUMMARY_FILENAME",
@@ -31,6 +30,6 @@ __all__ = [
     "HDF5_DATASET_NAME",
     "HDF5_SHUFFLE",
     "apply_proper_motion",
-    "compute_legacy_r_magnitude",
+    "compute_r_magnitude",
     "fetch_gaia_store",
 ]

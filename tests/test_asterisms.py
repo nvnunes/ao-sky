@@ -20,7 +20,7 @@ from ao_sky.gaia import (
     GAIA_SCHEMA_COLUMNS,
     GaiaHealpixStore,
     GaiaStoreConfig,
-    compute_legacy_r_magnitude,
+    compute_r_magnitude,
 )
 from ao_sky.spatial import get_parent_pixel, get_pixel_skycoord, get_pixel_neighbours, get_subpixels
 
@@ -391,7 +391,7 @@ def test_find_asterisms_uses_derived_r_magnitude_for_triplet_scoring() -> None:
     stars["G"] = np.asarray([12.0, 12.0, 12.0], dtype=np.float64)
     stars["BP"] = np.asarray([12.1, 12.2, 14.0], dtype=np.float64)
     stars["RP"] = np.asarray([11.9, 12.0, 13.8], dtype=np.float64)
-    stars["R"] = compute_legacy_r_magnitude(stars)
+    stars["R"] = compute_r_magnitude(stars)
 
     triplets = find_asterisms(stars, AsterismSearchOptions(min_stars=3, max_stars=3))
 

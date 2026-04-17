@@ -7,7 +7,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
-from mocpy import MOC
 
 from ._exceptions import SurveyError
 from ._models import SurveyExtentOverlaySpec
@@ -25,6 +24,7 @@ def _normalize_overlay_paths(
     moc_files: object,
     *,
     base_dir: Path,
+    resolve_paths: bool,
 ) -> tuple[Path, ...]:
     if isinstance(moc_files, (str, Path)):
         raw_paths = [moc_files]
@@ -38,6 +38,9 @@ def _normalize_overlay_paths(
     normalized: list[Path] = []
     for item in raw_paths:
         path = Path(str(item)).expanduser()
+        if not resolve_paths:
+            normalized.append(path)
+            continue
         if not path.is_absolute():
             path = (base_dir / path).resolve()
         else:
@@ -50,13 +53,14 @@ def normalize_survey_extent_overlays(
     raw_overlays: object,
     *,
     base_dir: Path,
+    resolve_paths: bool = True,
 ) -> tuple[SurveyExtentOverlaySpec, ...]:
     """Normalize human-authored survey-extent overlay definitions."""
 
     if raw_overlays in (None, ""):
         return ()
     if not isinstance(raw_overlays, list):
-        raise SurveyError("survey_extent_overlays must be a list")
+        raise SurveyError("survey_overlays must be a list")
 
     overlays: list[SurveyExtentOverlaySpec] = []
     seen_names: set[str] = set()
@@ -76,7 +80,11 @@ def normalize_survey_extent_overlays(
         overlays.append(
             SurveyExtentOverlaySpec(
                 name=name,
-                moc_files=_normalize_overlay_paths(raw["moc_files"], base_dir=base_dir),
+                moc_files=_normalize_overlay_paths(
+                    raw["moc_files"],
+                    base_dir=base_dir,
+                    resolve_paths=resolve_paths,
+                ),
             )
         )
 
@@ -92,6 +100,8 @@ def survey_extent_dtype(
 
 
 def _load_overlay_moc(overlay: SurveyExtentOverlaySpec) -> MOC:
+    from mocpy import MOC
+
     mocs = [MOC.from_fits(str(filename)) for filename in overlay.moc_files]
     if not mocs:
         raise SurveyError(f"overlay {overlay.name!r} has no MOC files")

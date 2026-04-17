@@ -13,7 +13,9 @@ from ao_sky.dust import (
     DustError,
     add_gaia_a0_to_inner,
     fetch_gaia_tge_dataset,
+    gaia_tge_a0_cache_filename,
     gaia_tge_map_filename,
+    prepare_gaia_tge_a0_cache,
     sample_gaia_a0_for_outer_pixel,
 )
 from ao_sky.dust.gaia_tge import GAIA_TGE_RELATIVE_FILENAME
@@ -21,7 +23,7 @@ from ao_sky.dust.gaia_tge import GAIA_TGE_RELATIVE_FILENAME
 
 def _write_gaia_tge_map(
     dust_root: Path,
-    rows: list[tuple[int, int, float]],
+    rows: list[tuple[int, int, float | str]],
 ) -> Path:
     filename = dust_root / "gaia_tge" / "TotalGalacticExtinctionMap_001.csv.gz"
     filename.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +83,62 @@ def test_sample_gaia_a0_for_outer_pixel_preserves_missing_values_as_nan(tmp_path
     assert values[:4].tolist() == [0.25] * 4
     assert values[4:8].tolist() == [1.25] * 4
     assert np.all(np.isnan(values[8:]))
+
+
+def test_prepare_gaia_tge_a0_cache_preserves_source_null_as_nan(tmp_path: Path) -> None:
+    dust_root = tmp_path / "dust"
+    _write_gaia_tge_map(
+        dust_root,
+        [
+            (0, 1, 0.25),
+            (1, 1, "null"),
+        ],
+    )
+
+    prepare_gaia_tge_a0_cache(
+        source_dust_root=dust_root,
+        destination_dust_root=dust_root,
+        level=1,
+    )
+    values = sample_gaia_a0_for_outer_pixel(
+        dust_root=dust_root,
+        outer_level=0,
+        outer_pix=0,
+        inner_level=2,
+        max_data_level=1,
+    )
+
+    assert values[:4].tolist() == [0.25] * 4
+    assert np.all(np.isnan(values[4:]))
+
+
+def test_sample_gaia_a0_uses_native_build_cache_without_source_csv(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    build_dust_root = tmp_path / "build" / "dust"
+    source_filename = _write_gaia_tge_map(
+        source_root,
+        [(healpix_id, 1, healpix_id + 0.5) for healpix_id in range(48)],
+    )
+
+    cache_filename = prepare_gaia_tge_a0_cache(
+        source_dust_root=source_root,
+        destination_dust_root=build_dust_root,
+        level=1,
+    )
+    source_filename.unlink()
+
+    assert cache_filename == gaia_tge_a0_cache_filename(build_dust_root, 1)
+    assert cache_filename.parent == build_dust_root.resolve()
+    assert cache_filename.is_file()
+    values = sample_gaia_a0_for_outer_pixel(
+        dust_root=build_dust_root,
+        outer_level=0,
+        outer_pix=0,
+        inner_level=2,
+        max_data_level=1,
+    )
+
+    assert values.tolist() == [0.5] * 4 + [1.5] * 4 + [2.5] * 4 + [3.5] * 4
 
 
 def test_add_gaia_a0_to_inner_inserts_field_after_pix(tmp_path: Path) -> None:
