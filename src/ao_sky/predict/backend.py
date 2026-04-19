@@ -86,6 +86,41 @@ def clear_cache(model) -> None:
     training.clear_cache(model)
 
 
+def get_model_device_type(model) -> str:
+    """Return the backend device type for one loaded model."""
+
+    training = _get_training_module()
+    return str(training.get_model_device(model["model"]).type)
+
+
+def mps_is_available() -> bool:
+    """Return whether PyTorch MPS can be used by the prediction backend."""
+
+    try:
+        import torch
+
+        return bool(torch.backends.mps.is_available() and torch.backends.mps.is_built())
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
+
+def get_mps_memory_bytes() -> tuple[int, int, int]:
+    """Return current, driver, and recommended MPS memory in bytes."""
+
+    try:
+        import torch
+
+        if not mps_is_available():
+            return (0, 0, 0)
+        return (
+            int(torch.mps.current_allocated_memory()),
+            int(torch.mps.driver_allocated_memory()),
+            int(torch.mps.recommended_max_memory()),
+        )
+    except (ImportError, AttributeError, RuntimeError):
+        return (0, 0, 0)
+
+
 def configure_inference_threads(num_threads: int) -> None:
     """Pin backend inference libraries to a bounded thread count."""
 

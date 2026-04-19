@@ -106,11 +106,10 @@ asterism, best, and coverage sections define the runtime policy.
 Example build config:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 build:
-  workers: 3
-  worker_memory_limit_mb: 2048
-  parent_memory_limit_mb: 12288
+  workers: 9
+  memory_limit_mb: 26624
   roots:
     gaia: /data/gaia
     model: /data/models
@@ -119,17 +118,21 @@ ao_system:
   band: R
   fov_arcsec: 120.0
   lgs: []
-  min_wfs: 2
+  min_wfs: 1
   max_wfs: 3
   min_mag: 8.0
   max_mag: 18.5
   min_sep_arcsec: 5.0
 prediction:
+  resolved_device: auto
+  averaged_device: auto
   wavelength_micron: 1.654
   resolved_models:
+    1star: point_one
     2star: point_two
     3star: point_three
   averaged_models:
+    1star: mean_one
     2star: mean_two
     3star: mean_three
 traversal:
@@ -138,13 +141,12 @@ traversal:
 gaia:
   release: dr3
   epoch: 2028.0
-  min_galactic_latitude_deg: 20.0
-  max_star_density: 6.0
   max_bright_star_mag: 8.0
+  max_bright_star_exclusion_arcsec: null
 maps:
   max_level: 9
 asterism:
-  max_overlap: 0.66
+  winner_ee_epsilon: 0.01
 best:
   seeing_baseline:
     wavelength_micron: 0.5
@@ -221,12 +223,10 @@ Explicit root flags remain available for tests and ad hoc runs:
   --workers 3 \
   --gaia-cache-entries 64 \
   --gaia-cache-mb 2048 \
-  --worker-memory-limit-mb 2048 \
   --parent-memory-limit-mb 12288
 ./.conda/bin/ao-sky restart build \
   --build-root /data/ao-builds \
   --workers 3 \
-  --worker-memory-limit-mb 2048 \
   --parent-memory-limit-mb 12288
 ```
 

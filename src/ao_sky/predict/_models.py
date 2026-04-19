@@ -30,10 +30,9 @@ class PredictRuntime:
     outer_level: int
     inner_level: int
     epoch: float
-    min_galactic_latitude: float | None
-    max_star_density: float | None
     max_bright_star_mag: float | None
-    max_overlap: float | None
+    max_bright_star_exclusion: u.Quantity
+    winner_ee_epsilon: float
     prediction_wavelength: u.Quantity
     resolved_models: dict[str, str]
     averaged_models: dict[str, str]

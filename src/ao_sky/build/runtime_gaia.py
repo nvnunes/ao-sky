@@ -110,6 +110,20 @@ class RuntimeGaiaHealpixStore:
                 prepare_seconds=self._prepare_seconds,
             )
 
+    def trim_cache(self, *, max_entries: int = 0, max_bytes: int = 0) -> None:
+        """Evict cached tables until the cache is no larger than the targets."""
+
+        target_entries = max(0, int(max_entries))
+        target_bytes = max(0, int(max_bytes))
+        with self._lock:
+            while self._cache and (
+                len(self._cache) > target_entries
+                or self._current_bytes > target_bytes
+            ):
+                _, (_, size) = self._cache.popitem(last=False)
+                self._current_bytes -= size
+                self._evictions += 1
+
     def _load_runtime_table(self, outer_pix: int, *, force_reload: bool) -> Table:
         started = time.perf_counter()
         raw_started = time.perf_counter()

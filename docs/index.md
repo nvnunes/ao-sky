@@ -21,6 +21,9 @@ The current repo surface establishes:
 
 - [`architecture.md`](architecture.md): package boundaries, data layers, and
   persisted contracts
+- [`api.md`](api.md): supported Python API and public helper contracts
+- [`algorithms.md`](algorithms.md): traversal, dense-field NGS selection, and
+  winner-selection algorithms
 - [`development.md`](development.md): local environment creation, editable
   installs, and daily commands
 - [`testing.md`](testing.md): canonical verification commands and completion

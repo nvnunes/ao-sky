@@ -8,6 +8,7 @@ The supported public surface currently centers on:
 - `ao_sky.dust` for Gaia TGE source validation and build-local A0 cache helpers
 - `ao_sky.spatial` for reusable non-plotting HEALPix helpers
 - `ao_sky.asterisms` for outer-pixel star assembly and in-memory search
+- `ao_sky.predict` for native prediction runtime records and array prediction helpers
 - `ao_sky.build` for persisted build roots, build state, and per-outer-pixel
   derived artifacts
 
@@ -134,6 +135,30 @@ The current package-supported asterism API exposes:
 - `load_asterism_stars`
 - `find_asterisms`
 - `ASTERISM_TABLE_COLUMNS`
+
+### `ao_sky.predict`
+
+The current package-supported prediction API exposes:
+
+- `AOSystemRuntime`
+- `PredictRuntime`
+- `PointPredictionBatch`
+- `SeeingBaselinePerformance`
+- `PredictError`
+- `configure_inference_threads`
+- `warm_model_cache`
+- `clear_backend_cache`
+- `get_point_model`
+- `get_mean_model`
+- `predict_point_arrays`
+- `predict_field_mean_arrays`
+- `get_seeing_baseline_performance`
+
+These helpers are primarily the build Traversal prediction boundary. Direct
+callers should pass homogeneous, magnitude-ordered NGS arrays whose second
+dimension matches the requested star count and should obtain models through
+`get_point_model` or `get_mean_model`. The current implementation still uses the
+temporary `girmos-aosims` backend adapter behind this native API.
 
 ### `ao_sky.build`
 
@@ -306,7 +331,7 @@ Behavior:
   `<build>/surveys/manifest.json`, and persist build-root-relative
   `surveys/<filename>` paths for augmentation
 
-### `run_build(build_path, *, workers=None, gaia_cache_entries=None, gaia_cache_mb=None, worker_memory_limit_mb=None, parent_memory_limit_mb=None, telemetry=None, aosky_yaml=None) -> Path`
+### `run_build(build_path, *, workers=None, gaia_cache_entries=None, gaia_cache_mb=None, parent_memory_limit_mb=None, telemetry=None, aosky_yaml=None) -> Path`
 
 Run one initialized build through its unfinished outer-pixel work and write
 `outer.h5` artifact containers.
@@ -331,16 +356,14 @@ only; they are not persisted in the build definition, build metadata, or
 canonical Gaia files. Native build Traversal expects these runtime rows for
 inner counts, asterism search, and prediction.
 
-`worker_memory_limit_mb` is an optional execution-time safety guard. A value of
-`0` or `None` disables it. When enabled, regional workers report profiling
-lines and stop the Traversal run if a worker's peak RSS exceeds the limit; the
-build is left restartable instead of risking unbounded memory growth.
-
-`parent_memory_limit_mb` is an optional aggregate current-RSS safety guard. A
-value of `0` or `None` disables it. When enabled, the parent process periodically
-checks its current RSS plus active worker current RSS and stops Traversal if the
-aggregate exceeds the limit. This guard is intended to protect the whole system;
-`worker_memory_limit_mb` remains the per-worker pathological-pixel guard.
+`parent_memory_limit_mb` is the Python/CLI override for the aggregate total-RAM
+safety guard configured in YAML as `build.memory_limit_mb`. A value of `0` or
+`None` disables it. When enabled, the parent process periodically checks its
+current RSS plus active worker current RSS, with an additional GPU-driver reserve
+when GPU prediction is enabled. As total RAM approaches the limit, the parent
+targets the heaviest active workers for cache trimming and brief backoff; if the
+aggregate still exceeds the limit, Traversal stops with a restartable failure.
+This is the only active memory-limit guard.
 
 `telemetry` controls runtime diagnostics. The default `None`/`"basic"` keeps
 low-cost operational profiling in `build.log`. `"detailed"` additionally writes
@@ -353,7 +376,7 @@ Artifact writes are direct and worker-owned. SSD artifact staging was benchmarke
 and rejected as an active runtime option after Blosc Zstd made write latency
 negligible relative to Traversal compute.
 
-### `restart_build(..., workers=None, gaia_cache_entries=None, gaia_cache_mb=None, worker_memory_limit_mb=None, parent_memory_limit_mb=None, telemetry=None) -> Path`
+### `restart_build(..., workers=None, gaia_cache_entries=None, gaia_cache_mb=None, parent_memory_limit_mb=None, telemetry=None) -> Path`
 
 Resume the latest `v<N>` build under the lineage workspace, using the same
 execution-time worker-count contract as `run_build`.

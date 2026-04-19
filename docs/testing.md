@@ -64,12 +64,12 @@ rather than calling the live Gaia archive or downloading dust.
 ```bash
 tmpdir="$(mktemp -d)"
 cat >"$tmpdir/build.yaml" <<'YAML'
-schema_version: 1
+schema_version: 2
 ao_system:
   band: R
   fov_arcsec: 120.0
   lgs: []
-  min_wfs: 2
+  min_wfs: 1
   max_wfs: 3
   min_mag: 8.0
   max_mag: 18.5
@@ -77,9 +77,11 @@ ao_system:
 prediction:
   wavelength_micron: 1.654
   resolved_models:
+    1star: point_one
     2star: point_two
     3star: point_three
   averaged_models:
+    1star: mean_one
     2star: mean_two
     3star: mean_three
 traversal:
@@ -88,13 +90,12 @@ traversal:
 gaia:
   release: dr3
   epoch: 2028.0
-  min_galactic_latitude_deg: null
-  max_star_density: 6.0
   max_bright_star_mag: 8.0
+  max_bright_star_exclusion_arcsec: null
 maps:
   max_level: 1
 asterism:
-  max_overlap: 0.66
+  winner_ee_epsilon: 0.01
 best:
   seeing_baseline:
     wavelength_micron: 0.5
@@ -140,7 +141,14 @@ with gzip.open(dust_file, "wt", encoding="utf-8") as handle:
 
 model_root = root / "models"
 model_root.mkdir(parents=True, exist_ok=True)
-for model_name in ("point_two", "point_three", "mean_two", "mean_three"):
+for model_name in (
+    "point_one",
+    "point_two",
+    "point_three",
+    "mean_one",
+    "mean_two",
+    "mean_three",
+):
     (model_root / f"{model_name}.pt").write_bytes(model_name.encode() + b":pt")
     (model_root / f"{model_name}_metadata.pkl").write_bytes(
         model_name.encode() + b":metadata"
@@ -272,7 +280,7 @@ The comparison samples are intentionally low-density and already-loaded. Do not
 use crowded or skipped pixels for routine regression checks unless the change is
 specifically about density handling, memory guards, or skip behavior.
 
-## Phase 13 Benchmark Handoff
+## Traversal Benchmark Handoff
 
 Use `docs/benchmarking.md` as the benchmark record. This section records how the
 latest Traversal benchmark data was produced so another thread can reproduce or
@@ -286,19 +294,38 @@ The current benchmark script is:
 
 The script currently uses:
 
-- source build: `/Volumes/Data/Galaxy/aosky/gnao-baseline/v1`
+- source config: `/Volumes/Data/Galaxy/aosky/gnao-baseline/ao-sky.yaml`
+- benchmark config: a schema-version-2 scratch copy derived from the source
+  config for each benchmark build
 - Gaia root: `/Users/nelsonnunes/ao-sky-cache/gaia`
+- model root:
+  `/Users/nelsonnunes/Library/CloudStorage/Dropbox/Projects/survey_tools/data/models`
+- survey root:
+  `/Users/nelsonnunes/Library/CloudStorage/Dropbox/Projects/survey_tools/data/euclid`
 - reference sample:
   `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-compression-sweep-bench-20260416-212643/sample-pixels.ecsv`
 - sample shape: `18` complete level-4 regions, `288` level-6 outer pixels
 - default worker count: `3`
 - default Gaia table cache: `8` prepared tables, `128 MiB`
-- default worker memory guard: `6144 MiB`
+- default parent memory guard: disabled unless `AO_SKY_BENCH_PARENT_MEMORY_LIMIT_MB`
+  is set
 - default telemetry mode: `detailed`
 
 Use the same fixed sample for benchmark comparisons. If the sample changes,
 record that explicitly in `docs/benchmarking.md`; otherwise cache, SSD, codec,
 worker-count, and telemetry measurements are not directly comparable.
+
+Run a small real-data smoke check before launching the full sample:
+
+```bash
+AO_SKY_BENCH_SAMPLE_LIMIT=12 \
+AO_SKY_BENCH_WORKERS=3 \
+AO_SKY_BENCH_TELEMETRY=detailed \
+./.conda/bin/python scripts/benchmark_traversal_baseline.py
+```
+
+Use `AO_SKY_BENCH_OUTER_PIXS=4432,4435,...` when a specific pixel list is more
+useful than the fixed sample prefix.
 
 Run a single baseline refresh with:
 
@@ -311,8 +338,7 @@ Run the worker-count sweep used for the current recommendation with:
 
 ```bash
 AO_SKY_BENCH_WORKERS=3,4,5,6,7,8,9 \
-AO_SKY_BENCH_WORKER_MEMORY_LIMIT_MB=2048 \
-AO_SKY_BENCH_PARENT_MEMORY_LIMIT_MB=12288 \
+AO_SKY_BENCH_PARENT_MEMORY_LIMIT_MB=26624 \
 AO_SKY_BENCH_TELEMETRY=basic \
 ./.conda/bin/python scripts/benchmark_traversal_baseline.py
 ```
@@ -330,11 +356,96 @@ Detailed telemetry writes raw traversal diagnostics under each benchmark build's
 Normal production runs should keep telemetry lower because detailed telemetry is
 for diagnosis, not throughput.
 
+## Saved Artifact Visual Checks
+
+Use saved-artifact visual checks during Phase 15 physical validation when the
+question is whether the new winner-map-first outputs remain spatially sensible,
+not whether they are byte-for-byte compatible with legacy outputs.
+
+The saved Phase 13 baseline artifact snapshot is:
+
+```text
+/Volumes/Data/Galaxy/aosky/gnao-baseline/phase13
+```
+
+This directory is a copied fixed-sample Traversal build from the end of the
+Phase 13 optimization pass. It is the best compact artifact source for "where
+Phase 13 landed" because it contains the representative 288-pixel sample built
+with the retained Phase 13 settings: SSD Gaia, worker-local prepared Gaia cache,
+Blosc Zstd artifacts, direct build-tree writes, build-local models, and
+build-local dust. It is not an all-sky production build.
+
+Use this snapshot as the legacy-compatible artifact baseline when comparing
+later branches or phases against the `legacy-compatible` tag. Match artifacts by
+relative path under the build root. For example:
+
+```bash
+rel="hpx6-14/0h/+00/18314/outer.h5"
+./.conda/bin/python scripts/plot_outer_best_ee_comparison.py \
+  "/Volumes/Data/Galaxy/aosky/gnao-baseline/phase13/$rel" \
+  "/path/to/new/build/$rel" \
+  --left-label "Phase 13 legacy-compatible" \
+  --right-label "Current branch" \
+  --output /tmp/ao_sky_phase13_current_best_ee_outer_18314.png
+```
+
+The snapshot is most useful for inspecting artifact contracts and spatial
+behavior on the fixed sample. For branch-level code comparisons, use the
+`legacy-compatible` tag as the code baseline and this directory as the saved
+artifact baseline.
+
+The true legacy artifact source is:
+
+```text
+/Volumes/Data/Galaxy/maps/inner
+```
+
+Use this path when the question is "what did the original legacy build write?"
+rather than "what did the Phase 13 `ao-sky` legacy-compatible build write?" The
+Phase 13 snapshot is the `ao-sky` compatibility baseline; this legacy path is
+the source of original `survey_tools` outputs.
+
+The reusable raw best-EE comparison helper is:
+
+```bash
+./.conda/bin/python scripts/plot_outer_best_ee_comparison.py \
+  /path/to/left/artifact-or-root \
+  /path/to/right/artifact-or-root \
+  --left-label "Phase 13" \
+  --right-label "Phase 14" \
+  --outer-pix 18314 \
+  --output /tmp/ao_sky_phase13_phase14_best_ee_outer_18314.png
+```
+
+The helper supports:
+
+- schema version 1: legacy-preserving Phase 13 artifacts with
+  `asterism_count` and `winner_distance_arcsec`
+- schema version 2: winner-map-first Phase 14 artifacts without those
+  legacy-only columns
+- true legacy FITS artifacts under roots such as
+  `/Volumes/Data/Galaxy/maps/inner`, where each outer pixel stores an
+  `inner.fits` file with the default raw EE column `ASTERISM_EE_MAX_GNAO`
+
+For `outer.h5` inputs, it reads the shared `inner.pix` and `inner.best_ee`
+columns. For true legacy `inner.fits` inputs, it reads `PIX` and the configured
+legacy EE column. It projects finite inner-pixel samples into local tangent-plane
+offsets about the outer-pixel center, interpolates them through a Delaunay
+triangulation onto a regular `300 x 300` grid, and writes a three-panel plot
+showing left, right, and right-minus-left raw best EE. EE panels use Matplotlib's
+`plasma` colormap with a fixed `0.0` to `0.60` scale by default so separate
+pixels can be compared visually. The default figure size and DPI are kept modest
+for chat and notebook previews; use the script's `--figure-width`,
+`--figure-height`, and `--dpi` options when a larger saved image is useful. This
+is a human-inspection tool for saved real-sky artifacts; keep deterministic
+repo-native correctness checks in `pytest`.
+
 The current full-build operating default on the local workstation is:
 
-- `build.workers: 6`
-- `build.worker_memory_limit_mb: 2048`
-- `build.parent_memory_limit_mb: 12288`
+- `build.workers: 9`
+- `build.memory_limit_mb: 26624`
+- `prediction.resolved_device: auto`
+- `prediction.averaged_device: auto`
 - `build.roots.gaia: /Users/nelsonnunes/ao-sky-cache/gaia`
 - artifact writes go directly to the build tree on `/Volumes/Data/Galaxy/aosky`
 - derived build artifacts use Blosc Zstd compression
@@ -369,6 +480,9 @@ Retained scripts:
   benchmark harness. It owns the current 288-pixel benchmark workflow, parses
   traversal telemetry, and writes reproducible CSV output for
   `docs/benchmarking.md`.
+- `scripts/plot_outer_best_ee_comparison.py` is a Phase 15 saved-artifact
+  visual inspection helper for comparing raw best-EE maps from true legacy
+  `inner.fits` artifacts, v1 `outer.h5` artifacts, and v2 `outer.h5` artifacts.
 
 Do not retain one-off prewarm, write-behind, artifact-staging, compression, or
 cache probes as separate scripts unless they become repeated workflows. Their

@@ -25,6 +25,7 @@ nav:
   - Guides:
       - API: api.md
       - Architecture: architecture.md
+      - Algorithms: algorithms.md
       - Development: development.md
       - Testing: testing.md
       - Benchmarking: benchmarking.md
@@ -33,4 +34,5 @@ nav:
       - Gaia API: reference/gaia/api.md
       - Spatial API: reference/spatial/api.md
       - Asterisms API: reference/asterisms/api.md
+      - Predict API: reference/predict/api.md
       - Build API: reference/build/api.md

@@ -55,16 +55,13 @@ def _add_traversal_execution_arguments(parser: argparse.ArgumentParser) -> None:
         help="Worker-local Gaia table cache memory cap in MiB; 0 disables caching.",
     )
     parser.add_argument(
-        "--worker-memory-limit-mb",
-        type=int,
-        default=None,
-        help="Stop Traversal if a worker reports peak RSS above this MiB limit; 0 disables the guard.",
-    )
-    parser.add_argument(
         "--parent-memory-limit-mb",
         type=int,
         default=None,
-        help="Stop Traversal if parent plus active worker current RSS exceeds this MiB limit; 0 disables the guard.",
+        help=(
+            "Stop Traversal if total RAM exceeds this MiB limit; 0 disables the "
+            "guard. YAML configs use build.memory_limit_mb."
+        ),
     )
     parser.add_argument(
         "--telemetry",
@@ -214,7 +211,6 @@ def _handle_run(args: argparse.Namespace) -> int:
             workers=args.workers,
             gaia_cache_entries=args.gaia_cache_entries,
             gaia_cache_mb=args.gaia_cache_mb,
-            worker_memory_limit_mb=args.worker_memory_limit_mb,
             parent_memory_limit_mb=args.parent_memory_limit_mb,
             telemetry=args.telemetry,
             aosky_yaml=args.aosky_yaml,
@@ -234,7 +230,6 @@ def _handle_restart(args: argparse.Namespace) -> int:
             workers=args.workers,
             gaia_cache_entries=args.gaia_cache_entries,
             gaia_cache_mb=args.gaia_cache_mb,
-            worker_memory_limit_mb=args.worker_memory_limit_mb,
             parent_memory_limit_mb=args.parent_memory_limit_mb,
             telemetry=args.telemetry,
         )

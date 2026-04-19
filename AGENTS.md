@@ -10,6 +10,8 @@
 - Follow `README.md` for the repo's public summary and starting docs.
 - Follow `docs/architecture.md` for package shape, artifact boundaries, and stable design decisions.
 - Follow `docs/api.md` for the supported public Python API and CLI-facing helper contracts.
+- Follow `docs/algorithms.md` for traversal, dense-field NGS selection, winner
+  selection, and AO metric aggregation algorithms.
 - Follow `docs/development.md` for local bootstrap, environment, and daily workflow.
 - Follow `docs/plan.md` for transitional migration context and implementation sequencing.
 - Follow `docs/benchmarking.md` for benchmark evidence that informs storage, scheduling, and cache decisions.

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import gc
 import multiprocessing
+import os
 from pathlib import Path
 from queue import Empty
 import resource
@@ -19,7 +21,8 @@ from astropy.table import Table
 
 from ..dust import prepare_gaia_tge_a0_cache
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore
-from ..predict import PredictRuntime, configure_inference_threads, warm_model_cache
+from ..predict import PredictRuntime, backend as predict_backend
+from ..predict import configure_inference_threads, warm_model_cache
 from .augmentation import build_survey_extent_layers
 from .aggregation import build_maps
 from ._constants import (
@@ -91,7 +94,6 @@ from .traversal import (
     TraversalStageProfile,
     TraversalStructureProfile,
     build_traversal_products,
-    coarse_density_skip_outer_pixs,
 )
 
 TRAVERSAL_PROGRESS_LOG_INTERVAL = 100
@@ -100,6 +102,21 @@ STATE_UPDATE_RETRY_ATTEMPTS = 20
 STATE_UPDATE_RETRY_DELAY_SECONDS = 0.05
 STATE_UPDATE_FLUSH_INTERVAL = 100
 PARENT_MEMORY_CHECK_INTERVAL_SECONDS = 1.0
+PARENT_MEMORY_SOFT_FRACTION = 0.80
+PARENT_MEMORY_SOFT_RELEASE_FRACTION = 0.70
+PARENT_MEMORY_HARD_FRACTION = 0.90
+PARENT_MEMORY_HARD_RELEASE_FRACTION = 0.80
+PARENT_MEMORY_PRESSURE_NORMAL = "normal"
+PARENT_MEMORY_PRESSURE_TRIM = "trim"
+PARENT_MEMORY_PRESSURE_PAUSE = "pause"
+PARENT_MEMORY_PRESSURE_RESUME = "resume"
+PARENT_MEMORY_PRESSURE_COMMAND_INTERVAL_SECONDS = 5.0
+WORKER_MEMORY_PRESSURE_SLEEP_SECONDS = 0.25
+WORKER_MEMORY_PRESSURE_MAX_PAUSE_SECONDS = 30.0
+PREDICT_DEVICE_ENV_VAR = "AO_SKY_PREDICT_DEVICE"
+AVERAGED_PREDICT_DEVICE_ENV_VAR = "AO_SKY_AVERAGED_PREDICT_DEVICE"
+PARENT_GPU_DRIVER_RESERVE_MB_ENV_VAR = "AO_SKY_PARENT_GPU_DRIVER_RESERVE_MB"
+DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB = 1075.0
 
 
 def init_build(
@@ -302,14 +319,28 @@ class _TraversalStageTelemetry:
     candidate_generation_seconds: float = 0.0
     filtering_seconds: float = 0.0
     bright_star_filter_seconds: float = 0.0
-    overlap_quality_seconds: float = 0.0
-    overlap_geometry_seconds: float = 0.0
     inner_assignment_seconds: float = 0.0
     local_selection_seconds: float = 0.0
     inner_table_seconds: float = 0.0
     context_seconds: float = 0.0
     point_prediction_seconds: float = 0.0
+    point_prediction_eligibility_seconds: float = 0.0
+    point_prediction_eligibility_intersection_seconds: float = 0.0
+    point_prediction_eligibility_extract_seconds: float = 0.0
+    point_prediction_buffer_seconds: float = 0.0
+    point_prediction_ngs_array_seconds: float = 0.0
+    point_prediction_model_seconds: float = 0.0
+    point_prediction_feature_seconds: float = 0.0
+    point_prediction_backend_seconds: float = 0.0
+    point_prediction_scatter_seconds: float = 0.0
+    point_prediction_scatter_filter_seconds: float = 0.0
+    point_prediction_scatter_merge_seconds: float = 0.0
+    point_prediction_scatter_sort_seconds: float = 0.0
+    point_prediction_scatter_write_seconds: float = 0.0
+    point_prediction_cache_clear_seconds: float = 0.0
     field_mean_prediction_seconds: float = 0.0
+    field_mean_prediction_feature_seconds: float = 0.0
+    field_mean_prediction_backend_seconds: float = 0.0
     coverage_seconds: float = 0.0
     dust_seconds: float = 0.0
     persisted_asterisms_seconds: float = 0.0
@@ -319,14 +350,50 @@ class _TraversalStageTelemetry:
         self.candidate_generation_seconds += stats.candidate_generation_seconds
         self.filtering_seconds += stats.filtering_seconds
         self.bright_star_filter_seconds += stats.bright_star_filter_seconds
-        self.overlap_quality_seconds += stats.overlap_quality_seconds
-        self.overlap_geometry_seconds += stats.overlap_geometry_seconds
         self.inner_assignment_seconds += stats.inner_assignment_seconds
         self.local_selection_seconds += stats.local_selection_seconds
         self.inner_table_seconds += stats.inner_table_seconds
         self.context_seconds += stats.context_seconds
         self.point_prediction_seconds += stats.point_prediction_seconds
+        self.point_prediction_eligibility_seconds += (
+            stats.point_prediction_eligibility_seconds
+        )
+        self.point_prediction_eligibility_intersection_seconds += (
+            stats.point_prediction_eligibility_intersection_seconds
+        )
+        self.point_prediction_eligibility_extract_seconds += (
+            stats.point_prediction_eligibility_extract_seconds
+        )
+        self.point_prediction_buffer_seconds += stats.point_prediction_buffer_seconds
+        self.point_prediction_ngs_array_seconds += (
+            stats.point_prediction_ngs_array_seconds
+        )
+        self.point_prediction_model_seconds += stats.point_prediction_model_seconds
+        self.point_prediction_feature_seconds += stats.point_prediction_feature_seconds
+        self.point_prediction_backend_seconds += stats.point_prediction_backend_seconds
+        self.point_prediction_scatter_seconds += stats.point_prediction_scatter_seconds
+        self.point_prediction_scatter_filter_seconds += (
+            stats.point_prediction_scatter_filter_seconds
+        )
+        self.point_prediction_scatter_merge_seconds += (
+            stats.point_prediction_scatter_merge_seconds
+        )
+        self.point_prediction_scatter_sort_seconds += (
+            stats.point_prediction_scatter_sort_seconds
+        )
+        self.point_prediction_scatter_write_seconds += (
+            stats.point_prediction_scatter_write_seconds
+        )
+        self.point_prediction_cache_clear_seconds += (
+            stats.point_prediction_cache_clear_seconds
+        )
         self.field_mean_prediction_seconds += stats.field_mean_prediction_seconds
+        self.field_mean_prediction_feature_seconds += (
+            stats.field_mean_prediction_feature_seconds
+        )
+        self.field_mean_prediction_backend_seconds += (
+            stats.field_mean_prediction_backend_seconds
+        )
         self.coverage_seconds += stats.coverage_seconds
         self.dust_seconds += stats.dust_seconds
         self.persisted_asterisms_seconds += stats.persisted_asterisms_seconds
@@ -337,18 +404,61 @@ class _TraversalStageTelemetry:
             candidate_generation_seconds=self.candidate_generation_seconds,
             filtering_seconds=self.filtering_seconds,
             bright_star_filter_seconds=self.bright_star_filter_seconds,
-            overlap_quality_seconds=self.overlap_quality_seconds,
-            overlap_geometry_seconds=self.overlap_geometry_seconds,
             inner_assignment_seconds=self.inner_assignment_seconds,
             local_selection_seconds=self.local_selection_seconds,
             inner_table_seconds=self.inner_table_seconds,
             context_seconds=self.context_seconds,
             point_prediction_seconds=self.point_prediction_seconds,
+            point_prediction_eligibility_seconds=(
+                self.point_prediction_eligibility_seconds
+            ),
+            point_prediction_eligibility_intersection_seconds=(
+                self.point_prediction_eligibility_intersection_seconds
+            ),
+            point_prediction_eligibility_extract_seconds=(
+                self.point_prediction_eligibility_extract_seconds
+            ),
+            point_prediction_buffer_seconds=self.point_prediction_buffer_seconds,
+            point_prediction_ngs_array_seconds=self.point_prediction_ngs_array_seconds,
+            point_prediction_model_seconds=self.point_prediction_model_seconds,
+            point_prediction_feature_seconds=self.point_prediction_feature_seconds,
+            point_prediction_backend_seconds=self.point_prediction_backend_seconds,
+            point_prediction_scatter_seconds=self.point_prediction_scatter_seconds,
+            point_prediction_scatter_filter_seconds=(
+                self.point_prediction_scatter_filter_seconds
+            ),
+            point_prediction_scatter_merge_seconds=(
+                self.point_prediction_scatter_merge_seconds
+            ),
+            point_prediction_scatter_sort_seconds=(
+                self.point_prediction_scatter_sort_seconds
+            ),
+            point_prediction_scatter_write_seconds=(
+                self.point_prediction_scatter_write_seconds
+            ),
+            point_prediction_cache_clear_seconds=(
+                self.point_prediction_cache_clear_seconds
+            ),
             field_mean_prediction_seconds=self.field_mean_prediction_seconds,
+            field_mean_prediction_feature_seconds=(
+                self.field_mean_prediction_feature_seconds
+            ),
+            field_mean_prediction_backend_seconds=(
+                self.field_mean_prediction_backend_seconds
+            ),
             coverage_seconds=self.coverage_seconds,
             dust_seconds=self.dust_seconds,
             persisted_asterisms_seconds=self.persisted_asterisms_seconds,
         )
+
+
+def _merge_bucket_stats(target: dict[int, int], values: dict[int, int]) -> None:
+    for bucket, count in values.items():
+        target[int(bucket)] = target.get(int(bucket), 0) + int(count)
+
+
+def _format_bucket_stats(values: tuple[tuple[int, int], ...]) -> str:
+    return ";".join(f"{bucket}:{count}" for bucket, count in values)
 
 
 @dataclass(slots=True)
@@ -362,11 +472,33 @@ class _TraversalStructureTelemetry:
     raw_asterism_rows: int = 0
     dedupe_key_rows: int = 0
     post_bright_asterism_rows: int = 0
-    post_overlap_asterism_rows: int = 0
+    candidate_graph_rows: int = 0
     local_asterism_rows: int = 0
     context_pair_rows: int = 0
     winner_rows: int = 0
     winner_payload_rows: int = 0
+    point_prediction_batches: int = 0
+    point_prediction_rows: int = 0
+    point_prediction_batch_rows_peak: int = 0
+    point_prediction_backend_rows: int = 0
+    point_prediction_backend_batch_rows_peak: int = 0
+    point_feature_bytes_peak: int = 0
+    point_mps_current_bytes_peak: int = 0
+    point_mps_driver_bytes_peak: int = 0
+    point_mps_recommended_bytes: int = 0
+    point_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
+    point_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
+    field_mean_prediction_batches: int = 0
+    field_mean_prediction_rows: int = 0
+    field_mean_prediction_batch_rows_peak: int = 0
+    field_mean_prediction_backend_rows: int = 0
+    field_mean_prediction_backend_batch_rows_peak: int = 0
+    field_mean_feature_bytes_peak: int = 0
+    field_mean_mps_current_bytes_peak: int = 0
+    field_mean_mps_driver_bytes_peak: int = 0
+    field_mean_mps_recommended_bytes: int = 0
+    field_mean_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
+    field_mean_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
     search_star_rows_peak: int = 0
     ngs_rows_peak: int = 0
     close_pair_rows_peak: int = 0
@@ -383,11 +515,83 @@ class _TraversalStructureTelemetry:
         self.raw_asterism_rows += int(stats.raw_asterism_rows)
         self.dedupe_key_rows += int(stats.dedupe_key_rows)
         self.post_bright_asterism_rows += int(stats.post_bright_asterism_rows)
-        self.post_overlap_asterism_rows += int(stats.post_overlap_asterism_rows)
+        self.candidate_graph_rows += int(stats.candidate_graph_rows)
         self.local_asterism_rows += int(stats.local_asterism_rows)
         self.context_pair_rows += int(stats.context_pair_rows)
         self.winner_rows += int(stats.winner_rows)
         self.winner_payload_rows += int(stats.winner_payload_rows)
+        self.point_prediction_batches += int(stats.point_prediction_batches)
+        self.point_prediction_rows += int(stats.point_prediction_rows)
+        self.point_prediction_batch_rows_peak = max(
+            self.point_prediction_batch_rows_peak,
+            int(stats.point_prediction_batch_rows_peak),
+        )
+        self.point_prediction_backend_rows += int(stats.point_prediction_backend_rows)
+        self.point_prediction_backend_batch_rows_peak = max(
+            self.point_prediction_backend_batch_rows_peak,
+            int(stats.point_prediction_backend_batch_rows_peak),
+        )
+        _merge_bucket_stats(
+            self.point_backend_bucket_counts,
+            dict(stats.point_prediction_backend_bucket_counts),
+        )
+        _merge_bucket_stats(
+            self.point_backend_bucket_rows,
+            dict(stats.point_prediction_backend_bucket_rows),
+        )
+        self.point_feature_bytes_peak = max(
+            self.point_feature_bytes_peak,
+            int(stats.point_feature_bytes_peak),
+        )
+        self.point_mps_current_bytes_peak = max(
+            self.point_mps_current_bytes_peak,
+            int(stats.point_mps_current_bytes_peak),
+        )
+        self.point_mps_driver_bytes_peak = max(
+            self.point_mps_driver_bytes_peak,
+            int(stats.point_mps_driver_bytes_peak),
+        )
+        self.point_mps_recommended_bytes = max(
+            self.point_mps_recommended_bytes,
+            int(stats.point_mps_recommended_bytes),
+        )
+        self.field_mean_prediction_batches += int(stats.field_mean_prediction_batches)
+        self.field_mean_prediction_rows += int(stats.field_mean_prediction_rows)
+        self.field_mean_prediction_batch_rows_peak = max(
+            self.field_mean_prediction_batch_rows_peak,
+            int(stats.field_mean_prediction_batch_rows_peak),
+        )
+        self.field_mean_prediction_backend_rows += int(
+            stats.field_mean_prediction_backend_rows
+        )
+        self.field_mean_prediction_backend_batch_rows_peak = max(
+            self.field_mean_prediction_backend_batch_rows_peak,
+            int(stats.field_mean_prediction_backend_batch_rows_peak),
+        )
+        _merge_bucket_stats(
+            self.field_mean_backend_bucket_counts,
+            dict(stats.field_mean_prediction_backend_bucket_counts),
+        )
+        _merge_bucket_stats(
+            self.field_mean_backend_bucket_rows,
+            dict(stats.field_mean_prediction_backend_bucket_rows),
+        )
+        self.field_mean_feature_bytes_peak = max(
+            self.field_mean_feature_bytes_peak,
+            int(stats.field_mean_feature_bytes_peak),
+        )
+        self.field_mean_mps_current_bytes_peak = max(
+            self.field_mean_mps_current_bytes_peak,
+            int(stats.field_mean_mps_current_bytes_peak),
+        )
+        self.field_mean_mps_driver_bytes_peak = max(
+            self.field_mean_mps_driver_bytes_peak,
+            int(stats.field_mean_mps_driver_bytes_peak),
+        )
+        self.field_mean_mps_recommended_bytes = max(
+            self.field_mean_mps_recommended_bytes,
+            int(stats.field_mean_mps_recommended_bytes),
+        )
         self.search_star_rows_peak = max(
             self.search_star_rows_peak,
             int(stats.search_star_rows_peak),
@@ -423,11 +627,49 @@ class _TraversalStructureTelemetry:
             raw_asterism_rows=self.raw_asterism_rows,
             dedupe_key_rows=self.dedupe_key_rows,
             post_bright_asterism_rows=self.post_bright_asterism_rows,
-            post_overlap_asterism_rows=self.post_overlap_asterism_rows,
+            candidate_graph_rows=self.candidate_graph_rows,
             local_asterism_rows=self.local_asterism_rows,
             context_pair_rows=self.context_pair_rows,
             winner_rows=self.winner_rows,
             winner_payload_rows=self.winner_payload_rows,
+            point_prediction_batches=self.point_prediction_batches,
+            point_prediction_rows=self.point_prediction_rows,
+            point_prediction_batch_rows_peak=self.point_prediction_batch_rows_peak,
+            point_prediction_backend_rows=self.point_prediction_backend_rows,
+            point_prediction_backend_batch_rows_peak=(
+                self.point_prediction_backend_batch_rows_peak
+            ),
+            point_prediction_backend_bucket_counts=tuple(
+                sorted(self.point_backend_bucket_counts.items())
+            ),
+            point_prediction_backend_bucket_rows=tuple(
+                sorted(self.point_backend_bucket_rows.items())
+            ),
+            point_feature_bytes_peak=self.point_feature_bytes_peak,
+            point_mps_current_bytes_peak=self.point_mps_current_bytes_peak,
+            point_mps_driver_bytes_peak=self.point_mps_driver_bytes_peak,
+            point_mps_recommended_bytes=self.point_mps_recommended_bytes,
+            field_mean_prediction_batches=self.field_mean_prediction_batches,
+            field_mean_prediction_rows=self.field_mean_prediction_rows,
+            field_mean_prediction_batch_rows_peak=(
+                self.field_mean_prediction_batch_rows_peak
+            ),
+            field_mean_prediction_backend_rows=(
+                self.field_mean_prediction_backend_rows
+            ),
+            field_mean_prediction_backend_batch_rows_peak=(
+                self.field_mean_prediction_backend_batch_rows_peak
+            ),
+            field_mean_prediction_backend_bucket_counts=tuple(
+                sorted(self.field_mean_backend_bucket_counts.items())
+            ),
+            field_mean_prediction_backend_bucket_rows=tuple(
+                sorted(self.field_mean_backend_bucket_rows.items())
+            ),
+            field_mean_feature_bytes_peak=self.field_mean_feature_bytes_peak,
+            field_mean_mps_current_bytes_peak=self.field_mean_mps_current_bytes_peak,
+            field_mean_mps_driver_bytes_peak=self.field_mean_mps_driver_bytes_peak,
+            field_mean_mps_recommended_bytes=self.field_mean_mps_recommended_bytes,
             search_star_rows_peak=self.search_star_rows_peak,
             ngs_rows_peak=self.ngs_rows_peak,
             close_pair_rows_peak=self.close_pair_rows_peak,
@@ -467,8 +709,8 @@ class _TraversalDiagnosticsWriter:
         "peak_rss_start_mb",
         "rss_after_star_selection_mb",
         "peak_rss_after_star_selection_mb",
-        "rss_after_find_asterisms_mb",
-        "peak_rss_after_find_asterisms_mb",
+        "rss_after_candidate_generation_mb",
+        "peak_rss_after_candidate_generation_mb",
         "rss_after_filtering_mb",
         "peak_rss_after_filtering_mb",
         "rss_after_context_mb",
@@ -491,10 +733,32 @@ class _TraversalDiagnosticsWriter:
         "ngs_rows",
         "close_pair_rows",
         "raw_asterism_rows",
-        "post_overlap_asterism_rows",
+        "candidate_graph_rows",
         "local_asterism_rows",
         "context_pair_rows",
         "winner_payload_rows",
+        "point_prediction_batches",
+        "point_prediction_rows",
+        "point_prediction_batch_rows_peak",
+        "point_prediction_backend_rows",
+        "point_prediction_backend_batch_rows_peak",
+        "point_prediction_backend_bucket_counts",
+        "point_prediction_backend_bucket_rows",
+        "point_feature_mib_peak",
+        "point_mps_current_mib_peak",
+        "point_mps_driver_mib_peak",
+        "point_mps_recommended_mib",
+        "field_mean_prediction_batches",
+        "field_mean_prediction_rows",
+        "field_mean_prediction_batch_rows_peak",
+        "field_mean_prediction_backend_rows",
+        "field_mean_prediction_backend_batch_rows_peak",
+        "field_mean_prediction_backend_bucket_counts",
+        "field_mean_prediction_backend_bucket_rows",
+        "field_mean_feature_mib_peak",
+        "field_mean_mps_current_mib_peak",
+        "field_mean_mps_driver_mib_peak",
+        "field_mean_mps_recommended_mib",
         "artifact_inner_structured_mib",
         "artifact_asterism_structured_mib",
         "error_message",
@@ -584,9 +848,11 @@ class _TraversalDiagnosticsWriter:
                 "peak_rss_after_star_selection_mb": (
                     f"{sample.peak_rss_after_star_selection_mb:.3f}"
                 ),
-                "rss_after_find_asterisms_mb": f"{sample.rss_after_find_asterisms_mb:.3f}",
-                "peak_rss_after_find_asterisms_mb": (
-                    f"{sample.peak_rss_after_find_asterisms_mb:.3f}"
+                "rss_after_candidate_generation_mb": (
+                    f"{sample.rss_after_candidate_generation_mb:.3f}"
+                ),
+                "peak_rss_after_candidate_generation_mb": (
+                    f"{sample.peak_rss_after_candidate_generation_mb:.3f}"
                 ),
                 "rss_after_filtering_mb": f"{sample.rss_after_filtering_mb:.3f}",
                 "peak_rss_after_filtering_mb": f"{sample.peak_rss_after_filtering_mb:.3f}",
@@ -620,10 +886,64 @@ class _TraversalDiagnosticsWriter:
                 "ngs_rows": sample.ngs_rows,
                 "close_pair_rows": sample.close_pair_rows,
                 "raw_asterism_rows": sample.raw_asterism_rows,
-                "post_overlap_asterism_rows": sample.post_overlap_asterism_rows,
+                "candidate_graph_rows": sample.candidate_graph_rows,
                 "local_asterism_rows": sample.local_asterism_rows,
                 "context_pair_rows": sample.context_pair_rows,
                 "winner_payload_rows": sample.winner_payload_rows,
+                "point_prediction_batches": sample.point_prediction_batches,
+                "point_prediction_rows": sample.point_prediction_rows,
+                "point_prediction_batch_rows_peak": (
+                    sample.point_prediction_batch_rows_peak
+                ),
+                "point_prediction_backend_rows": sample.point_prediction_backend_rows,
+                "point_prediction_backend_batch_rows_peak": (
+                    sample.point_prediction_backend_batch_rows_peak
+                ),
+                "point_prediction_backend_bucket_counts": (
+                    sample.point_prediction_backend_bucket_counts
+                ),
+                "point_prediction_backend_bucket_rows": (
+                    sample.point_prediction_backend_bucket_rows
+                ),
+                "point_feature_mib_peak": f"{sample.point_feature_mib_peak:.3f}",
+                "point_mps_current_mib_peak": (
+                    f"{sample.point_mps_current_mib_peak:.3f}"
+                ),
+                "point_mps_driver_mib_peak": (
+                    f"{sample.point_mps_driver_mib_peak:.3f}"
+                ),
+                "point_mps_recommended_mib": (
+                    f"{sample.point_mps_recommended_mib:.3f}"
+                ),
+                "field_mean_prediction_batches": sample.field_mean_prediction_batches,
+                "field_mean_prediction_rows": sample.field_mean_prediction_rows,
+                "field_mean_prediction_batch_rows_peak": (
+                    sample.field_mean_prediction_batch_rows_peak
+                ),
+                "field_mean_prediction_backend_rows": (
+                    sample.field_mean_prediction_backend_rows
+                ),
+                "field_mean_prediction_backend_batch_rows_peak": (
+                    sample.field_mean_prediction_backend_batch_rows_peak
+                ),
+                "field_mean_prediction_backend_bucket_counts": (
+                    sample.field_mean_prediction_backend_bucket_counts
+                ),
+                "field_mean_prediction_backend_bucket_rows": (
+                    sample.field_mean_prediction_backend_bucket_rows
+                ),
+                "field_mean_feature_mib_peak": (
+                    f"{sample.field_mean_feature_mib_peak:.3f}"
+                ),
+                "field_mean_mps_current_mib_peak": (
+                    f"{sample.field_mean_mps_current_mib_peak:.3f}"
+                ),
+                "field_mean_mps_driver_mib_peak": (
+                    f"{sample.field_mean_mps_driver_mib_peak:.3f}"
+                ),
+                "field_mean_mps_recommended_mib": (
+                    f"{sample.field_mean_mps_recommended_mib:.3f}"
+                ),
                 "artifact_inner_structured_mib": (
                     f"{sample.artifact_inner_structured_mib:.3f}"
                 ),
@@ -821,6 +1141,7 @@ def _materialize_outer_pixel_products(
     geometry: TraversalGeometry | None = None,
     memory_profile: TraversalMemoryProfile | None = None,
     artifact_memory_profile: ArtifactMemoryProfile | None = None,
+    memory_pressure_callback=None,
 ) -> tuple[ArtifactWriteProfile, TraversalStageStats, TraversalStructureStats]:
     """Run the Traversal pipeline for one outer pixel without mutating build state."""
 
@@ -831,6 +1152,7 @@ def _materialize_outer_pixel_products(
         store=store,
         geometry=geometry,
         memory_profile=memory_profile,
+        memory_pressure_callback=memory_pressure_callback,
     )
     write_profile = _write_outer_pixel_products(
         filename,
@@ -853,6 +1175,7 @@ def _build_outer_pixel_products(
     store=None,
     geometry: TraversalGeometry | None = None,
     memory_profile: TraversalMemoryProfile | None = None,
+    memory_pressure_callback=None,
 ) -> tuple[Path, Table, Table, TraversalStageStats, TraversalStructureStats]:
     """Build Traversal products for one outer pixel without writing artifacts."""
 
@@ -879,7 +1202,7 @@ def _build_outer_pixel_products(
     if geometry is None:
         geometry = TraversalGeometry.from_runtime(runtime)
     profile = TraversalStageProfile()
-    structure_profile = TraversalStructureProfile() if memory_profile is not None else None
+    structure_profile = TraversalStructureProfile()
     asterisms, inner = build_traversal_products(
         store,
         runtime,
@@ -892,11 +1215,7 @@ def _build_outer_pixel_products(
         memory_profile=memory_profile,
         rss_sampler=_current_rss_mb if memory_profile is not None else None,
         peak_sampler=_peak_rss_mb if memory_profile is not None else None,
-        asterism_skip_reason=(
-            "coarse_outer_density"
-            if int(outer_pix) in context.coarse_density_skip_outer_pixs
-            else None
-        ),
+        memory_pressure_callback=memory_pressure_callback,
     )
     filename = outer_artifact_filename(context.build_path, context.definition, outer_pix)
     structure_stats = (
@@ -1093,11 +1412,103 @@ def _reset_running_rows(
     return int(len(running))
 
 
+def _clear_torch_mps_cache() -> None:
+    try:
+        import torch
+    except Exception:
+        return
+    try:
+        if torch.backends.mps.is_built() and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        return
+
+
+def _trim_worker_runtime_memory(store: object) -> None:
+    if isinstance(store, RuntimeGaiaHealpixStore):
+        store.trim_cache(max_entries=0, max_bytes=0)
+    _clear_torch_mps_cache()
+    gc.collect()
+
+
+def _drain_worker_control_command(control_queue) -> str | None:
+    if control_queue is None:
+        return None
+    command = None
+    while True:
+        try:
+            command = control_queue.get_nowait()
+        except Empty:
+            return command
+
+
+def _apply_worker_memory_pressure_command(
+    *,
+    control_queue,
+    store: object,
+    worker_id: int,
+    run_started: float,
+    detailed: bool,
+    allow_pause: bool,
+) -> Iterator[TraversalWorkerMessage]:
+    command = _drain_worker_control_command(control_queue)
+    if command is None or command == PARENT_MEMORY_PRESSURE_RESUME:
+        return
+    if command not in (
+        PARENT_MEMORY_PRESSURE_TRIM,
+        PARENT_MEMORY_PRESSURE_PAUSE,
+    ):
+        return
+
+    _trim_worker_runtime_memory(store)
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event=f"after_memory_pressure_{command}",
+            run_started=run_started,
+        )
+    if command != PARENT_MEMORY_PRESSURE_PAUSE or not allow_pause:
+        return
+
+    pause_started = time.perf_counter()
+    while (
+        time.perf_counter() - pause_started
+        < WORKER_MEMORY_PRESSURE_MAX_PAUSE_SECONDS
+    ):
+        time.sleep(WORKER_MEMORY_PRESSURE_SLEEP_SECONDS)
+        next_command = _drain_worker_control_command(control_queue)
+        if next_command is None or next_command == PARENT_MEMORY_PRESSURE_PAUSE:
+            continue
+        if next_command == PARENT_MEMORY_PRESSURE_RESUME:
+            if detailed:
+                yield _worker_memory_sample(
+                    worker_id=worker_id,
+                    event="after_memory_pressure_resume",
+                    run_started=run_started,
+                )
+            return
+        if next_command == PARENT_MEMORY_PRESSURE_TRIM:
+            _trim_worker_runtime_memory(store)
+            if detailed:
+                yield _worker_memory_sample(
+                    worker_id=worker_id,
+                    event="after_memory_pressure_trim_while_paused",
+                    run_started=run_started,
+                )
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="after_memory_pressure_pause_timeout",
+            run_started=run_started,
+        )
+
+
 def _run_regional_traversal_worker(
     context: TraversalTaskContext,
     plan: TraversalWorkerPlan,
     execution_config: TraversalExecutionConfig,
     result_queue,
+    control_queue=None,
 ) -> None:
     """Worker entrypoint for one region-owned Traversal plan."""
 
@@ -1105,6 +1516,7 @@ def _run_regional_traversal_worker(
         context,
         plan,
         execution_config,
+        control_queue=control_queue,
     ):
         result_queue.put(message)
 
@@ -1179,6 +1591,101 @@ def _parent_total_current_rss_mb(processes: tuple | list = ()) -> float:
     return total
 
 
+@contextmanager
+def _prediction_device_environment(execution_config: TraversalExecutionConfig):
+    updates = {
+        PREDICT_DEVICE_ENV_VAR: execution_config.prediction_device,
+        AVERAGED_PREDICT_DEVICE_ENV_VAR: execution_config.averaged_prediction_device,
+    }
+    previous = {
+        env_var: os.environ.get(env_var)
+        for env_var, value in updates.items()
+        if value is not None
+    }
+    try:
+        for env_var, value in updates.items():
+            if value is not None:
+                os.environ[env_var] = value
+        yield
+    finally:
+        for env_var, old_value in previous.items():
+            if old_value is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = old_value
+
+
+def _prediction_device_value(
+    env_var: str,
+    configured_value: str | None,
+) -> str:
+    if configured_value is not None:
+        return configured_value
+    return os.environ.get(env_var, "cpu").strip().lower()
+
+
+def _gpu_prediction_enabled(
+    execution_config: TraversalExecutionConfig | None = None,
+) -> bool:
+    if not predict_backend.mps_is_available():
+        return False
+    resolved_device = _prediction_device_value(
+        PREDICT_DEVICE_ENV_VAR,
+        None if execution_config is None else execution_config.prediction_device,
+    )
+    averaged_device = _prediction_device_value(
+        AVERAGED_PREDICT_DEVICE_ENV_VAR,
+        None if execution_config is None else execution_config.averaged_prediction_device,
+    )
+    return any(
+        value == "auto"
+        for value in (resolved_device, averaged_device)
+    )
+
+
+def _parent_gpu_driver_reserve_mb(
+    worker_count: int,
+    execution_config: TraversalExecutionConfig | None = None,
+) -> float:
+    if int(worker_count) <= 0 or not _gpu_prediction_enabled(execution_config):
+        return 0.0
+    raw = os.environ.get(
+        PARENT_GPU_DRIVER_RESERVE_MB_ENV_VAR,
+        str(DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB),
+    )
+    try:
+        reserve_mb = float(raw)
+    except ValueError:
+        reserve_mb = DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB
+    return max(0.0, reserve_mb) * int(worker_count)
+
+
+def _active_process_count(processes: tuple | list) -> int:
+    count = 0
+    for process in processes:
+        exitcode = getattr(process, "exitcode", None)
+        if exitcode is None:
+            count += 1
+    return count
+
+
+def _parent_total_current_ram_mb(
+    processes: tuple | list = (),
+    *,
+    worker_count: int | None = None,
+    execution_config: TraversalExecutionConfig | None = None,
+) -> float:
+    reserve_workers = (
+        max(1, int(worker_count))
+        if worker_count is not None
+        else _active_process_count(processes)
+    )
+    return _parent_total_current_rss_mb(processes) + _parent_gpu_driver_reserve_mb(
+        reserve_workers,
+        execution_config,
+    )
+
+
 def _raise_if_parent_memory_limit_exceeded(
     execution_config: TraversalExecutionConfig,
     processes: tuple | list = (),
@@ -1186,12 +1693,210 @@ def _raise_if_parent_memory_limit_exceeded(
     limit = int(execution_config.parent_memory_limit_mb)
     if limit <= 0:
         return
-    total_mb = _parent_total_current_rss_mb(processes)
+    total_mb = _parent_total_current_ram_mb(
+        processes,
+        worker_count=None if processes else 1,
+        execution_config=execution_config,
+    )
     if total_mb > float(limit):
         raise BuildError(
-            f"parent memory limit exceeded: current RSS {total_mb:.1f} MiB "
+            f"parent memory limit exceeded: current total RAM {total_mb:.1f} MiB "
             f"> {limit} MiB"
         )
+
+
+def _classify_parent_memory_pressure(
+    *,
+    total_mb: float,
+    limit_mb: int,
+    previous_state: str,
+) -> str:
+    """Classify total-RAM pressure with hysteresis around soft and hard bands."""
+
+    if int(limit_mb) <= 0:
+        return PARENT_MEMORY_PRESSURE_NORMAL
+    hard_mb = float(limit_mb) * PARENT_MEMORY_HARD_FRACTION
+    soft_mb = float(limit_mb) * PARENT_MEMORY_SOFT_FRACTION
+    hard_release_mb = float(limit_mb) * PARENT_MEMORY_HARD_RELEASE_FRACTION
+    soft_release_mb = float(limit_mb) * PARENT_MEMORY_SOFT_RELEASE_FRACTION
+
+    if total_mb >= hard_mb:
+        return PARENT_MEMORY_PRESSURE_PAUSE
+    if (
+        previous_state == PARENT_MEMORY_PRESSURE_PAUSE
+        and total_mb >= hard_release_mb
+    ):
+        return PARENT_MEMORY_PRESSURE_PAUSE
+    if total_mb >= soft_mb:
+        return PARENT_MEMORY_PRESSURE_TRIM
+    if (
+        previous_state
+        in (PARENT_MEMORY_PRESSURE_TRIM, PARENT_MEMORY_PRESSURE_PAUSE)
+        and total_mb >= soft_release_mb
+    ):
+        return PARENT_MEMORY_PRESSURE_TRIM
+    return PARENT_MEMORY_PRESSURE_NORMAL
+
+
+def _select_parent_memory_pressure_targets(
+    *,
+    pressure_state: str,
+    worker_rss_mb: dict[int, float],
+    active_worker_ids: set[int],
+) -> tuple[int, ...]:
+    """Return heaviest active workers to target under memory pressure."""
+
+    if pressure_state == PARENT_MEMORY_PRESSURE_NORMAL or not active_worker_ids:
+        return ()
+    ranked = sorted(
+        (int(worker_id) for worker_id in active_worker_ids),
+        key=lambda worker_id: worker_rss_mb.get(worker_id, 0.0),
+        reverse=True,
+    )
+    if pressure_state == PARENT_MEMORY_PRESSURE_TRIM or len(ranked) <= 1:
+        return tuple(ranked[:1])
+    target_count = max(1, (len(ranked) + 1) // 2)
+    return tuple(ranked[:target_count])
+
+
+def _worker_process_rss_mb(
+    process_by_worker_id: dict[int, object],
+) -> dict[int, float]:
+    rss_by_worker: dict[int, float] = {}
+    for worker_id, process in process_by_worker_id.items():
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            rss_by_worker[int(worker_id)] = 0.0
+            continue
+        rss_by_worker[int(worker_id)] = _process_current_rss_mb(int(pid))
+    return rss_by_worker
+
+
+def _send_parent_memory_pressure_commands(
+    *,
+    build_path: Path,
+    control_queues: dict[int, object],
+    active_worker_ids: set[int],
+    worker_rss_mb: dict[int, float],
+    worker_pressure_states: dict[int, str],
+    worker_pressure_command_times: dict[int, float],
+    pressure_state: str,
+    targets: tuple[int, ...],
+    now: float,
+) -> None:
+    target_set = set(targets)
+    for worker_id in sorted(active_worker_ids):
+        if worker_id in target_set:
+            desired_state = pressure_state
+            if (
+                desired_state == PARENT_MEMORY_PRESSURE_PAUSE
+                and len(active_worker_ids) <= 1
+            ):
+                desired_state = PARENT_MEMORY_PRESSURE_TRIM
+        else:
+            desired_state = PARENT_MEMORY_PRESSURE_NORMAL
+
+        current_state = worker_pressure_states.get(
+            worker_id,
+            PARENT_MEMORY_PRESSURE_NORMAL,
+        )
+        last_command = worker_pressure_command_times.get(worker_id, 0.0)
+        should_send = desired_state != current_state
+        if (
+            desired_state != PARENT_MEMORY_PRESSURE_NORMAL
+            and now - last_command >= PARENT_MEMORY_PRESSURE_COMMAND_INTERVAL_SECONDS
+        ):
+            should_send = True
+        if not should_send:
+            continue
+
+        command = (
+            PARENT_MEMORY_PRESSURE_RESUME
+            if desired_state == PARENT_MEMORY_PRESSURE_NORMAL
+            else desired_state
+        )
+        control_queue = control_queues.get(worker_id)
+        if control_queue is None:
+            continue
+        control_queue.put(command)
+        worker_pressure_states[worker_id] = desired_state
+        worker_pressure_command_times[worker_id] = now
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={worker_id} "
+            f"memory_pressure_command={command} "
+            f"worker_rss_mb={worker_rss_mb.get(worker_id, 0.0):.1f}",
+        )
+
+
+def _update_parent_memory_pressure(
+    *,
+    build_path: Path,
+    execution_config: TraversalExecutionConfig,
+    process_by_worker_id: dict[int, object],
+    control_queues: dict[int, object],
+    active_worker_ids: set[int],
+    worker_pressure_states: dict[int, str],
+    worker_pressure_command_times: dict[int, float],
+    previous_state: str,
+    previous_targets: tuple[int, ...],
+) -> tuple[str, tuple[int, ...]]:
+    """Monitor total RAM and ask the heaviest workers to back off when needed."""
+
+    limit = int(execution_config.parent_memory_limit_mb)
+    if limit <= 0:
+        return PARENT_MEMORY_PRESSURE_NORMAL, ()
+
+    worker_rss_mb = _worker_process_rss_mb(process_by_worker_id)
+    active_worker_rss_mb = {
+        worker_id: worker_rss_mb.get(worker_id, 0.0)
+        for worker_id in active_worker_ids
+    }
+    gpu_reserve_mb = _parent_gpu_driver_reserve_mb(
+        len(active_worker_ids),
+        execution_config,
+    )
+    total_mb = _current_rss_mb() + sum(active_worker_rss_mb.values()) + gpu_reserve_mb
+    pressure_state = _classify_parent_memory_pressure(
+        total_mb=total_mb,
+        limit_mb=limit,
+        previous_state=previous_state,
+    )
+    targets = _select_parent_memory_pressure_targets(
+        pressure_state=pressure_state,
+        worker_rss_mb=active_worker_rss_mb,
+        active_worker_ids=active_worker_ids,
+    )
+    now = time.perf_counter()
+    _send_parent_memory_pressure_commands(
+        build_path=build_path,
+        control_queues=control_queues,
+        active_worker_ids=active_worker_ids,
+        worker_rss_mb=active_worker_rss_mb,
+        worker_pressure_states=worker_pressure_states,
+        worker_pressure_command_times=worker_pressure_command_times,
+        pressure_state=pressure_state,
+        targets=targets,
+        now=now,
+    )
+    if pressure_state != previous_state or targets != previous_targets:
+        target_text = ",".join(str(worker_id) for worker_id in targets) or "none"
+        rss_text = ",".join(
+            f"{worker_id}:{active_worker_rss_mb[worker_id]:.1f}"
+            for worker_id in sorted(active_worker_rss_mb)
+        )
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"memory_pressure state={pressure_state} "
+            f"total_mb={total_mb:.1f} "
+            f"gpu_reserve_mb={gpu_reserve_mb:.1f} "
+            f"limit_mb={limit} "
+            f"targets={target_text} "
+            f"worker_rss_mb={rss_text}",
+        )
+    return pressure_state, targets
 
 
 def _darwin_current_rss_mb() -> float:
@@ -1291,13 +1996,6 @@ def _traversal_worker_stats_message(
             cache_stats=_traversal_cache_stats(store),
         ),
     )
-
-
-def _worker_memory_limit_exceeded(
-    execution_config: TraversalExecutionConfig,
-) -> bool:
-    limit = int(execution_config.worker_memory_limit_mb)
-    return limit > 0 and _peak_rss_mb() > float(limit)
 
 
 def _build_memory_sample(
@@ -1415,8 +2113,8 @@ def _build_memory_sample(
         peak_rss_start_mb=memory_profile.peak_rss_start_mb,
         rss_after_star_selection_mb=memory_profile.rss_after_star_selection_mb,
         peak_rss_after_star_selection_mb=memory_profile.peak_rss_after_star_selection_mb,
-        rss_after_find_asterisms_mb=memory_profile.rss_after_find_asterisms_mb,
-        peak_rss_after_find_asterisms_mb=memory_profile.peak_rss_after_find_asterisms_mb,
+        rss_after_candidate_generation_mb=memory_profile.rss_after_candidate_generation_mb,
+        peak_rss_after_candidate_generation_mb=memory_profile.peak_rss_after_candidate_generation_mb,
         rss_after_filtering_mb=memory_profile.rss_after_filtering_mb,
         peak_rss_after_filtering_mb=memory_profile.peak_rss_after_filtering_mb,
         rss_after_context_mb=memory_profile.rss_after_context_mb,
@@ -1441,10 +2139,66 @@ def _build_memory_sample(
         ngs_rows=structure_stats.ngs_rows,
         close_pair_rows=structure_stats.close_pair_rows,
         raw_asterism_rows=structure_stats.raw_asterism_rows,
-        post_overlap_asterism_rows=structure_stats.post_overlap_asterism_rows,
+        candidate_graph_rows=structure_stats.candidate_graph_rows,
         local_asterism_rows=structure_stats.local_asterism_rows,
         context_pair_rows=structure_stats.context_pair_rows,
         winner_payload_rows=structure_stats.winner_payload_rows,
+        point_prediction_batches=structure_stats.point_prediction_batches,
+        point_prediction_rows=structure_stats.point_prediction_rows,
+        point_prediction_batch_rows_peak=(
+            structure_stats.point_prediction_batch_rows_peak
+        ),
+        point_prediction_backend_rows=structure_stats.point_prediction_backend_rows,
+        point_prediction_backend_batch_rows_peak=(
+            structure_stats.point_prediction_backend_batch_rows_peak
+        ),
+        point_prediction_backend_bucket_counts=_format_bucket_stats(
+            structure_stats.point_prediction_backend_bucket_counts
+        ),
+        point_prediction_backend_bucket_rows=_format_bucket_stats(
+            structure_stats.point_prediction_backend_bucket_rows
+        ),
+        point_feature_mib_peak=(
+            structure_stats.point_feature_bytes_peak / (1024.0 * 1024.0)
+        ),
+        point_mps_current_mib_peak=(
+            structure_stats.point_mps_current_bytes_peak / (1024.0 * 1024.0)
+        ),
+        point_mps_driver_mib_peak=(
+            structure_stats.point_mps_driver_bytes_peak / (1024.0 * 1024.0)
+        ),
+        point_mps_recommended_mib=(
+            structure_stats.point_mps_recommended_bytes / (1024.0 * 1024.0)
+        ),
+        field_mean_prediction_batches=structure_stats.field_mean_prediction_batches,
+        field_mean_prediction_rows=structure_stats.field_mean_prediction_rows,
+        field_mean_prediction_batch_rows_peak=(
+            structure_stats.field_mean_prediction_batch_rows_peak
+        ),
+        field_mean_prediction_backend_rows=(
+            structure_stats.field_mean_prediction_backend_rows
+        ),
+        field_mean_prediction_backend_batch_rows_peak=(
+            structure_stats.field_mean_prediction_backend_batch_rows_peak
+        ),
+        field_mean_prediction_backend_bucket_counts=_format_bucket_stats(
+            structure_stats.field_mean_prediction_backend_bucket_counts
+        ),
+        field_mean_prediction_backend_bucket_rows=_format_bucket_stats(
+            structure_stats.field_mean_prediction_backend_bucket_rows
+        ),
+        field_mean_feature_mib_peak=(
+            structure_stats.field_mean_feature_bytes_peak / (1024.0 * 1024.0)
+        ),
+        field_mean_mps_current_mib_peak=(
+            structure_stats.field_mean_mps_current_bytes_peak / (1024.0 * 1024.0)
+        ),
+        field_mean_mps_driver_mib_peak=(
+            structure_stats.field_mean_mps_driver_bytes_peak / (1024.0 * 1024.0)
+        ),
+        field_mean_mps_recommended_mib=(
+            structure_stats.field_mean_mps_recommended_bytes / (1024.0 * 1024.0)
+        ),
         artifact_inner_structured_mib=float(artifact_inner_structured_mib),
         artifact_asterism_structured_mib=float(artifact_asterism_structured_mib),
         error_message=error_message,
@@ -1474,6 +2228,8 @@ def _iter_long_lived_traversal_worker_messages(
     context: TraversalTaskContext,
     plan: TraversalWorkerPlan,
     execution_config: TraversalExecutionConfig,
+    *,
+    control_queue=None,
 ) -> Iterator[TraversalWorkerMessage]:
     """Yield Traversal messages from one reusable worker runtime."""
 
@@ -1541,6 +2297,14 @@ def _iter_long_lived_traversal_worker_messages(
             event="after_geometry",
             run_started=run_started,
         )
+    yield from _apply_worker_memory_pressure_command(
+        control_queue=control_queue,
+        store=store,
+        worker_id=plan.worker_id,
+        run_started=run_started,
+        detailed=detailed,
+        allow_pause=True,
+    )
     completed = 0
     failed = 0
     pixel_seconds = 0.0
@@ -1549,6 +2313,14 @@ def _iter_long_lived_traversal_worker_messages(
     structure_telemetry = _TraversalStructureTelemetry()
 
     for outer_pix in plan.outer_pixs:
+        yield from _apply_worker_memory_pressure_command(
+            control_queue=control_queue,
+            store=store,
+            worker_id=plan.worker_id,
+            run_started=run_started,
+            detailed=detailed,
+            allow_pause=True,
+        )
         yield TraversalWorkerMessage(
             worker_id=plan.worker_id,
             kind="started",
@@ -1563,6 +2335,20 @@ def _iter_long_lived_traversal_worker_messages(
                 peak_rss_start_mb=_peak_rss_mb(),
             )
             artifact_memory_profile = ArtifactMemoryProfile()
+        pressure_messages: list[TraversalWorkerMessage] = []
+
+        def poll_memory_pressure() -> None:
+            pressure_messages.extend(
+                _apply_worker_memory_pressure_command(
+                    control_queue=control_queue,
+                    store=store,
+                    worker_id=plan.worker_id,
+                    run_started=run_started,
+                    detailed=detailed,
+                    allow_pause=True,
+                )
+            )
+
         try:
             write_profile, stage_stats, structure_stats = _materialize_outer_pixel_products(
                 context,
@@ -1572,6 +2358,7 @@ def _iter_long_lived_traversal_worker_messages(
                 geometry=geometry,
                 memory_profile=memory_profile,
                 artifact_memory_profile=artifact_memory_profile,
+                memory_pressure_callback=poll_memory_pressure,
             )
             artifact_write_telemetry.add(write_profile)
             stage_telemetry.add(stage_stats)
@@ -1598,6 +2385,7 @@ def _iter_long_lived_traversal_worker_messages(
                         error_message=str(exc),
                     ),
                 )
+            yield from pressure_messages
             yield TraversalWorkerMessage(
                 worker_id=plan.worker_id,
                 kind="failed",
@@ -1620,16 +2408,14 @@ def _iter_long_lived_traversal_worker_messages(
                     structure_telemetry=structure_telemetry,
                     store=store,
                 )
-            if _worker_memory_limit_exceeded(execution_config):
-                yield TraversalWorkerMessage(
-                    worker_id=plan.worker_id,
-                    kind="memory_limit",
-                    error_message=(
-                        "worker peak RSS exceeded "
-                        f"{execution_config.worker_memory_limit_mb} MiB"
-                    ),
-                )
-                return
+            yield from _apply_worker_memory_pressure_command(
+                control_queue=control_queue,
+                store=store,
+                worker_id=plan.worker_id,
+                run_started=run_started,
+                detailed=detailed,
+                allow_pause=True,
+            )
             continue
         pixel_seconds += time.perf_counter() - pixel_started
         completed += 1
@@ -1651,6 +2437,7 @@ def _iter_long_lived_traversal_worker_messages(
                     memory_profile=memory_profile,
                 ),
             )
+        yield from pressure_messages
         yield TraversalWorkerMessage(
             worker_id=plan.worker_id,
             kind="completed",
@@ -1672,16 +2459,14 @@ def _iter_long_lived_traversal_worker_messages(
                 structure_telemetry=structure_telemetry,
                 store=store,
             )
-        if _worker_memory_limit_exceeded(execution_config):
-            yield TraversalWorkerMessage(
-                worker_id=plan.worker_id,
-                kind="memory_limit",
-                error_message=(
-                    "worker peak RSS exceeded "
-                    f"{execution_config.worker_memory_limit_mb} MiB"
-                ),
-            )
-            return
+        yield from _apply_worker_memory_pressure_command(
+            control_queue=control_queue,
+            store=store,
+            worker_id=plan.worker_id,
+            run_started=run_started,
+            detailed=detailed,
+            allow_pause=True,
+        )
 
     yield _traversal_worker_stats_message(
         worker_id=plan.worker_id,
@@ -1857,6 +2642,42 @@ def _handle_regional_worker_message(
         artifact_asterism_structured_mib = stats.artifact_asterism_structured_bytes / (
             1024.0 * 1024.0
         )
+        point_feature_mib_peak = structure_stats.point_feature_bytes_peak / (
+            1024.0 * 1024.0
+        )
+        point_mps_current_mib_peak = structure_stats.point_mps_current_bytes_peak / (
+            1024.0 * 1024.0
+        )
+        point_mps_driver_mib_peak = structure_stats.point_mps_driver_bytes_peak / (
+            1024.0 * 1024.0
+        )
+        point_mps_recommended_mib = structure_stats.point_mps_recommended_bytes / (
+            1024.0 * 1024.0
+        )
+        field_mean_feature_mib_peak = structure_stats.field_mean_feature_bytes_peak / (
+            1024.0 * 1024.0
+        )
+        field_mean_mps_current_mib_peak = (
+            structure_stats.field_mean_mps_current_bytes_peak / (1024.0 * 1024.0)
+        )
+        field_mean_mps_driver_mib_peak = (
+            structure_stats.field_mean_mps_driver_bytes_peak / (1024.0 * 1024.0)
+        )
+        field_mean_mps_recommended_mib = (
+            structure_stats.field_mean_mps_recommended_bytes / (1024.0 * 1024.0)
+        )
+        point_backend_bucket_counts = _format_bucket_stats(
+            structure_stats.point_prediction_backend_bucket_counts
+        )
+        point_backend_bucket_rows = _format_bucket_stats(
+            structure_stats.point_prediction_backend_bucket_rows
+        )
+        field_mean_backend_bucket_counts = _format_bucket_stats(
+            structure_stats.field_mean_prediction_backend_bucket_counts
+        )
+        field_mean_backend_bucket_rows = _format_bucket_stats(
+            structure_stats.field_mean_prediction_backend_bucket_rows
+        )
         append_build_log(
             build_path,
             "phase=traversal "
@@ -1875,14 +2696,28 @@ def _handle_regional_worker_message(
             f"stage_candidate_generation_s={stage_stats.candidate_generation_seconds:.3f} "
             f"stage_filtering_s={stage_stats.filtering_seconds:.3f} "
             f"stage_bright_star_filter_s={stage_stats.bright_star_filter_seconds:.3f} "
-            f"stage_overlap_quality_s={stage_stats.overlap_quality_seconds:.3f} "
-            f"stage_overlap_geometry_s={stage_stats.overlap_geometry_seconds:.3f} "
             f"stage_inner_assignment_s={stage_stats.inner_assignment_seconds:.3f} "
             f"stage_local_selection_s={stage_stats.local_selection_seconds:.3f} "
             f"stage_inner_table_s={stage_stats.inner_table_seconds:.3f} "
             f"stage_context_s={stage_stats.context_seconds:.3f} "
             f"stage_point_prediction_s={stage_stats.point_prediction_seconds:.3f} "
+            f"stage_point_prediction_eligibility_s={stage_stats.point_prediction_eligibility_seconds:.3f} "
+            f"stage_point_prediction_eligibility_intersection_s={stage_stats.point_prediction_eligibility_intersection_seconds:.3f} "
+            f"stage_point_prediction_eligibility_extract_s={stage_stats.point_prediction_eligibility_extract_seconds:.3f} "
+            f"stage_point_prediction_buffer_s={stage_stats.point_prediction_buffer_seconds:.3f} "
+            f"stage_point_prediction_ngs_array_s={stage_stats.point_prediction_ngs_array_seconds:.3f} "
+            f"stage_point_prediction_model_s={stage_stats.point_prediction_model_seconds:.3f} "
+            f"stage_point_prediction_feature_s={stage_stats.point_prediction_feature_seconds:.3f} "
+            f"stage_point_prediction_backend_s={stage_stats.point_prediction_backend_seconds:.3f} "
+            f"stage_point_prediction_scatter_s={stage_stats.point_prediction_scatter_seconds:.3f} "
+            f"stage_point_prediction_scatter_filter_s={stage_stats.point_prediction_scatter_filter_seconds:.3f} "
+            f"stage_point_prediction_scatter_merge_s={stage_stats.point_prediction_scatter_merge_seconds:.3f} "
+            f"stage_point_prediction_scatter_sort_s={stage_stats.point_prediction_scatter_sort_seconds:.3f} "
+            f"stage_point_prediction_scatter_write_s={stage_stats.point_prediction_scatter_write_seconds:.3f} "
+            f"stage_point_prediction_cache_clear_s={stage_stats.point_prediction_cache_clear_seconds:.3f} "
             f"stage_field_mean_prediction_s={stage_stats.field_mean_prediction_seconds:.3f} "
+            f"stage_field_mean_prediction_feature_s={stage_stats.field_mean_prediction_feature_seconds:.3f} "
+            f"stage_field_mean_prediction_backend_s={stage_stats.field_mean_prediction_backend_seconds:.3f} "
             f"stage_coverage_s={stage_stats.coverage_seconds:.3f} "
             f"stage_dust_s={stage_stats.dust_seconds:.3f} "
             f"stage_persisted_asterisms_s={stage_stats.persisted_asterisms_seconds:.3f} "
@@ -1911,11 +2746,33 @@ def _handle_regional_worker_message(
             f"raw_asterism_rows={structure_stats.raw_asterism_rows} "
             f"dedupe_key_rows={structure_stats.dedupe_key_rows} "
             f"post_bright_asterism_rows={structure_stats.post_bright_asterism_rows} "
-            f"post_overlap_asterism_rows={structure_stats.post_overlap_asterism_rows} "
+            f"candidate_graph_rows={structure_stats.candidate_graph_rows} "
             f"local_asterism_rows={structure_stats.local_asterism_rows} "
             f"context_pair_rows={structure_stats.context_pair_rows} "
             f"winner_rows={structure_stats.winner_rows} "
             f"winner_payload_rows={structure_stats.winner_payload_rows} "
+            f"point_prediction_batches={structure_stats.point_prediction_batches} "
+            f"point_prediction_rows={structure_stats.point_prediction_rows} "
+            f"point_prediction_batch_rows_peak={structure_stats.point_prediction_batch_rows_peak} "
+            f"point_prediction_backend_rows={structure_stats.point_prediction_backend_rows} "
+            f"point_prediction_backend_batch_rows_peak={structure_stats.point_prediction_backend_batch_rows_peak} "
+            f"point_prediction_backend_bucket_counts={point_backend_bucket_counts or '-'} "
+            f"point_prediction_backend_bucket_rows={point_backend_bucket_rows or '-'} "
+            f"point_feature_mib_peak={point_feature_mib_peak:.3f} "
+            f"point_mps_current_mib_peak={point_mps_current_mib_peak:.3f} "
+            f"point_mps_driver_mib_peak={point_mps_driver_mib_peak:.3f} "
+            f"point_mps_recommended_mib={point_mps_recommended_mib:.3f} "
+            f"field_mean_prediction_batches={structure_stats.field_mean_prediction_batches} "
+            f"field_mean_prediction_rows={structure_stats.field_mean_prediction_rows} "
+            f"field_mean_prediction_batch_rows_peak={structure_stats.field_mean_prediction_batch_rows_peak} "
+            f"field_mean_prediction_backend_rows={structure_stats.field_mean_prediction_backend_rows} "
+            f"field_mean_prediction_backend_batch_rows_peak={structure_stats.field_mean_prediction_backend_batch_rows_peak} "
+            f"field_mean_prediction_backend_bucket_counts={field_mean_backend_bucket_counts or '-'} "
+            f"field_mean_prediction_backend_bucket_rows={field_mean_backend_bucket_rows or '-'} "
+            f"field_mean_feature_mib_peak={field_mean_feature_mib_peak:.3f} "
+            f"field_mean_mps_current_mib_peak={field_mean_mps_current_mib_peak:.3f} "
+            f"field_mean_mps_driver_mib_peak={field_mean_mps_driver_mib_peak:.3f} "
+            f"field_mean_mps_recommended_mib={field_mean_mps_recommended_mib:.3f} "
             f"search_star_rows_peak={structure_stats.search_star_rows_peak} "
             f"ngs_rows_peak={structure_stats.ngs_rows_peak} "
             f"close_pair_rows_peak={structure_stats.close_pair_rows_peak} "
@@ -1951,19 +2808,6 @@ def _handle_regional_worker_message(
             diagnostics_writer.write_worker(message.worker_memory_sample)
         return False
 
-    if message.kind == "memory_limit":
-        message_text = (
-            message.error_message
-            or f"worker {message.worker_id} exceeded memory limit"
-        )
-        append_build_log(
-            build_path,
-            "phase=traversal "
-            f"worker={message.worker_id} "
-            f"memory_limit: {message_text}",
-        )
-        raise BuildError(message_text)
-
     if message.kind == "done":
         return False
 
@@ -1988,34 +2832,67 @@ def _run_regional_traversal_workers(
 
     process_context = _create_regional_process_context()
     result_queue = process_context.Queue()
+    control_queues = {
+        plan.worker_id: process_context.Queue()
+        for plan in plans
+    }
     processes = []
+    process_by_worker_id: dict[int, object] = {}
     active_worker_ids = {plan.worker_id for plan in plans}
+    worker_pressure_states = {
+        plan.worker_id: PARENT_MEMORY_PRESSURE_NORMAL
+        for plan in plans
+    }
+    worker_pressure_command_times: dict[int, float] = {}
+    memory_pressure_state = PARENT_MEMORY_PRESSURE_NORMAL
+    memory_pressure_targets: tuple[int, ...] = ()
     progress: dict[int, dict[str, int]] = {
         plan.worker_id: {"completed": 0, "failed": 0} for plan in plans
     }
     failed = False
     last_parent_memory_check = 0.0
 
-    for plan in plans:
-        append_build_log(
-            build_path,
-            "phase=traversal "
-            f"worker={plan.worker_id} "
-            f"regions={','.join(str(pix) for pix in plan.region_pixs)} "
-            f"outer_pixels={len(plan.outer_pixs)} "
-            f"estimated_star_count={plan.estimated_star_count} started",
-        )
-        process = process_context.Process(
-            target=_run_regional_traversal_worker,
-            args=(context, plan, execution_config, result_queue),
-        )
-        process.start()
-        processes.append(process)
+    with _prediction_device_environment(execution_config):
+        for plan in plans:
+            append_build_log(
+                build_path,
+                "phase=traversal "
+                f"worker={plan.worker_id} "
+                f"regions={','.join(str(pix) for pix in plan.region_pixs)} "
+                f"outer_pixels={len(plan.outer_pixs)} "
+                f"estimated_star_count={plan.estimated_star_count} started",
+            )
+            process = process_context.Process(
+                target=_run_regional_traversal_worker,
+                args=(
+                    context,
+                    plan,
+                    execution_config,
+                    result_queue,
+                    control_queues[plan.worker_id],
+                ),
+            )
+            process.start()
+            processes.append(process)
+            process_by_worker_id[plan.worker_id] = process
 
     try:
         while active_worker_ids:
             now = time.perf_counter()
             if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                memory_pressure_state, memory_pressure_targets = (
+                    _update_parent_memory_pressure(
+                        build_path=build_path,
+                        execution_config=execution_config,
+                        process_by_worker_id=process_by_worker_id,
+                        control_queues=control_queues,
+                        active_worker_ids=active_worker_ids,
+                        worker_pressure_states=worker_pressure_states,
+                        worker_pressure_command_times=worker_pressure_command_times,
+                        previous_state=memory_pressure_state,
+                        previous_targets=memory_pressure_targets,
+                    )
+                )
                 _raise_if_parent_memory_limit_exceeded(execution_config, processes)
                 last_parent_memory_check = now
             try:
@@ -2041,10 +2918,26 @@ def _run_regional_traversal_workers(
             ) or failed
             now = time.perf_counter()
             if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                memory_pressure_state, memory_pressure_targets = (
+                    _update_parent_memory_pressure(
+                        build_path=build_path,
+                        execution_config=execution_config,
+                        process_by_worker_id=process_by_worker_id,
+                        control_queues=control_queues,
+                        active_worker_ids=active_worker_ids,
+                        worker_pressure_states=worker_pressure_states,
+                        worker_pressure_command_times=worker_pressure_command_times,
+                        previous_state=memory_pressure_state,
+                        previous_targets=memory_pressure_targets,
+                    )
+                )
                 _raise_if_parent_memory_limit_exceeded(execution_config, processes)
                 last_parent_memory_check = now
             if message.kind == "done":
                 active_worker_ids.discard(message.worker_id)
+                worker_pressure_states[message.worker_id] = (
+                    PARENT_MEMORY_PRESSURE_NORMAL
+                )
                 worker_progress = progress[message.worker_id]
                 append_build_log(
                     build_path,
@@ -2089,30 +2982,31 @@ def _run_in_process_traversal_worker(
         f"outer_pixels={len(plan.outer_pixs)} "
         f"estimated_star_count={plan.estimated_star_count} started",
     )
-    for message in _iter_long_lived_traversal_worker_messages(
-        context,
-        plan,
-        execution_config,
-    ):
-        _raise_if_parent_memory_limit_exceeded(execution_config)
-        failed = _handle_regional_worker_message(
-            build_path=build_path,
-            state=state,
-            message=message,
-            progress=progress,
-            telemetry=telemetry,
-            state_writer=state_writer,
-            diagnostics_writer=diagnostics_writer,
-        ) or failed
-        if message.kind == "done":
-            worker_progress = progress[message.worker_id]
-            append_build_log(
-                build_path,
-                "phase=traversal "
-                f"worker={message.worker_id} "
-                f"done completed={worker_progress['completed']} "
-                f"failed={worker_progress['failed']}",
-            )
+    with _prediction_device_environment(execution_config):
+        for message in _iter_long_lived_traversal_worker_messages(
+            context,
+            plan,
+            execution_config,
+        ):
+            _raise_if_parent_memory_limit_exceeded(execution_config)
+            failed = _handle_regional_worker_message(
+                build_path=build_path,
+                state=state,
+                message=message,
+                progress=progress,
+                telemetry=telemetry,
+                state_writer=state_writer,
+                diagnostics_writer=diagnostics_writer,
+            ) or failed
+            if message.kind == "done":
+                worker_progress = progress[message.worker_id]
+                append_build_log(
+                    build_path,
+                    "phase=traversal "
+                    f"worker={message.worker_id} "
+                    f"done completed={worker_progress['completed']} "
+                    f"failed={worker_progress['failed']}",
+                )
     return failed
 
 
@@ -2144,15 +3038,6 @@ def _run_traversal_phase(
         gaia_release=definition.gaia_release,
         outer_level=definition.outer_level,
     )
-    runtime = load_runtime_config(context.runtime_config_path, model_root=roots.model_root)
-    coarse_density_skips = coarse_density_skip_outer_pixs(runtime, star_counts)
-    context = TraversalTaskContext(
-        build_path=build_path,
-        definition=definition,
-        roots=roots,
-        runtime_config_path=context.runtime_config_path,
-        coarse_density_skip_outer_pixs=coarse_density_skips,
-    )
 
     state = load_state(build_path)
     state_telemetry = _StateUpdateTelemetry()
@@ -2179,10 +3064,8 @@ def _run_traversal_phase(
         f"derived_region_level={execution_config.region_level} "
         f"gaia_cache_entries={execution_config.gaia_cache_entries} "
         f"gaia_cache_mb={execution_config.gaia_cache_mb} "
-        f"worker_memory_limit_mb={execution_config.worker_memory_limit_mb} "
         f"parent_memory_limit_mb={execution_config.parent_memory_limit_mb} "
-        f"telemetry={execution_config.telemetry} "
-        f"coarse_density_skipped={len(coarse_density_skips)}",
+        f"telemetry={execution_config.telemetry}",
     )
     failed = False
     diagnostics_writer = (
@@ -2366,7 +3249,6 @@ def run_build(
     workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
-    worker_memory_limit_mb: int | None = None,
     parent_memory_limit_mb: int | None = None,
     telemetry: str | None = None,
     aosky_yaml: Path | None = None,
@@ -2397,7 +3279,6 @@ def run_build(
             workers=workers,
             gaia_cache_entries=gaia_cache_entries,
             gaia_cache_mb=gaia_cache_mb,
-            worker_memory_limit_mb=worker_memory_limit_mb,
             parent_memory_limit_mb=parent_memory_limit_mb,
             telemetry=telemetry,
             aosky_yaml=aosky_yaml,
@@ -2430,7 +3311,6 @@ def restart_build(
     workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
-    worker_memory_limit_mb: int | None = None,
     parent_memory_limit_mb: int | None = None,
     telemetry: str | None = None,
 ) -> Path:
@@ -2449,7 +3329,6 @@ def restart_build(
         workers=workers,
         gaia_cache_entries=gaia_cache_entries,
         gaia_cache_mb=gaia_cache_mb,
-        worker_memory_limit_mb=worker_memory_limit_mb,
         parent_memory_limit_mb=parent_memory_limit_mb,
         telemetry=telemetry,
         aosky_yaml=aosky_yaml,

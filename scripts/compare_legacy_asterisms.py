@@ -180,7 +180,6 @@ AOSystemRuntime = None
 PredictRuntime = None
 runtime_to_config = None
 RuntimeGaiaHealpixStore = None
-should_skip_asterisms = None
 maps_artifact_filename = None
 outer_artifact_filename = None
 sample_gaia_a0_for_outer_pixel = None
@@ -215,7 +214,7 @@ def _load_runtime() -> None:
     global resolve_traversal_execution_config
     global build_traversal_products
     global AOSystemRuntime, PredictRuntime, runtime_to_config
-    global RuntimeGaiaHealpixStore, should_skip_asterisms
+    global RuntimeGaiaHealpixStore
     global maps_artifact_filename, outer_artifact_filename, sample_gaia_a0_for_outer_pixel
     global prepare_gaia_tge_a0_cache
     global write_outer_artifact
@@ -253,7 +252,6 @@ def _load_runtime() -> None:
     from ao_sky.build.runtime_gaia import RuntimeGaiaHealpixStore as _RuntimeGaiaHealpixStore
     from ao_sky.build.traversal import (
         build_traversal_products as _build_traversal_products,
-        should_skip_asterisms as _should_skip_asterisms,
     )
     from ao_sky.dust import sample_gaia_a0_for_outer_pixel as _sample_gaia_a0_for_outer_pixel
     from ao_sky.dust import prepare_gaia_tge_a0_cache as _prepare_gaia_tge_a0_cache
@@ -283,7 +281,6 @@ def _load_runtime() -> None:
     PredictRuntime = _PredictRuntime
     runtime_to_config = _runtime_to_config
     RuntimeGaiaHealpixStore = _RuntimeGaiaHealpixStore
-    should_skip_asterisms = _should_skip_asterisms
     maps_artifact_filename = _maps_artifact_filename
     outer_artifact_filename = _outer_artifact_filename
     sample_gaia_a0_for_outer_pixel = _sample_gaia_a0_for_outer_pixel
@@ -319,9 +316,6 @@ class LegacyComparisonConfig:
     inner_level: int
     max_data_level: int
     asterism_epoch: float | None
-    asterisms_min_galactic_latitude: float
-    asterisms_galactic_latitude_bypass_pixs: tuple[int, ...]
-    asterisms_max_star_density: float | None
     asterisms_max_bright_star_mag: float | None
     asterisms_max_overlap: float | None
     coverage_ee_threshold_resolved: float
@@ -351,7 +345,6 @@ def load_live_legacy_traversal_outputs(
     if not legacy_python.exists():
         raise RuntimeError(f"Legacy Python runtime not found: {legacy_python}")
 
-    skip_asterisms, _ = should_skip_asterisms(runtime, outer_pix)
     with tempfile.TemporaryDirectory(prefix="ao-sky-legacy-compare-") as tmpdir:
         tmpdir_path = Path(tmpdir)
         asterism_filename = tmpdir_path / "asterisms.fits"
@@ -484,7 +477,7 @@ def load_live_legacy_traversal_outputs(
                 str(inner_filename),
                 str(outer_pix),
                 ao_system_name,
-                "1" if skip_asterisms else "0",
+                "0",
             ],
             cwd=legacy_config_path.parent,
             env={**os.environ, "MPLCONFIGDIR": str(tmpdir_path / "mpl")},
@@ -635,23 +628,12 @@ def load_legacy_config(filename: Path, ao_system_name: str) -> LegacyComparisonC
         },
     )
 
-    bypass_pixs = tuple(
-        int(pix)
-        for pix in raw.get("asterisms_galactic_latitude_bypass_pixs", [])
-    )
     return LegacyComparisonConfig(
         outer_level=int(raw["outer_level"]),
         inner_level=int(raw["inner_level"]),
         max_data_level=int(raw["max_data_level"]),
         asterism_epoch=(
             None if raw.get("asterism_epoch") is None else float(raw["asterism_epoch"])
-        ),
-        asterisms_min_galactic_latitude=float(raw.get("asterisms_min_galactic_latitude", 20.0)),
-        asterisms_galactic_latitude_bypass_pixs=bypass_pixs,
-        asterisms_max_star_density=(
-            None
-            if raw.get("asterisms_max_star_density") is None
-            else float(raw["asterisms_max_star_density"])
         ),
         asterisms_max_bright_star_mag=(
             None
@@ -696,10 +678,9 @@ def _build_runtime(
         outer_level=config.outer_level,
         inner_level=config.inner_level,
         epoch=config.asterism_epoch if config.asterism_epoch is not None else 2016.0,
-        min_galactic_latitude=config.asterisms_min_galactic_latitude,
-        max_star_density=config.asterisms_max_star_density,
         max_bright_star_mag=config.asterisms_max_bright_star_mag,
-        max_overlap=config.asterisms_max_overlap,
+        max_bright_star_exclusion=2.0 * ao_system.fov,
+        winner_ee_epsilon=0.01,
         prediction_wavelength=1.654 * u.micron,
         resolved_models=config.ao_system.resolved_models,
         averaged_models=config.ao_system.averaged_models,
@@ -1466,9 +1447,6 @@ def main() -> int:
         inner_level=config.inner_level,
         max_data_level=config.max_data_level,
         asterism_epoch=config.asterism_epoch,
-        asterisms_min_galactic_latitude=config.asterisms_min_galactic_latitude,
-        asterisms_galactic_latitude_bypass_pixs=config.asterisms_galactic_latitude_bypass_pixs,
-        asterisms_max_star_density=config.asterisms_max_star_density,
         asterisms_max_bright_star_mag=config.asterisms_max_bright_star_mag,
         asterisms_max_overlap=config.asterisms_max_overlap,
         coverage_ee_threshold_resolved=config.coverage_ee_threshold_resolved,

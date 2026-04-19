@@ -289,7 +289,6 @@ def resolve_traversal_execution_config(
     workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
-    worker_memory_limit_mb: int | None = None,
     parent_memory_limit_mb: int | None = None,
     telemetry: str | None = None,
     aosky_yaml: Path | None = None,
@@ -299,6 +298,7 @@ def resolve_traversal_execution_config(
 
     conf_data = _load_aosky_yaml(aosky_yaml=aosky_yaml, cwd=cwd)
     build_data = conf_data.get("build") if isinstance(conf_data.get("build"), dict) else {}
+    prediction_devices = _resolve_prediction_device_defaults(conf_data)
     resolved_workers = _resolve_int_setting(
         workers,
         build_data.get("workers"),
@@ -317,17 +317,15 @@ def resolve_traversal_execution_config(
         default=DEFAULT_GAIA_CACHE_MB,
         name="gaia_cache_mb",
     )
-    resolved_worker_memory_limit_mb = _resolve_int_setting(
-        worker_memory_limit_mb,
-        build_data.get("worker_memory_limit_mb"),
-        default=0,
-        name="worker_memory_limit_mb",
-    )
+    if "parent_memory_limit_mb" in build_data:
+        raise BuildError(
+            "build.parent_memory_limit_mb was renamed; use build.memory_limit_mb"
+        )
     resolved_parent_memory_limit_mb = _resolve_int_setting(
         parent_memory_limit_mb,
-        build_data.get("parent_memory_limit_mb"),
+        build_data.get("memory_limit_mb"),
         default=0,
-        name="parent_memory_limit_mb",
+        name="memory_limit_mb",
     )
     resolved_telemetry = (telemetry or "basic").strip().lower()
 
@@ -339,14 +337,9 @@ def resolve_traversal_execution_config(
         )
     if resolved_cache_mb < 0:
         raise BuildError(f"gaia_cache_mb must be non-negative, got {resolved_cache_mb}")
-    if resolved_worker_memory_limit_mb < 0:
-        raise BuildError(
-            "worker_memory_limit_mb must be non-negative, "
-            f"got {resolved_worker_memory_limit_mb}"
-        )
     if resolved_parent_memory_limit_mb < 0:
         raise BuildError(
-            "parent_memory_limit_mb must be non-negative, "
+            "memory_limit_mb must be non-negative, "
             f"got {resolved_parent_memory_limit_mb}"
         )
     if resolved_telemetry not in {"basic", "detailed"}:
@@ -363,10 +356,51 @@ def resolve_traversal_execution_config(
             outer_level=int(outer_level),
             workers=resolved_workers,
         ),
-        worker_memory_limit_mb=resolved_worker_memory_limit_mb,
         parent_memory_limit_mb=resolved_parent_memory_limit_mb,
         telemetry=resolved_telemetry,
+        prediction_device=prediction_devices[0],
+        averaged_prediction_device=prediction_devices[1],
     )
+
+
+def _resolve_prediction_device_defaults(
+    conf_data: dict[str, object],
+) -> tuple[str | None, str | None]:
+    prediction_raw = conf_data.get("prediction")
+    if not isinstance(prediction_raw, dict):
+        return None, None
+
+    resolved_device = prediction_raw.get("resolved_device")
+    averaged_device = prediction_raw.get("averaged_device")
+    shared_device = prediction_raw.get("device")
+    if resolved_device is None:
+        resolved_device = shared_device
+    if averaged_device is None:
+        averaged_device = shared_device
+
+    return (
+        _validate_prediction_device_default(
+            resolved_device,
+            field_name="prediction.resolved_device",
+        ),
+        _validate_prediction_device_default(
+            averaged_device,
+            field_name="prediction.averaged_device",
+        ),
+    )
+
+
+def _validate_prediction_device_default(
+    value: object,
+    *,
+    field_name: str,
+) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized not in {"cpu", "auto"}:
+        raise BuildError(f"{field_name} must be either 'cpu' or 'auto'")
+    return normalized
 
 
 def derive_traversal_region_level(*, outer_level: int, workers: int) -> int:

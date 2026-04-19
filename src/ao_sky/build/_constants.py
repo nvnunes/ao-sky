@@ -6,7 +6,7 @@ from typing import Final
 
 import numpy as np
 
-BUILD_LAYOUT_VERSION: Final[int] = 1
+BUILD_LAYOUT_VERSION: Final[int] = 2
 BUILD_FILENAME: Final[str] = "build.h5"
 BUILD_LOG_FILENAME: Final[str] = "build.log"
 RUNTIME_CONFIG_FILENAME: Final[str] = "build.yaml"
@@ -55,12 +55,10 @@ INNER_DTYPE: Final[np.dtype] = np.dtype(
         ("gaia_A0", "<f8"),
         ("star_count", "<i8"),
         ("ngs_count", "<i8"),
-        ("asterism_count", "<i8"),
         ("best_ee", "<f8"),
         ("best_sr", "<f8"),
         ("best_fwhm", "<f8"),
         ("winner_asterism_id", "<i8"),
-        ("winner_distance_arcsec", "<f8"),
         ("winner_ee_resolved", "<f8"),
         ("winner_ee_averaged", "<f8"),
         ("coverage_resolved", "?"),
@@ -96,7 +94,6 @@ MAPS_DTYPE: Final[np.dtype] = np.dtype(
         ("gaia_A0", "<f8"),
         ("star_count", "<i8"),
         ("ngs_count", "<i8"),
-        ("asterism_count", "<i8"),
         ("best_sr", "<f8"),
         ("best_ee", "<f8"),
         ("best_fwhm", "<f8"),
@@ -110,7 +107,6 @@ MAPS_DTYPE: Final[np.dtype] = np.dtype(
 MAPS_SUM_FIELDS: Final[tuple[str, ...]] = (
     "star_count",
     "ngs_count",
-    "asterism_count",
 )
 
 MAPS_MEAN_FIELDS: Final[tuple[str, ...]] = (

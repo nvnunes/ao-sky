@@ -81,7 +81,6 @@ def aggregate_maps(
             "gaia_A0": np.asarray(dust, dtype=np.float64)[order],
             "star_count": np.asarray(inner["star_count"], dtype=np.int64)[order],
             "ngs_count": np.asarray(inner["ngs_count"], dtype=np.int64)[order],
-            "asterism_count": np.asarray(inner["asterism_count"], dtype=np.int64)[order],
             "best_sr": np.asarray(inner["best_sr"], dtype=np.float64)[order],
             "best_ee": np.asarray(inner["best_ee"], dtype=np.float64)[order],
             "best_fwhm": np.asarray(inner["best_fwhm"], dtype=np.float64)[order],

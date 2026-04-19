@@ -35,6 +35,188 @@ benchmark material from the legacy implementation has been consolidated here so
   worker-local prepared Gaia table cache, but did not retain speculative read
   prewarm or write-behind artifact writes as active execution paths.
 
+## 2026-04-17 Phase 14 Synthetic Traversal Smoke
+
+Purpose:
+
+- check the CPU and memory shape of the Phase 14 winner-map-first Traversal
+  implementation before running expensive real-sky validation
+- stress adaptive candidate capping, field-of-regard bitsets, candidate-pixel
+  streaming, top-K winner state, local regularization, and retained winner
+  catalog construction without model-inference cost
+
+Setup:
+
+- synthetic Gaia tables generated around one `outer_level=6` outer pixel
+- `ao_system.min_wfs=1`, `ao_system.max_wfs=3`
+- fake resolved and averaged predictors returned deterministic arrays so the
+  measured cost is Traversal-side CPU and memory rather than model runtime
+- RSS was sampled with process high-water `ru_maxrss`, so values include Python
+  import/runtime overhead and are best read as relative smoke-test evidence
+
+### Synthetic Cases
+
+| Case | Inner Pixels | Input Stars | Candidate Budget | Adaptive NGS | Candidate Identities | Retained Winners | Winner Pixels | Wall | CPU | RSS Delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dense budget 256 | 256 | 200 | 256 | not recorded | not recorded | 1 | 1 | 0.120 s | 0.120 s | 19.4 MiB |
+| Dense default 4096 | 4096 | 400 | 4096 | not recorded | not recorded | 5 | 5 | 0.143 s | 0.143 s | 6.2 MiB |
+| Sparse default 4096 | 4096 | 400 | 4096 | not recorded | not recorded | 161 | 350 | 0.115 s | 0.115 s | 0.2 MiB |
+| Dense default 65536 | 65536 | 1000 | 65536 | 73 | 63249 | 27 | 72 | 5.598 s | 5.596 s | 76.7 MiB |
+
+For the dense default-65536 case, the adaptive graph details were:
+
+| Raw Stage A Estimate | Stage B Estimate | Close-Pair Edges | Graph Triangles | Budget Exceed Reason | Graph Time |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 260246 | 63249 | 2605 | 60571 | none | 0.214 s |
+
+Interpretation:
+
+- The adaptive cap did what it was designed to do in a deliberately dense
+  synthetic field: 1,000 available NGS rows were reduced to 73 adaptive NGS
+  rows while preserving a candidate count just under the default 65,536 budget.
+- The large smoke run stayed CPU-bound and single-process wall time matched CPU
+  time, which is expected with fake predictors and no real Gaia I/O.
+- The observed RSS increase was modest relative to the previous multi-GiB
+  legacy materialization problem. The main remaining production risk is real
+  model-inference cost and real-sky candidate-pixel row counts, which Phase 15
+  should measure carefully before all-sky execution.
+
+## 2026-04-17 Phase 14 Real-Data Traversal Benchmark
+
+Purpose:
+
+- run the Phase 14 winner-map-first Traversal implementation on the same
+  fixed real-sky sample used by the Phase 13 Traversal benchmarks
+- compare runtime and memory against the documented Phase 13 baseline
+- verify that the adaptive `max_mag` candidate budget, bitset eligibility,
+  top-K winner state, local winner regularization, retained winner catalog, and
+  final averaged winner prediction operate on real Gaia/model data
+
+Setup:
+
+- source config: `/Volumes/Data/Galaxy/aosky/gnao-baseline/ao-sky.yaml`
+- benchmark script writes a schema-version-2 benchmark config copy for each
+  scratch build, adding the Phase 14 `asterism` and bright-star exclusion
+  fields when the live source config has not yet been migrated in place
+- Gaia and dust root: `/Users/nelsonnunes/ao-sky-cache/gaia`
+- model root:
+  `/Users/nelsonnunes/Library/CloudStorage/Dropbox/Projects/survey_tools/data/models`
+- worker count: `3`
+- worker Gaia cache: `8` entries, `128 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
+- regional combination work: default inner pixel count per outer pixel
+  (`65,536` for `outer_level=6`, `inner_level=14`)
+- default internal prediction batch size after CPU tuning: `25,000` rows
+- later MPS comparison runs used `AO_SKY_PREDICTION_BATCH_SIZE=100000`
+  because MPS only became competitive for large resolved batches
+- sample source:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-compression-sweep-bench-20260416-212643/sample-pixels.ecsv`
+
+### Regularizer Optimization Check
+
+The first detailed real-data sample showed that the initial scalar local
+regularizer was too expensive. It computed HEALPix neighbours in a Python loop
+for every inner pixel. Replacing that with a vectorized neighbour matrix and
+vectorized support counting kept the same local rule but removed the dominant
+regularization overhead.
+
+| Run | Pixels | Workers | Telemetry | Wall | Avg Pixel | Local Selection/Px | Point Prediction/Px | Averaged Prediction/Px | Peak RSS |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| before vectorized regularizer | `12` | `3` | detailed | `47.926 s` | `3.706 s` | `2.230 s` | `0.979 s` | `0.278 s` | `1001.4 MiB` |
+| after vectorized regularizer | `12` | `3` | detailed | `21.685 s` | `1.542 s` | `0.076 s` | `0.976 s` | `0.277 s` | `992.5 MiB` |
+
+The 12-pixel sample is one contiguous region, so it mostly exercises one
+regional worker. It is useful for per-pixel stage shape, not worker scaling.
+
+Detailed row-count shape after the regularizer optimization:
+
+| Intermediate | Average Per Pixel | Peak Pixel | Interpretation |
+| --- | ---: | ---: | --- |
+| Expanded search stars | `2488` rows | `2597` rows | Stars loaded for the outer pixel plus two-ring boundary footprint |
+| Search NGS rows | `1106` rows | `1183` rows | Rows available before adaptive magnitude limiting |
+| Adaptive candidate identities | `4402` rows | `5207` rows | Exact one-, two-, and three-star combinations retained under the default candidate budget |
+| Stage A raw estimate | `260246` rows | n/a | Cheap raw-combination estimate before graph-constrained Stage B limiting |
+| Candidate/inner evaluation pairs | `93864` rows | `103886` rows | Resolved model rows streamed through the top-K winner state |
+| Retained winning asterisms | `2404` rows | `2624` rows | Unique regularized winners persisted in the outer-pixel asterism table |
+| Winner inner pixels | `38427` rows | `39450` rows | Inner pixels with a regularized winning asterism |
+| Inner artifact structured array | `5.125 MiB` | n/a | Dense inner rows copied for HDF5 writing |
+| Asterism artifact structured array | `0.308 MiB` | n/a | Retained asterism rows copied for HDF5 writing |
+
+### Prediction Feature Path Optimization
+
+The next detailed sample confirmed that the expensive "prediction" bucket was
+not only model inference. It also included Python construction of
+`list[list[dict]]` NGS payloads, backend conversion of those payloads into
+feature matrices, and row-by-row top-K scatter updates. Phase 14 now builds the
+model feature matrix directly from vectorized NumPy arrays and updates top-K
+state with a batch sort/scatter.
+
+The direct array feature path was checked against the pre-optimization
+list/dict path by comparing the 12 generated `outer.h5` artifacts from the same
+sample. Core inner performance and winner columns matched exactly:
+`best_ee`, `best_sr`, `best_fwhm`, `winner_asterism_id`,
+`winner_ee_resolved`, `winner_ee_averaged`, `coverage_resolved`, and
+`coverage_averaged`.
+
+Batch-size tuning on the same 12-pixel sample:
+
+| Feature Path | Batch Size | Wall | Avg Pixel | Point Prediction/Px | Averaged Prediction/Px | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Python payloads | `10000` | `21.685 s` | `1.542 s` | `0.976 s` | `0.277 s` | `992.5 MiB` |
+| NumPy arrays | `100000` | `13.788 s` | `0.785 s` | `0.380 s` | `0.113 s` | `2750.3 MiB` |
+| NumPy arrays | `50000` | `12.236 s` | `0.756 s` | `0.365 s` | `0.112 s` | `2095.9 MiB` |
+| NumPy arrays | `25000` | `12.128 s` | `0.766 s` | `0.367 s` | `0.111 s` | `2016.8 MiB` |
+| NumPy arrays | `10000` | `13.490 s` | `0.807 s` | `0.383 s` | `0.118 s` | `980.7 MiB` |
+
+Interpretation:
+
+- direct feature construction removes most of the Python payload overhead while
+  preserving the same predictions
+- `25,000` rows is the best current speed/memory compromise on this sample; it
+  is effectively tied with `50,000` rows in wall time but keeps peak RSS
+  slightly lower
+- `10,000` rows is a useful fallback if higher-density Phase 15 samples show
+  memory pressure, but it gives up throughput on this benchmark
+
+### Fixed 288-Pixel Sample
+
+Benchmark build root:
+
+`/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-104810`
+
+Results:
+
+| Case | Completed Pixels | Wall | Elapsed | Pixels/s | Avg Pixel | Point Prediction/Px | Averaged Prediction/Px | Local Selection/Px | Avg Artifact Write | Artifact Size/Px | Gaia Load | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Phase 13 post-dust-cache, 3 workers | `288` | `137.491 s` | n/a | `2.095` | `1.332 s` | n/a | n/a | n/a | `0.036 s` | `0.531 MiB` | n/a | `1060.7 MiB` |
+| Phase 14 winner-map-first | `288` | `97.484 s` | `96.653 s` | `2.980` | `0.932 s` | `0.484 s` | `0.147 s` | `0.083 s` | `0.050 s` | `1.060 MiB` | `6.813 s` | `2272.2 MiB` |
+
+Interpretation:
+
+- The optimized Phase 14 real-data path is about `29%` faster than the
+  post-dust-cache Phase 13 `3`-worker fixed-sample runtime while doing more
+  work: one-star asterisms are now included, overlap pruning is no longer
+  selecting a small retained catalog before prediction, and the averaged model
+  is evaluated for the final regularized winner field.
+- Resolved plus averaged prediction remains the largest cost, but direct
+  vectorized feature construction reduced it from about `1.41 s/pixel` to
+  about `0.63 s/pixel`.
+- The vectorized local regularizer is no longer a major bottleneck at
+  about `0.08 s/pixel`.
+- Artifact size roughly doubled because Phase 14 retains unique winning
+  asterisms rather than the smaller overlap-pruned legacy catalog.
+- Peak worker RSS is materially higher than the post-dust-cache Phase 13
+  baseline on this sample: `2272.2 MiB` versus `1060.7 MiB`. The earlier
+  `3710.3 MiB` Phase 13 result measured the pre-mmap dust high-water behavior
+  and should not be used as the memory baseline for Phase 14.
+- The old `2048 MiB` per-worker target was practical for post-dust-cache
+  Phase 13, but Phase 14 with real prediction can exceed it. Phase 15 should
+  repeat this on higher-density fields before choosing the all-sky memory guard
+  and prediction batch-size default.
+- The implementation is worth further review and Phase 15 physical validation,
+  but the main remaining performance risk is model-call volume on dense fields
+  rather than avoidable Python payload construction.
+
 ## 2026-04-01 Storage Baseline
 
 Purpose:
@@ -64,7 +246,7 @@ Devices tested:
 | DataSSD | 5000 | 19.5 MiB | 1.41 s | 3548.4 |
 | Local SSD | 5000 | 19.5 MiB | 1.30 s | 3847.3 |
 
-Retained interpretation:
+Interpretation:
 
 - HDD was acceptable for sustained transfer but very poor for seek-heavy
   many-file access.
@@ -106,7 +288,7 @@ Benchmark region:
 | `CLUSTER_PASS1` | 0.3646 s | 0.3799 s |
 | `CLUSTER_PASS2` | 0.3975 s | 0.4056 s |
 
-Retained interpretation:
+Interpretation:
 
 - HDD remained much worse for cold Gaia access.
 - DataSSD was already strong for the actual Gaia HEALPix read pattern.
@@ -148,7 +330,7 @@ Important setup notes:
 | DataSSD | 1 | 82.336 s | 16.467 s |
 | DataSSD | 5 | 105.300 s | 21.060 s |
 
-Retained interpretation:
+Interpretation:
 
 - DataSSD clearly improved cold single-pixel Gaia load time.
 - Even so, most single-pixel wall time was not raw Gaia I/O.
@@ -189,7 +371,7 @@ Setup:
 | DataSSD | 82.336 s | 16.467 s |
 | Local `/tmp` | 81.510 s | 16.302 s |
 
-Retained interpretation:
+Interpretation:
 
 - The local-only run did not beat DataSSD on the single-pixel benchmark.
 - For the 5-pixel mixed-density batch at `cores=1`, local `/tmp`, DataSSD, and
@@ -222,7 +404,7 @@ Purpose:
 | Combined HDF5 with one dataset | 131,826,282 bytes |
 | Combined size change | -56.3% |
 
-Retained interpretation:
+Interpretation:
 
 - Compressed HDF5 was materially smaller than the FITS representation for real
   Gaia files.
@@ -246,7 +428,7 @@ Common setup for the initial probes:
 - Gaia root: `/Volumes/Data/Galaxy/aosky`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - measurement method: short restart/run samples, stopped before completion
 - benchmark caveat: the live build scheduler can hit uneven-density work; the
   write-behind comparison used scratch copies of the same `build.h5` and
@@ -273,7 +455,7 @@ Setup:
   `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260416-225527`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - sample source:
   `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-compression-sweep-bench-20260416-212643/sample-pixels.ecsv`
 
@@ -415,7 +597,7 @@ Representative first high-water pixels:
 | `27027` | `2` | `416.8 MiB` | `3318.2 MiB` | `437.9 MiB` | `2559.9 MiB` |
 | `34448` | `0` | `418.3 MiB` | `3291.2 MiB` | `417.2 MiB` | `2470.5 MiB` |
 
-Retained interpretation:
+Interpretation:
 
 - overlap geometry filtering is the largest measured bucket, followed by
   bright-star filtering
@@ -495,7 +677,7 @@ Purpose:
 - measure fixed-sample throughput as the worker count approaches the available
   performance-core budget on the M4 Max test system
 - keep the same 288-pixel non-crowded sample for each run
-- confirm the new memory guards are practical during real Traversal execution
+- confirm the memory guards used at the time were practical during real Traversal execution
 
 Setup:
 
@@ -503,7 +685,7 @@ Setup:
 - Gaia root: `/Users/nelsonnunes/ao-sky-cache/gaia`
 - artifact writes: direct HDD writes with Blosc Zstd
 - telemetry: basic profile logging
-- worker memory guard: `2048 MiB`
+- historical worker peak-RSS guard: `2048 MiB`
 - parent aggregate current-RSS guard: `12288 MiB`
 - benchmark roots:
   `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-001121`
@@ -522,7 +704,7 @@ Results:
 | `8` | `69.404 s` | `4.150` | `1.393 s` | `1.335 s` | `0.039 s` | `1417.4 MiB` | `0` |
 | `9` | `59.745 s` | `4.821` | `1.599 s` | `1.531 s` | `0.045 s` | `1370.8 MiB` | `0` |
 
-Retained interpretation:
+Interpretation:
 
 - `9` workers was fastest on this fixed non-crowded sample, completing the
   sample in `59.745 s`
@@ -552,7 +734,7 @@ Setup:
 - scratch build root: `/tmp/ao-sky-fixed-gaia-bench-20260416-192625`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - artifact writes: scratch build directories under `/tmp`
 - sample criteria: `60` loaded outer pixels with `1000 <= star_count <= 2500`
   and `abs(galactic latitude) >= 40 deg`
@@ -568,7 +750,7 @@ Results:
 | HDD Gaia | `2` | `60` | `42.845 s` | `1.400` | `2.074 s` | `0.360 s` | `0.184 s` | `0.159 s` | `0.025 s` | `57` | `3895.1 MiB` |
 | SSD Gaia | `2` | `60` | `41.000 s` | `1.463` | `1.976 s` | `0.360 s` | `0.053 s` | `0.030 s` | `0.023 s` | `57` | `3903.5 MiB` |
 
-Retained interpretation:
+Interpretation:
 
 - the SSD Gaia mirror materially reduced raw Gaia load time, but total
   Traversal elapsed time improved by only about `8%` on this moderate-density
@@ -603,7 +785,7 @@ Setup:
 - HDD scratch build root: `/tmp/ao-sky-cache-signal-bench-20260416-201046`
 - SSD scratch build root: `/tmp/ao-sky-cache-signal-ssd-bench-20260416-202355`
 - worker count: `3`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - artifact writes: scratch build directories under `/tmp`
 - sample: `18` complete HEALPix regions at level `4`, totaling `288` level-6
   outer pixels
@@ -621,7 +803,7 @@ Results:
 | SSD | cache off | `0` | `0` | `288` | `178.547 s` | `175.818 s` | `1.638` | `1.775 s` | `0.389 s` | `8.149 s` | `4.835 s` | `3.315 s` | `0` | `0` | `0.000` | `0` | `0.0 MiB` | `3921.7 MiB` |
 | SSD | cache on | `8` | `128` | `288` | `180.336 s` | `177.327 s` | `1.624` | `1.785 s` | `0.392 s` | `6.087 s` | `3.666 s` | `2.419 s` | `829` | `2051` | `0.288` | `2027` | `2.4 MiB` | `3929.1 MiB` |
 
-Retained interpretation:
+Interpretation:
 
 - the prepared Gaia table cache reduced measured Gaia load and preparation time
   on both roots: about `25%` on HDD, from `14.357 s` to `10.736 s`, and about
@@ -654,7 +836,7 @@ cache.
 | `gaia_prewarm_window=2` | about `0.163-0.169 s/pixel` | no prewarm failures or drops | best observed balance |
 | `gaia_prewarm_window=4` | about `0.169-0.174 s/pixel` | stable but no meaningful gain | not worth extra lookahead |
 
-Retained interpretation:
+Interpretation:
 
 - the initial `0` versus nonzero window comparison overstated the value of
   prewarm because it mixed prewarm with regional scheduling and prepared-table
@@ -684,7 +866,7 @@ Setup:
 - artifact stage root: `/Users/nelsonnunes/ao-sky-cache/artifact-stage`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - sample: same `18` region / `288` outer-pixel sample as above
 
 Results:
@@ -709,7 +891,7 @@ Artifact volume:
 - asterism rows: `135,718` total, about `471` rows per outer pixel
 - artifact size: `154.9 MiB` total, about `0.538 MiB` per outer pixel
 
-Retained interpretation:
+Interpretation:
 
 - artifact write time is not raw disk copy time and not Astropy-to-NumPy table
   conversion time
@@ -742,7 +924,7 @@ Setup:
 - artifact stage root: `/Users/nelsonnunes/ao-sky-cache/artifact-stage`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - sample: same `18` region / `288` outer-pixel sample as above
 
 Results:
@@ -792,7 +974,7 @@ No-compression additive worker-time breakdown:
 | Worker-side replace | `0.026 s` | `<0.001 s` | `<0.1%` |
 | Total worker pixel time | `406.312 s` | `1.411 s` | `100.0%` |
 
-Retained interpretation:
+Interpretation:
 
 - the dominant artifact-write cost was gzip compression of the dense `inner`
   dataset, not HDF5 dataset creation itself
@@ -825,7 +1007,7 @@ Setup:
 - artifact stage root: `/Users/nelsonnunes/ao-sky-cache/artifact-stage`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - sample: same `18` region / `288` outer-pixel sample as above
 - plugin codecs used `hdf5plugin` with Blosc `clevel=5`
 
@@ -860,7 +1042,7 @@ Read/decompression check:
 | `blosc-lz4` | `73.2 MiB` | `0.380 s` | `3.96 ms` |
 | `uncompressed` | `594.1 MiB` | `0.091 s` | `0.95 ms` |
 
-Retained interpretation:
+Interpretation:
 
 - every tested alternative to `gzip=9` removed most of the artifact-write
   bottleneck
@@ -932,7 +1114,7 @@ Setup:
 - artifact stage root: `/Users/nelsonnunes/ao-sky-cache/artifact-stage`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - sample: same region list as the fixed-region prepared-cache benchmark
 
 Results:
@@ -942,7 +1124,7 @@ Results:
 | direct HDD write | `288` | `179.668 s` | `176.981 s` | `1.627` | `1.781 s` | `0.396 s` | `0` | `0.000 s` | `0.0 MiB` | `5.965 s` | `3930.6 MiB` |
 | SSD stage then promote | `288` | `178.843 s` | `175.837 s` | `1.638` | `1.779 s` | `0.390 s` | `288` | `0.242 s` | `154.9 MiB` | `5.911 s` | `3910.3 MiB` |
 
-Retained interpretation:
+Interpretation:
 
 - SSD artifact staging improved wall time by only `0.825 s`, about `0.5%`, on
   this sample
@@ -978,7 +1160,7 @@ Setup:
 - artifact stage root: `/Users/nelsonnunes/ao-sky-cache/artifact-stage`
 - worker count: `3`
 - worker Gaia cache: `8` entries, `128 MiB`
-- worker memory guard: `6144 MiB`
+- historical worker peak-RSS guard: `6144 MiB`
 - sample source:
   `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-compression-sweep-bench-20260416-212643/sample-pixels.ecsv`
 
@@ -989,7 +1171,7 @@ Results:
 | direct HDD write | `288` | `146.938 s` | `143.621 s` | `2.005` | `1.440 s` | `0.040 s` | `0.039 s` | `0.531 MiB` | `0` | `0.000 s` | `6.115 s` | `3710.3 MiB` |
 | SSD stage then promote | `288` | `147.165 s` | `144.109 s` | `1.998` | `1.437 s` | `0.037 s` | `0.036 s` | `0.531 MiB` | `288` | `0.175 s` | `5.981 s` | `3825.6 MiB` |
 
-Retained interpretation:
+Interpretation:
 
 - with Blosc Zstd, artifact write time fell from the old `~0.39 s/pixel`
   `gzip=9` cost to `~0.04 s/pixel`
@@ -1042,7 +1224,7 @@ Implementation tested:
 | `64 MiB` with fair IO loop | `74.4 s elapsed`, `0.325 s/pixel` | preserved, no drops | `30.6 MiB` | best observed balance |
 | early `256 MiB` shape | `81.2 s elapsed`, `0.358 s/pixel` | starved prewarm before fairness | `24.5 MiB` | too aggressive before fairness |
 
-Retained interpretation:
+Interpretation:
 
 - naive write-priority write-behind can make the total path worse by starving
   read prewarm
@@ -1118,7 +1300,7 @@ Result:
 | `5448` | `371` | `372` | accepted boundary divergence: `1` extra | `65536` | OK |
 | `5391` | `356` | `356` | accepted boundary divergence: `1` missing, `1` extra | `65536` | OK |
 
-Retained interpretation:
+Interpretation:
 
 - the current implementation is still legacy-compatible for the retained
   Traversal contract on this full 12-pixel sample
@@ -1128,3 +1310,1217 @@ Retained interpretation:
   ordering
 - this is the known-good legacy-preserving state before Phase 14 changes the
   winner/overlap algorithm more substantially
+
+## 2026-04-17 Phase 14 CPU Prediction Baseline
+
+Purpose:
+
+- record the pure-CPU Phase 14 Traversal performance before the MPS-specific
+  device tests and prediction batch-size sweep
+- keep the prediction batch size at the normal CPU/default value of `25,000`
+  rows
+- establish the time and memory baseline for interpreting later resolved-MPS
+  measurements
+
+Setup:
+
+- resolved model: CPU
+- averaged model: CPU
+- prediction batch size: `25,000` rows
+- worker count: `3`
+- historical worker peak-RSS guard: `6144 MiB`
+- Gaia and dust root: `/Users/nelsonnunes/ao-sky-cache/gaia`
+- model root:
+  `/Users/nelsonnunes/Library/CloudStorage/Dropbox/Projects/survey_tools/data/models`
+- sample source:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-compression-sweep-bench-20260416-212643/sample-pixels.ecsv`
+
+Benchmark roots:
+
+- full 288-pixel run:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-104810`
+- 12-pixel detailed telemetry run:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-124659`
+
+Results:
+
+| Sample | Pixels | Wall | Elapsed | Pixels/s | Avg Pixel | Resolved Prediction | Averaged Prediction | Artifact Write | Artifact Size/Px | Peak Worker RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| full fixed sample | `288` | `97.48 s` | `96.65 s` | `2.980` | `0.93 s` | `139.47 s` / `0.48 s/px` | `42.31 s` / `0.15 s/px` | `14.52 s` / `0.05 s/px` | `1.060 MiB` | `2272.2 MiB` |
+| detailed telemetry subset | `12` | `12.04 s` | `11.25 s` | `1.067` | `0.76 s` | `4.29 s` / `0.36 s/px` | `1.27 s` / `0.11 s/px` | `0.68 s` / `0.06 s/px` | `1.067 MiB` | `2014.4 MiB` |
+
+### CPU Baseline Versus Legacy-Compatible Traversal
+
+The relevant legacy-compatible baseline is the post-dust-cache Phase 13 run
+from `Traversal Worker Scaling With Memory Guards`, not the older pre-mmap dust
+high-water run. Both rows below use the same fixed `288` outer-pixel sample and
+`3` workers.
+
+| Case | Wall | Pixels/s | Avg Pixel | Avg Artifact Write | Artifact Size/Px | Peak Worker RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Phase 13 legacy-compatible, post-dust-cache | `137.49 s` | `2.095` | `1.33 s` | `0.04 s` | `0.531 MiB` | `1060.7 MiB` |
+| Phase 14 CPU winner-map-first | `97.48 s` | `2.980` | `0.93 s` | `0.05 s` | `1.060 MiB` | `2272.2 MiB` |
+
+Retained comparison:
+
+- Phase 14 CPU is `40.0 s` faster on the fixed sample, about `29%` lower wall
+  time and `42%` higher pixel throughput.
+- Phase 14 CPU peak worker RSS is `1211.5 MiB` higher, about `2.14x` the
+  legacy-compatible post-dust-cache peak worker RSS.
+- The artifact size roughly doubles because Phase 14 persists the unique
+  winning asterism catalog rather than the smaller overlap-pruned catalog.
+- The speed gain is real, but it is not a memory win relative to the
+  post-dust-cache legacy-compatible implementation.
+
+Detailed prediction telemetry from the 12-pixel subset:
+
+| Metric | Resolved | Averaged |
+| --- | ---: | ---: |
+| Prediction rows | `1126370` | `461128` |
+| Inference time | `3.19 s` | `1.12 s` |
+| Feature peak | `2.483 MiB` | `0.763 MiB` |
+| MPS driver allocation | `0.0 MiB` | `0.0 MiB` |
+
+Interpretation:
+
+- with the default CPU batch size, Phase 14 is already faster than the
+  post-dust-cache Phase 13 `3`-worker baseline, but peak worker RSS is higher
+- resolved prediction is the largest CPU cost; averaged prediction is smaller
+  but still material
+- the detailed 12-pixel run confirms this baseline has no MPS allocation, so
+  later MPS memory measurements should be treated as additional device memory
+  on top of the CPU-only path
+- the CPU-only `25,000` row remains the best low-memory CPU reference before
+  considering larger CPU batches or resolved MPS
+
+## 2026-04-17 Phase 14 Other Performance Improvements
+
+This section records smaller traversal performance experiments that are useful
+to keep visible but are not large enough to justify their own top-level
+benchmark section. Each attempted improvement should get its own subsection so
+later audit work can distinguish retained changes from ideas that did not move
+the measured runtime.
+
+### Static Feature Template Cache
+
+The prediction feature builder now caches a tiny static row template per model
+shape. The cached row contains values that do not vary across prediction rows,
+including wavelength, target offsets, and resolved-model LGS radius columns.
+Each call still allocates its own feature matrix and overwrites the NGS columns
+from the current vectorized arrays, so the change does not introduce shared
+mutable batch state.
+
+Setup:
+
+- same 12-pixel detailed telemetry sample as the CPU baseline
+- resolved model: CPU
+- averaged model: CPU
+- prediction batch size: `25,000` rows
+- worker count: `3`
+
+Benchmark roots:
+
+- before static template:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-142153`
+- after static template:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-150841`
+
+| Case | Wall | Resolved Feature | Resolved Inference | Averaged Feature | Averaged Inference | Point Calls | Averaged Calls | Peak Worker RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before static template | `11.29 s` | `0.061 s` | `3.070 s` | `0.021 s` | `1.074 s` | `69` | `48` | `2035.8 MiB` |
+| after static template | `11.53 s` | `0.061 s` | `3.084 s` | `0.023 s` | `1.079 s` | `69` | `48` | `2024.5 MiB` |
+
+Interpretation:
+
+- the measured feature-construction and wall-time changes are noise on this
+  sample; the CPU prediction path is dominated by inference, eligibility,
+  scatter, and candidate volume rather than repeated static feature columns
+- peak worker RSS is effectively unchanged, so the memory trade-off is
+  negligible
+- the implementation is retained because it is low risk, keeps feature-matrix
+  ownership per call, removes repeated static row/LGS coordinate setup, and is
+  covered by tests against the backend feature layout
+
+### Magnitude-Tie Ordering Sensitivity
+
+This diagnostic checked how much the current resolved prediction models depend
+on the legacy exact NGS ordering rule when magnitudes are tied. At the time of
+the diagnostic, the vectorized model-feature path canonicalized NGS slots by
+`(mag, zd, az)`. Magnitude is star-fixed, but `zd` and `az` are measured
+relative to the inner-pixel center, so exact magnitude ties can require
+different slot ordering across the same asterism footprint.
+
+This is a model-sensitivity probe, not a retained Phase 14 implementation
+change. Before publishing this path, the prediction models should be trained or
+validated with the intended ordering contract.
+
+Setup:
+
+- source build:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-145101/ssd_gaia_cache_blosc_zstd_direct_hdd_workers3/v1`
+- sampled real Phase 14 regularized winning asterism/inner-pixel pairs from
+  `60` outer-pixel artifacts
+- collected `240,000` multistar winner rows before stratification
+- forced magnitude ties within each sampled asterism row by replacing all
+  member magnitudes with that row's original mean magnitude
+- preserved magnitude dynamic range across the batch rather than collapsing all
+  rows to one artificial magnitude
+- compared resolved CPU inference with exact `(mag, zd, az)` canonicalization
+  against inference using the original candidate member order after the forced
+  ties
+
+Magnitude range after forcing per-row ties:
+
+| Order | Rows | Min | P10 | Median | P90 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2-star | `60,000` | `9.329` | `14.576` | `16.555` | `17.879` | `18.484` |
+| 3-star | `34,854` | `10.911` | `15.207` | `16.719` | `17.753` | `18.432` |
+
+Prediction differences, all rows:
+
+| Order | Changed Slot Order | SR Mean Abs | SR Max Abs | EE Mean Abs | EE Max Abs | FWHM Mean Abs | FWHM Max Abs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2-star | `61.9%` | `0.000665` | `0.00842` | `0.000816` | `0.00908` | `0.230 mas` | `2.27 mas` |
+| 3-star | `90.6%` | `0.00108` | `0.00884` | `0.00125` | `0.00925` | `0.329 mas` | `2.88 mas` |
+
+Interpretation:
+
+- the current models are not perfectly insensitive to tied-star slot order
+- the forced-tie stress test kept EE and SR differences below `0.01`, and FWHM
+  differences below `3 mas`
+- the real-sky effect of dropping `zd`/`az` tie sorting would likely be smaller
+  than this stress test unless the sensing magnitudes used by Traversal are
+  heavily quantized
+- Phase 14 now applies the `ao-sky` ordering assumption in code: Traversal
+  emits candidate members in sensing-magnitude order, and the vectorized feature
+  builder no longer applies row-wise `zd`/`az` tie sorting
+- before publishing the new Traversal path, the production prediction models
+  must be trained and validated against that magnitude-ordered contract
+
+Magnitude-ordered feature path benchmark:
+
+- compared the latest exact-canonicalization run after the static-template
+  change against the magnitude-ordered feature path
+- both runs used the same 12-pixel detailed CPU sample, `3` workers, and a
+  `25,000` row prediction batch size
+- compared the generated artifacts for the same 12 outer pixels; `best_ee`,
+  `best_sr`, `best_fwhm`, `winner_asterism_id`, `winner_ee_resolved`,
+  `winner_ee_averaged`, `coverage_resolved`, and `coverage_averaged` matched
+  exactly
+
+Benchmark roots:
+
+- exact `(mag, zd, az)` canonicalization:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-150841`
+- magnitude-ordered feature path:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-153639`
+
+| Case | Wall | Resolved Feature | Resolved Inference | Averaged Feature | Averaged Inference | Peak Worker RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| exact canonicalization | `11.53 s` | `0.061 s` | `3.084 s` | `0.023 s` | `1.079 s` | `2024.5 MiB` |
+| magnitude-ordered path | `11.82 s` | `0.023 s` | `3.254 s` | `0.008 s` | `1.122 s` | `2018.8 MiB` |
+
+Retained performance interpretation:
+
+- removing row-wise canonicalization reduced measured feature construction from
+  `0.061 s` to `0.023 s` for resolved prediction and from `0.023 s` to
+  `0.008 s` for averaged prediction
+- the total wall time did not improve on this small sample because feature
+  construction is a small part of the CPU path and inference timing varied in
+  the opposite direction
+- retain the code simplification because it matches the intended `ao-sky`
+  model contract, not because this 12-pixel CPU sample shows an end-to-end speed
+  win
+
+### NumPy Candidate-Pixel Row Buffer
+
+The resolved prediction stream now stores pending `(inner pixel, candidate)`
+rows in fixed-size NumPy buffers instead of appending Python integers to lists.
+This targets the candidate-pixel buffering overhead without changing
+eligibility, feature construction, inference, or scatter semantics.
+
+Setup:
+
+- same 12-pixel detailed telemetry sample as the CPU baseline
+- resolved model: CPU
+- averaged model: CPU
+- prediction batch size: `25,000` rows
+- worker count: `3`
+
+Benchmark roots:
+
+- list-backed resolved row buffers:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-153639`
+- NumPy resolved row buffers:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-154338`
+
+| Case | Wall | Resolved Buffer | Resolved Prediction | Resolved Inference | Averaged Prediction | Peak Worker RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| list row buffer | `11.82 s` | `0.079 s` | `4.316 s` | `3.254 s` | `1.260 s` | `2018.8 MiB` |
+| NumPy row buffer | `12.30 s` | `0.028 s` | `4.442 s` | `3.466 s` | `1.345 s` | `2027.4 MiB` |
+
+Artifact comparison:
+
+- compared the generated artifacts for the same 12 outer pixels
+- `best_ee`, `best_sr`, `best_fwhm`, `winner_asterism_id`,
+  `winner_ee_resolved`, `winner_ee_averaged`, `coverage_resolved`, and
+  `coverage_averaged` matched exactly, with maximum absolute floating
+  difference `0.0`
+
+Interpretation:
+
+- the NumPy row buffer reduced measured resolved buffering time from `0.079 s`
+  to `0.028 s` on this sample
+- the end-to-end wall time did not improve because inference timing varied in
+  the opposite direction; this remains a local overhead reduction rather than a
+  measured whole-run win
+- peak worker RSS changed by less than `10 MiB`, so the memory trade-off is
+  negligible for this sample
+- retain the implementation because it removes Python list/int churn in the
+  hottest resolved streaming loop and preserves identical persisted outputs
+
+### Bitset Eligibility Extraction
+
+Resolved candidate-pixel eligibility now records the parent eligibility timer
+as two child counters:
+
+- `stage_point_prediction_eligibility_intersection_s`: copying the bright-star
+  allowed bitset and intersecting member-star FOR bitsets
+- `stage_point_prediction_eligibility_extract_s`: converting the final bitset
+  into explicit inner-pixel indices
+
+The first telemetry run showed extraction as the larger part of eligibility, so
+`_bitset_to_indices()` was changed from a Python set-bit loop to a
+`np.unpackbits` path over only the nonzero `uint64` words.
+
+Setup:
+
+- same 12-pixel detailed telemetry sample as the CPU baseline
+- resolved model: CPU
+- averaged model: CPU
+- prediction batch size: `25,000` rows
+- worker count: `3`
+
+Benchmark roots:
+
+- Python set-bit extraction loop:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-154950`
+- `np.unpackbits` extraction:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-155141`
+
+| Case | Wall | Eligibility | Intersection | Extraction | Resolved Prediction | Resolved Inference | Peak Worker RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Python set-bit loop | `12.87 s` | `0.351 s` | `0.101 s` | `0.249 s` | `4.082 s` | `3.131 s` | `2037.0 MiB` |
+| `np.unpackbits` | `11.08 s` | `0.326 s` | `0.102 s` | `0.224 s` | `3.972 s` | `3.062 s` | `2046.2 MiB` |
+
+Artifact comparison:
+
+- compared the generated artifacts for the same 12 outer pixels
+- `best_ee`, `best_sr`, `best_fwhm`, `winner_asterism_id`,
+  `winner_ee_resolved`, `winner_ee_averaged`, `coverage_resolved`, and
+  `coverage_averaged` matched exactly, with maximum absolute floating
+  difference `0.0`
+
+Interpretation:
+
+- splitting the timer confirmed extraction was the larger eligibility child
+  cost on this sample
+- `np.unpackbits` reduced extraction from `0.249 s` to `0.224 s`; this is a
+  small local improvement, not a major whole-run lever
+- intersection time was unchanged, as expected
+- peak worker RSS increased by about `9 MiB`, which is negligible at this
+  sample size
+- retain the implementation because it moves the extraction work into NumPy,
+  preserves identical persisted outputs, and keeps memory impact small
+
+### Scatter Top-K Update Telemetry
+
+Resolved prediction scatter now records the parent scatter timer as four child
+counters:
+
+- `stage_point_prediction_scatter_filter_s`: finite-row filtering and batch
+  array setup
+- `stage_point_prediction_scatter_merge_s`: affected-pixel discovery and
+  existing top-K merge materialization
+- `stage_point_prediction_scatter_sort_s`: candidate ranking by pixel, EE, and
+  candidate ID
+- `stage_point_prediction_scatter_write_s`: top-K writeback and best-metric
+  update
+
+The first telemetry run showed sort/rank as the largest scatter child, followed
+by writeback and merge. The retained code change removes a redundant
+`searchsorted` pass during writeback: the sorted pixel values are already global
+inner-pixel row indexes, so they can be used directly when refilling the top-K
+arrays.
+
+Setup:
+
+- same 12-pixel detailed telemetry sample as the CPU baseline
+- resolved model: CPU
+- averaged model: CPU
+- prediction batch size: `25,000` rows
+- worker count: `3`
+
+Benchmark roots:
+
+- scatter child telemetry, pre-writeback simplification:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-155830`
+- direct global-pixel writeback:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-155954`
+
+| Case | Wall | Scatter | Filter | Merge | Sort | Write | Peak Worker RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pre-writeback simplification | `10.80 s` | `0.395 s` | `0.005 s` | `0.087 s` | `0.197 s` | `0.100 s` | `2049.5 MiB` |
+| direct writeback | `11.65 s` | `0.362 s` | `0.005 s` | `0.092 s` | `0.210 s` | `0.046 s` | `2004.1 MiB` |
+
+Artifact comparison:
+
+- compared the generated artifacts for the same 12 outer pixels
+- `best_ee`, `best_sr`, `best_fwhm`, `winner_asterism_id`,
+  `winner_ee_resolved`, `winner_ee_averaged`, `coverage_resolved`, and
+  `coverage_averaged` matched exactly, with maximum absolute floating
+  difference `0.0`
+
+Interpretation:
+
+- direct writeback reduced the write child from `0.100 s` to `0.046 s`
+- the parent scatter timer dropped from `0.395 s` to `0.362 s`, but wall time
+  moved in the opposite direction because backend inference and other stages
+  varied more than the local scatter change
+- sort/rank remains the largest scatter child; a larger rewrite would need to
+  reduce sort volume without changing the exact top-K tie-breaking contract
+- retain the direct writeback simplification because it removes unnecessary
+  work, preserves identical persisted outputs, and does not increase memory
+
+## 2026-04-17 Phase 14 CPU Memory Usage Audit
+
+Purpose:
+
+- audit the default CPU-only Phase 14 Traversal memory shape after the retained
+  performance cleanup work
+- separate active per-pixel arrays from process RSS high-water behavior
+- check worker-summed memory on the fixed 288-pixel sample with three workers
+- decide whether memory pressure is coming from candidate data structures,
+  prediction batches, artifact writing, or backend/runtime allocation
+
+Setup:
+
+- fixed 288-pixel sample
+- workers: `3`
+- resolved model: CPU
+- averaged model: CPU
+- prediction batch size: `25,000` rows
+- telemetry: `detailed`
+- benchmark root:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260417-160411`
+
+Run summary:
+
+| Metric | Value |
+| --- | ---: |
+| Completed pixels | `288 / 288` |
+| Wall time | `93.67 s` |
+| Peak worker RSS | `2567.2 MiB` |
+| Conservative worker-summed peak RSS | `6261.8 MiB` |
+| MPS driver allocation | `0.0 MiB` |
+| Point feature matrix peak | `2.486 MiB` |
+| Averaged feature matrix peak | `0.763 MiB` |
+| Artifact inner structured size per pixel | `5.125 MiB` |
+| Artifact asterism structured size, max per pixel | `0.450 MiB` |
+
+The worker-summed peak is the sum of each worker's maximum recorded peak RSS,
+not a simultaneous time-resolved total. It is intentionally conservative and is
+the best planning value available from this diagnostics run.
+
+### Worker Bootstrap
+
+| Event | RSS Range |
+| --- | ---: |
+| Worker start | `88.4-88.9 MiB` |
+| After inference thread config | `240.5-241.0 MiB` |
+| After runtime config | `240.5-241.0 MiB` |
+| After model warmup and geometry | `407.3-408.2 MiB` |
+
+The fixed per-worker baseline before processing any pixels is about `408 MiB`.
+Most of that baseline appears after model warmup rather than Gaia cache or
+geometry construction.
+
+### Per-Worker High-Water
+
+| Worker | Pixels | Max Current RSS | Max Peak RSS | Max Post-GC RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `0` | `96` | `2564.2 MiB` | `2567.2 MiB` | `2563.8 MiB` |
+| `1` | `96` | `2186.5 MiB` | `2189.5 MiB` | `2185.4 MiB` |
+| `2` | `96` | `1502.9 MiB` | `1505.1 MiB` | `1502.1 MiB` |
+
+The per-worker plateaus differ even though each worker handled the same number
+of pixels. The highest RSS pixel was not the densest pixel in the sample:
+
+| Case | Outer Pixel | Worker | Start RSS | Post-GC RSS | Point Rows | Winner Rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Max RSS | `28319` | `0` | `2563.8 MiB` | `2563.2 MiB` | `78,088` | `36,221` |
+| Max point rows | `27027` | `2` | `408.2 MiB` | `961.2 MiB` | `134,893` | `43,044` |
+
+This is the strongest signal from the audit: RSS high-water is dominated by
+runtime allocation and allocator retention across a worker lifetime, not by the
+currently active candidate count in a single outer pixel.
+
+### Per-Pixel Checkpoints
+
+Current RSS across all 288 per-pixel diagnostics:
+
+| Checkpoint | P50 | P90 | Max |
+| --- | ---: | ---: | ---: |
+| Pixel start | `2010.3 MiB` | `2529.8 MiB` | `2563.8 MiB` |
+| After candidate generation | `2010.3 MiB` | `2529.8 MiB` | `2563.8 MiB` |
+| After context bitsets | `2011.2 MiB` | `2530.3 MiB` | `2564.2 MiB` |
+| After resolved prediction | `2016.4 MiB` | `2531.3 MiB` | `2564.2 MiB` |
+| After averaged prediction | `2016.0 MiB` | `2530.8 MiB` | `2564.2 MiB` |
+| After artifact write | `2016.0 MiB` | `2530.3 MiB` | `2564.2 MiB` |
+| After GC | `2013.1 MiB` | `2530.3 MiB` | `2563.8 MiB` |
+
+The high median start RSS is a symptom of retained process memory: by the time
+most pixels run, the worker has already reached a high-water plateau. Garbage
+collection does not materially reduce current RSS in this workload.
+
+Largest within-pixel RSS increases from pixel start:
+
+| Stage | P50 Increase | P90 Increase | Max Increase |
+| --- | ---: | ---: | ---: |
+| Star selection | `0.0 MiB` | `0.2 MiB` | `14.0 MiB` |
+| Candidate generation | `0.0 MiB` | `0.5 MiB` | `39.9 MiB` |
+| Context bitsets | `0.5 MiB` | `1.7 MiB` | `77.2 MiB` |
+| Resolved prediction | `1.0 MiB` | `21.1 MiB` | `886.0 MiB` |
+| Averaged prediction | `2.0 MiB` | `30.6 MiB` | `1090.4 MiB` |
+| Artifact write | `2.8 MiB` | `31.4 MiB` | `1102.6 MiB` |
+| Post-GC | `2.0 MiB` | `30.0 MiB` | `1102.6 MiB` |
+
+The large maximum increases occur early in each worker while the process is
+still allocating inference/runtime memory. After the plateau is reached,
+per-pixel deltas are small.
+
+### Active Structures
+
+Representative cardinalities and active buffer sizes:
+
+| Quantity | P50 | P90 | Max |
+| --- | ---: | ---: | ---: |
+| NGS rows | `1,119` | `1,267` | `1,399` |
+| Close-pair rows | `1,992` | `2,599` | `3,151` |
+| Raw asterisms | `4,540` | `5,989` | `7,426` |
+| Resolved prediction rows | `93,993` | `115,299` | `134,893` |
+| Winner payload rows | `38,271` | `41,526` | `43,689` |
+| Point batch rows peak | `25,042` | `25,063` | `25,068` |
+| Averaged batch rows peak | `25,000` | `25,000` | `25,000` |
+| Point feature matrix peak | `2.480 MiB` | `2.482 MiB` | `2.486 MiB` |
+| Averaged feature matrix peak | `0.763 MiB` | `0.763 MiB` | `0.763 MiB` |
+
+Inferred active arrays are also small relative to process RSS. At the current
+inner-pixel resolution and internal `top-K=3`, the resolved top-K state is about
+`6 MiB` per active outer pixel. The three best-metric arrays add about
+`1.5 MiB`, and the largest observed star-to-inner-pixel bitset table is about
+`11 MiB`.
+
+### Artifact Write Memory
+
+Artifact write materialization is not the memory driver in this sample:
+
+| Artifact Write Step | P50 RSS Increase | P90 RSS Increase | Max RSS Increase |
+| --- | ---: | ---: | ---: |
+| Convert inner table | `0.0 MiB` | `0.0 MiB` | `5.1 MiB` |
+| Convert asterism table | `0.0 MiB` | `0.0 MiB` | `5.1 MiB` |
+| HDF5 open | `0.0 MiB` | `0.0 MiB` | `5.2 MiB` |
+| HDF5 inner write | `0.0 MiB` | `3.7 MiB` | `11.3 MiB` |
+| HDF5 asterism write | `0.0 MiB` | `3.7 MiB` | `11.4 MiB` |
+| HDF5 close/replace | `0.0 MiB` | `3.7 MiB` | `11.4 MiB` |
+
+The structured inner artifact is `5.125 MiB` per pixel, and the asterism table
+stays below `0.5 MiB` per pixel on this sample. HDF5 writing is visible in wall
+time but does not explain the multi-GiB worker RSS.
+
+### Prediction Shape Probes
+
+After the 288-pixel audit showed that explicit Traversal arrays were small, two
+targeted one-off probes were run against outer pixel `34448` to inspect the
+prediction backend more directly. These probes were separate Python processes
+and should be interpreted as directional diagnostics rather than retained
+benchmark cases.
+
+The backend path in `girmos-aosims` does the following per prediction call:
+
+1. `scaler_X.transform(X)`.
+2. Convert the scaled NumPy array to a `torch.float32` tensor.
+3. Run the TorchScript model under `torch.no_grad()`.
+4. Convert the output back to NumPy.
+5. Apply `scaler_Y.inverse_transform()`.
+
+A standalone per-model probe loaded all six CPU models, then ran one `25,000`
+row prediction call per model. Loading the models reached about `412 MiB` RSS.
+The first real TorchScript forward on the first resolved model increased RSS to
+about `719 MiB`, and the memory remained retained after `del` and `gc.collect()`.
+Later same-shape calls were much smaller, which points to CPU backend/runtime
+allocation rather than feature arrays.
+
+An actual outer-pixel probe monkeypatched the Traversal prediction calls to log
+RSS before and after each backend call. With the normal variable row counts,
+outer pixel `34448` ended at about `1478.6 MiB` RSS:
+
+| Call | Rows | RSS Delta |
+| --- | ---: | ---: |
+| Resolved 1-star | `25,009` | `+253.6 MiB` |
+| Resolved 2-star | `25,017` | `+200.4 MiB` |
+| Resolved 1-star | `25,050` | `+249.1 MiB` |
+| Resolved 1-star | `20,909` | `+84.0 MiB` |
+| Resolved 2-star | `15,608` | `+2.2 MiB` |
+| Resolved 3-star | `14,619` | `+3.0 MiB` |
+| Averaged 1-star | `25,000` | `+97.7 MiB` |
+| Averaged 1-star | `2,540` | `+31.1 MiB` |
+| Averaged 2-star | `11,542` | `+0.0 MiB` |
+| Averaged 3-star | `2,720` | `+26.7 MiB` |
+
+The large repeated jumps for the same model family at slightly different row
+counts suggest that TorchScript/PyTorch CPU retains shape-dependent execution
+state or allocator arenas.
+
+A second probe padded every prediction call in the same outer pixel to a fixed
+`25,068` rows and sliced the outputs back to the real row count. This keeps the
+model semantics row-independent while forcing a single shape per model-input
+dimension. The same pixel ended at about `813.0 MiB` RSS:
+
+| Call | Real Rows | RSS Delta |
+| --- | ---: | ---: |
+| Resolved 1-star | `25,009` | `+254.4 MiB` |
+| Resolved 2-star | `25,017` | `+1.1 MiB` |
+| Resolved 1-star | `25,050` | `+7.8 MiB` |
+| Resolved 1-star | `20,909` | `+2.4 MiB` |
+| Resolved 2-star | `15,608` | `+2.7 MiB` |
+| Resolved 3-star | `14,619` | `+3.6 MiB` |
+| Averaged calls | mixed | `+0.1` to `+2.2 MiB` each |
+
+A third probe pre-warmed each model once at `25,068` rows and then ran the
+normal unpadded Traversal calls. That ended at about `1146.2 MiB`: better than
+the normal variable-shape path, but worse than actually padding the calls. This
+suggests warmup alone does not prevent allocations for later row-count shapes.
+
+Interpretation:
+
+- The strongest current hypothesis is that PyTorch/TorchScript CPU prediction
+  retains shape-dependent backend or allocator state.
+- Variable prediction-call row counts are therefore a plausible reason that
+  RSS grows far beyond the explicit Traversal arrays and remains high after GC.
+- Fixed-shape prediction calls are a promising RAM-reduction idea, but they
+  trade memory for extra compute on partial batches, especially for averaged
+  prediction where the final chunks can be small.
+- A cautious implementation experiment would first try exact fixed-size
+  resolved chunks, with optional padding only for the final chunk per model
+  order, then artifact-compare and benchmark CPU time/RSS on the 288-pixel
+  sample before considering averaged padding.
+
+### Retained Audit Conclusion
+
+- Active Traversal arrays, feature matrices, and artifact materialization are
+  too small to explain multi-GiB worker RSS.
+- Worker RSS is dominated by backend/runtime allocation and allocator retention
+  across the worker lifetime.
+- Variable prediction-call row counts are the strongest observed contributor to
+  retained backend memory, which motivated the later fixed-shape and dense-ladder
+  prediction work summarized below.
+
+## 2026-04-18 Phase 14 Algorithm Explorations
+
+These rows are not one apples-to-apples sweep; compare only within the stated
+sample and policy.
+
+| Change | Sample | Before | After | Main Effect | Keep? |
+| --- | --- | ---: | ---: | --- | --- |
+| Vectorized local regularizer | `12` pixels, CPU | `47.93 s` | `21.69 s` | local selection `2.230 -> 0.076 s/pixel` | yes |
+| Vectorized feature path | `12` pixels, CPU | `21.69 s` | `12.13 s` | resolved + averaged prediction `1.253 -> 0.478 s/pixel` | yes |
+| Static feature template cache | `12` pixels, CPU | `11.29 s` | `11.53 s` | feature construction unchanged | yes, cleanup |
+| Magnitude-ordered NGS path | `12` pixels, CPU | `11.53 s` | `11.82 s` | feature construction `0.084 -> 0.031 s` | yes, model contract |
+| NumPy row buffer | `12` pixels, CPU | `11.82 s` | `12.30 s` | buffering `0.079 -> 0.028 s` | yes, cleanup |
+| `np.unpackbits` extraction | `12` pixels, CPU | `12.87 s` | `11.08 s` | extraction `0.249 -> 0.224 s` | yes |
+| Direct top-K writeback | `12` pixels, CPU | `10.80 s` | `11.65 s` | writeback `0.100 -> 0.046 s` | yes, cleanup |
+
+Where outputs could change, retained changes matched the fixed-sample artifacts
+for the key inner performance, winner, and coverage fields.
+
+Interpretation:
+
+- Big wins: vectorized regularization and vectorized feature construction.
+- Smaller retained changes are cleanup/local-counter wins, not standalone
+  wall-time wins.
+- Conclusion: keep the algorithmic tweaks.
+
+## 2026-04-18 Phase 14 GPU Cache Clearing
+
+GPU cache clear means explicit `torch.mps.empty_cache()` calls through the
+prediction service. This comparison uses the fixed `288`-pixel sample,
+`3` workers, both model families on GPU, variable inference batch shapes, no
+fixed inference batch ladder, and a `25,000` row-buffer cap.
+
+| Cache Policy | Wall | Resolved Inference | Averaged Inference | Cache Clear | Worker RAM | GPU RAM | Total RAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Every flush | `94.23 s` | `80.60 s` | `45.93 s` | `27.18 s` | `6.0 GiB` | `3.1 GiB` | `9.1 GiB` |
+| Every 4 flushes | `69.83 s` | `45.40 s` | `27.44 s` | `8.90 s` | `7.1 GiB` | `3.1 GiB` | `10.2 GiB` |
+| End of outer pixel | `60.78 s` | `37.20 s` | `16.67 s` | `3.02 s` | `8.3 GiB` | `3.1 GiB` | `11.4 GiB` |
+| Never | `56.88 s` | `30.23 s` | `15.97 s` | `0.00 s` | `8.3 GiB` | `3.1 GiB` | `11.4 GiB` |
+
+Interpretation:
+
+- `torch.mps.empty_cache()` can save RAM, but it costs CPU time. If RAM can be
+  afforded, do not clear regularly.
+- Conclusion: use clearing sparingly when approaching RAM limits, not as part
+  of the normal fast path.
+
+## 2026-04-18 Phase 14 CPU vs GPU Device Baseline
+
+This comparison isolates the basic time/RAM trade for device selection. Both
+rows use the fixed `288`-pixel sample, `3` workers, a `25,000` row-buffer cap,
+variable inference shapes, and no explicit GPU cache clearing.
+
+| Device | Wall | Resolved Inference | Averaged Inference | Worker RAM | GPU RAM | Total RAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CPU | `85.86 s` | `93.09 s` | `32.16 s` | `4.6 GiB` | `0.0 GiB` | `4.6 GiB` |
+| GPU | `57.32 s` | `30.26 s` | `16.21 s` | `8.5 GiB` | `3.1 GiB` | `11.6 GiB` |
+
+Interpretation:
+
+- GPU prediction cut wall time by about `33%`, resolved inference time by
+  about `68%`, and averaged inference time by about `50%` in this direct
+  comparison.
+- The cost is memory: total RAM rose from about `4.6 GiB` to `11.6 GiB` across
+  the three workers.
+  - GPU RAM is overhead of about `1.0 GiB` per worker on this sample.
+  - The Worker RAM increase is probably CPU-side PyTorch/GPU allocator retention.
+- GPU prediction is worth using when the additional RAM is available.
+- Conclusion: use GPU when possible, but study the trade against using more
+  CPU workers instead.
+
+Benchmark roots:
+
+- CPU:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260418-110504`
+- GPU:
+  `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260418-110646`
+
+## 2026-04-18 Phase 14 Inference Shape Control
+
+Question: is Torch RAM usage affected by sending inference batches with many
+different row counts? This exploration uses the fixed `288`-pixel sample and
+`3` workers. Each trial controls the allowed inference batch row counts: a
+single shape pads every call to `25,000`, ladders pad each call up to the next
+allowed row count, and variable uses the natural row count with no padding. The
+same shape policy is applied to resolved and averaged inference in each table.
+Inference timings include Torch prediction-service overhead, so allocator and
+shape-setup costs from variable row counts are included.
+
+CPU comparison:
+
+| Trial | Shapes | Wall | Resolved Inference | Resolved Padding | Averaged Inference | Averaged Padding | Worker RAM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Single | `25000` | `119.79 s` | `140.15 s` | `46.6%` | `85.95 s` | `161.1%` | `3.7 GiB` |
+| Power ladder by `2^n` | `1024..25000` | `91.19 s` | `105.20 s` | `10.8%` | `38.75 s` | `17.4%` | `3.9 GiB` |
+| Dense ladder | `1000..25000` by `1000` | `86.12 s` | `95.85 s` | `1.6%` | `33.72 s` | `3.9%` | `4.2 GiB` |
+| Variable | natural row counts | `85.86 s` | `93.09 s` | `0.0%` | `32.16 s` | `0.0%` | `4.6 GiB` |
+
+GPU comparison:
+
+| Trial | Shapes | Wall | Resolved Inference | Resolved Padding | Averaged Inference | Averaged Padding | Worker RAM | GPU RAM | Total RAM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Single | `25000` | `51.36 s` | `18.10 s` | `46.6%` | `10.83 s` | `161.1%` | `2.5 GiB` | `3.1 GiB` | `5.6 GiB` |
+| Power ladder by `2^n` | `1024..25000` | `47.84 s` | `13.24 s` | `10.8%` | `5.25 s` | `17.4%` | `2.6 GiB` | `3.1 GiB` | `5.7 GiB` |
+| Dense ladder | `1000..25000` by `1000` | `46.90 s` | `13.16 s` | `1.6%` | `4.72 s` | `3.9%` | `2.8 GiB` | `3.1 GiB` | `6.0 GiB` |
+| Variable | natural row counts | `57.32 s` | `30.26 s` | `0.0%` | `16.21 s` | `0.0%` | `8.5 GiB` | `3.1 GiB` | `11.6 GiB` |
+
+Interpretation:
+
+- On CPU, the single shape saves RAM but costs too much time. The dense ladder
+  is the compromise: it uses less RAM while staying almost as fast as doing the
+  least inference work.
+- On GPU, batching is clearly necessary: fixed inference shapes save both time
+  and RAM compared with variable shapes.
+- A single batch size saves the most RAM, but costs time through padding. The
+  dense `1000..25000` ladder is the best current GPU tradeoff.
+- For the dense ladder, GPU is about `46%` faster than CPU and uses only
+  `1.8 GiB` more total RAM with `3` workers, which narrows the penalty to
+  using the GPU.
+- Conclusion: use dense ladder shape control.
+
+## 2026-04-18 Phase 14 Worst-Pixel Dense Stress Test
+
+This subsection records two separate findings from the same worst-case pixel:
+the algorithmic reason to replace an adaptive NGS magnitude cap with
+FOR-optimized NGS selection, and the RAM/performance cost of running that
+algorithm.
+
+### Selected Pixels
+
+The benchmark uses the densest loaded level-6 Gaia pixel in the raw Gaia
+summary as the stress case, and the least-populated loaded level-6 pixel as the
+not-dense comparison:
+
+| Rank | Outer Pixel | Total Stars | Usable Stars | Neighbour Stars | Total NGS | RA | Dec | Galactic `l` | Galactic `b` |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `28726` | `1,116,354` | `431,136` | `117,020` | `239,104` | `270.703125 deg` | `-32.797168 deg` | `358.525685 deg` | `-5.132106 deg` |
+| least | `28559` | `1,711` | `1,383` | `406` | `831` | `174.375000 deg` | `29.313199 deg` | `200.956542 deg` | `73.584429 deg` |
+
+### Algorithm Finding
+
+The first probe compared two dense-field star-selection algorithms and exposed
+a third target algorithm:
+
+- Adaptive NGS magnitude cap: adaptively lower the faint-end NGS magnitude
+  limit for the whole outer pixel until the estimated candidate count is under
+  a configured asterism budget. This is cheap, but it does not account for
+  where the selected stars fall on the sky.
+- FOR-optimized NGS selection: select bright stars only when they improve the
+  guide-star availability within the FOR of at least one still-undercovered
+  inner pixel, stopping when every inner pixel not excluded by the bright-star
+  mask has `max_wfs=3` NGS within a FOR centered on it.
+- Regional FOR-optimized NGS selection: partition the outer pixel into working
+  regions, use all configured NGS in regions whose complete candidate graph
+  stays under the derived `max_regional_combination_work` threshold, subdivide
+  regions that are too dense, and apply FOR-optimized NGS selection only in
+  regions that remain too dense at the minimum working scale.
+
+Regional FOR-optimized NGS selection therefore acts as a local combination-work
+control. It does not enforce a strict final asterism cap, but in dense fields it
+effectively caps the number of generated asterisms without first enumerating the
+full asterism set.
+
+| Selector | Usable NGS | Faintest R | FOR NGS >=1 | FOR NGS >=2 | FOR NGS >=3 | Candidate Identities |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Full configured NGS set | `239,104` | `18.5` | `100.00%` | `100.00%` | `100.00%` | way too many |
+| Adaptive NGS magnitude cap | `3,387` | `13.9` | `91.97%` | `72.53%` | `49.45%` | `65,517` |
+| FOR-optimized NGS selection | `6,311` | `16.3` | `100.00%` | `100.00%` | `100.00%` | `417,432` |
+| Regional FOR-optimized NGS selection | `6,311` | `16.3` | `100.00%` | `100.00%` | `100.00%` | `330,161` |
+
+| Selector | Candidate Ids | Resolved Inferences | Retained Asterisms | Resolved Coverage | Averaged Coverage |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Adaptive NGS magnitude cap | `65,517` | `636,599` | `11,136` | `64.42%` | `74.09%` |
+| FOR-optimized NGS selection | `417,432` | `3,816,537` | `27,713` | `99.67%` | `99.99%` |
+| Regional FOR-optimized NGS selection | `330,161` | `3,348,605` | `27,207` | `99.65%` | `99.99%` |
+
+Coverage percentages in this table are fractions of inner pixels not excluded
+by the bright-star mask.
+
+The COSMOS outer pixel check lands in outer pixel `27258` and uses complete
+regional enumeration: `7,091` regional candidate identities are below the
+derived `65,536` `max_regional_combination_work` threshold, with `150,153`
+resolved inference rows recorded as telemetry.
+
+Interpretation:
+
+- the adaptive NGS magnitude cap algorithm does not select NGS in a way that
+  maximizes coverage
+- FOR-optimized NGS selection addresses this directly by selecting NGS from the
+  perspective of inner-pixel FOR availability
+- regional FOR-optimized NGS selection should preserve exact all-NGS enumeration
+  in sparse parts of an outer pixel while applying FOR-optimized selection only
+  where local combinatorics require it
+- Conclusion: use regional FOR-optimized NGS selection as the target dense-field
+  mitigation approach
+
+### Regional FOR Selection Runtime And RAM Finding
+
+The runtime test used regional FOR-optimized NGS selection, one worker, a
+`25,000` row-buffer cap, and the dense `1000..25000` inference ladder for both
+model families. The time column is outer-pixel processing time, not full
+benchmark wall time, so setup and artifact-loading overheads are excluded.
+
+| Pixel | Device | Asterisms | Resolved Inferences | Outer Pixel Time | Candidate Generation | Resolved Inference | Worker RAM | GPU RAM | Total RAM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Not dense `28559` | CPU | `2,074` | `62,579` | `0.78 s` | `0.09 s` | `0.20 s` | `1.0 GiB` | `0.0 GiB` | `1.0 GiB` |
+| Dense `28726` | CPU | `330,161` | `3,348,605` | `31.68 s` | `13.60 s` | `9.54 s` | `4.8 GiB` | `0.0 GiB` | `4.8 GiB` |
+| Not dense `28559` | GPU | `2,074` | `62,579` | `0.58 s` | `0.09 s` | `0.19 s` | `0.7 GiB` | `1.0 GiB` | `1.7 GiB` |
+| Dense `28726` | GPU | `330,161` | `3,348,605` | `26.26 s` | `16.27 s` | `1.39 s` | `4.6 GiB` | `1.0 GiB` | `5.7 GiB` |
+
+Interpretation:
+
+- the regional selector scales much better than the raw star count: the dense
+  pixel starts with about `650x` more total Gaia stars than the not-dense pixel,
+  but the GPU run uses about `45x` more outer-pixel processing time and about
+  `7x` more worker RAM
+- dense-pixel runtime is acceptable for this worst-case stress pixel after
+  recharacterizing the internal control as regional combination work rather
+  than an enforced final row limit
+- RAM is the resource to keep watching. The dense GPU run reaches about
+  `5.7 GiB` total RAM for one worker, so worker-count and device policy must be
+  chosen against a total-RAM ceiling
+- Conclusion: use regional FOR-optimized NGS selection without a Galactic
+  latitude Traversal cut; runtime is acceptable, and RAM remains viable with
+  explicit worker/device limits
+
+## 2026-04-18 Phase 14 RAM and Runtime Scaling
+
+The probe below sampled loaded level-6 pixels across Gaia-summary
+`star_count`, using one GPU worker, a `25,000` row-buffer cap, and the dense
+`1000..25000` inference ladder for both model families.
+
+| Pixel | Total Stars | Outer Pixel Time | Asterisms | Retained Asterisms | Resolved Inferences | Worker RAM |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `28559` | `1,711` | `0.58 s` | `2,074` | `1,537` | `62,579` | `0.7 GiB` |
+| `5219` | `2,000` | `0.80 s` | `3,078` | `2,069` | `82,302` | `0.7 GiB` |
+| `40311` | `5,000` | `1.87 s` | `24,312` | `8,168` | `362,576` | `0.7 GiB` |
+| `13638` | `10,000` | `5.62 s` | `122,505` | `16,903` | `1,364,137` | `0.8 GiB` |
+| `20925` | `25,000` | `18.52 s` | `480,653` | `27,184` | `4,726,836` | `1.1 GiB` |
+| `14159` | `50,003` | `15.85 s` | `393,772` | `26,960` | `3,758,738` | `1.2 GiB` |
+| `15652` | `99,996` | `14.23 s` | `323,195` | `28,056` | `3,279,450` | `1.3 GiB` |
+| `42120` | `250,080` | `19.66 s` | `439,910` | `28,040` | `4,743,630` | `2.1 GiB` |
+| `28677` | `499,374` | `16.15 s` | `276,177` | `24,432` | `2,742,240` | `3.0 GiB` |
+| `29250` | `750,285` | `19.41 s` | `328,365` | `28,241` | `3,304,169` | `3.5 GiB` |
+| `28726` | `1,116,354` | `26.26 s` | `330,161` | `27,207` | `3,348,605` | `4.6 GiB` |
+
+Resolved inference rows count streamed `(candidate asterism, inner pixel)`
+evaluations, not raw Gaia stars. The count is therefore driven by how many
+regional candidate identities survive selection and by how many inner-pixel FOR
+footprints each candidate covers. Dense raw Gaia pixels can end up with fewer
+resolved inferences than less dense pixels when the regional selector cuts them
+into smaller FOR-optimized regions or when their retained candidate footprints
+cover fewer eligible inner pixels.
+
+### RAM Estimate
+
+![Traversal worker RAM versus Gaia star count](assets/regional-for-worker-ram-trend.png)
+
+A sublinear power-law fit gives a useful rough worker-RAM trend for scheduling:
+
+```text
+worker_ram_gib = 0.66 + 0.000264 * total_gaia_stars^0.690
+R^2 = 0.996
+```
+
+A conservative upper-envelope form that covers this sweep is:
+
+```text
+estimated_worker_ram_gib = 0.89 + 0.000264 * total_gaia_stars^0.690
+```
+
+For schedule-overlap simulation, the fixed `0.89 GiB` term is not stacked as
+pixel work. The measured worker-trade fit supplies the total-RAM overhead below,
+and only the star-dependent term is treated as active worker memory:
+
+```text
+active_worker_ram_gib = 0.000264 * total_gaia_stars^0.690
+```
+
+For GPU workers, add about `1.05 GiB` of GPU-driver RAM per active worker in
+this local PyTorch/MPS environment.
+
+The fitted coefficients are local calibration values, not machine-independent
+constants. For scheduling, the important portable signal is relative ordering:
+high-`star_count` pixels should still be treated as heavy pixels even if another
+machine shifts the absolute RAM curve up or down. The parent total-RAM guard and
+observed worker RSS remain the authority for machine-specific limits.
+
+### Runtime Estimate
+
+![Traversal outer-pixel runtime versus Gaia star count](assets/regional-schedule-time-fit.png)
+
+Outer-pixel runtime is estimated with a piecewise fit. A power law is fit to
+the pre-saturation points below `25,000` total stars, and the estimate is then
+capped at the saturation mean computed from the `25,000`-star point and the
+denser points:
+
+```text
+outer_pixel_seconds =
+    min(0.5 * 6.86e-05 * total_gaia_stars^1.22, 18.6)
+```
+
+The `0.5` factor comes from comparing isolated single-pixel timings with
+neighbour-ordered regional worker plans, where adjacent pixels reuse Gaia cache
+state and warm model runtime state. It is used only as an ordering proxy for
+staggering heavy regions; observed runtime remains the authority for throughput
+estimates. RAM is not scaled because it behaves like a high-water quantity and
+already matches the real run well.
+
+The regional cap starts at about `50.8k` total stars.
+
+RAM starts with the star-dependent RAM fit plus per-active-worker GPU overhead.
+The GPU worker-trade measurements provide the additive total-RAM overhead from a
+straight-line fit to measured total RAM versus worker count:
+
+```text
+measured_total_ram_gib = 12.13605 + 1.35087 * workers
+total_ram_gib =
+    12.13605
+    + active_worker_ram_gib
+    + active_gpu_overhead_gib
+```
+
+The `12.13605 GiB` overhead is a local empirical planning correction, not a
+physical model. The GPU-driver term comes from measured MPS driver telemetry,
+while star-count structure remains responsible for scheduling pressure.
+
+The base runtime model is calibrated as a one-worker outer-pixel estimate. For
+multi-worker GPU simulations, the simulator multiplies each outer-pixel runtime
+by the per-worker throughput correction measured in the worker trade study:
+
+```text
+throughput_per_worker(w) = -0.00208 * w + 0.07455
+runtime_scale(w) =
+    throughput_per_worker(1) / throughput_per_worker(w)
+```
+
+## 2026-04-18 Phase 14 Worker Trade Study
+
+This study compares CPU prediction with more workers against GPU prediction
+with fewer workers after retaining dense ladder inference batches. The sample
+contains `60` individual outer pixels: `12` pixels from each total-star-count
+bin (`1,000-5,000`, `5,000-25,000`, `25,000-100,000`,
+`100,000-300,000`, and `>300,000`), including the worst loaded Gaia pixel,
+`28726`.
+
+Common setup:
+
+- Sample: `/Volumes/Data/Galaxy/aosky/benchmark-runs/phase14-worker-trade-study-pixels.ecsv`
+- CPU run: `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260418-212226/summary.csv`
+- GPU run: `/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260418-215820/summary.csv`
+- Parent memory limit: `26 GiB`
+- Inference row buffer: `25000`
+- Inference batches: dense ladder from `1000` to `25000` in `1000`-row steps
+- Cache clearing: no routine `torch.mps.empty_cache()` calls
+
+`Process RAM` is the sampled high-water RSS of the parent process and active
+worker process tree. `GPU RAM` is the worker-summed MPS driver allocation.
+`Total RAM` is `Process RAM + GPU RAM`, the planning value that best matches
+observed whole-system memory pressure on this machine.
+
+CPU results:
+
+| Workers | Wall | Pixels/s/Worker | Process RAM | GPU RAM | Total RAM | Resolved Inference | Averaged Inference |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `3` | `504.97 s` | `0.040` | `12.3 GiB` | `0.0 GiB` | `12.3 GiB` | `472.9 s` | `10.1 s` |
+| `4` | `365.21 s` | `0.041` | `16.7 GiB` | `0.0 GiB` | `16.7 GiB` | `529.1 s` | `10.8 s` |
+| `6` | `298.80 s` | `0.033` | `17.5 GiB` | `0.0 GiB` | `17.5 GiB` | `567.5 s` | `11.5 s` |
+| `8` | `228.07 s` | `0.033` | `18.4 GiB` | `0.0 GiB` | `18.4 GiB` | `678.0 s` | `13.2 s` |
+| `10` | `210.17 s` | `0.029` | `18.7 GiB` | `0.0 GiB` | `18.7 GiB` | `725.5 s` | `14.0 s` |
+
+GPU results:
+
+| Workers | Wall | Pixels/s/Worker | Process RAM | GPU RAM | Total RAM | Resolved Inference | Averaged Inference |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `3` | `315.89 s` | `0.063` | `12.1 GiB` | `3.1 GiB` | `15.2 GiB` | `59.6 s` | `1.8 s` |
+| `4` | `219.97 s` | `0.068` | `14.6 GiB` | `4.2 GiB` | `18.8 GiB` | `62.9 s` | `1.9 s` |
+| `5` | `169.35 s` | `0.071` | `13.8 GiB` | `5.2 GiB` | `19.1 GiB` | `67.1 s` | `2.1 s` |
+| `6` | `168.87 s` | `0.059` | `13.8 GiB` | `6.3 GiB` | `20.1 GiB` | `67.3 s` | `2.2 s` |
+| `7` | `141.69 s` | `0.060` | `13.7 GiB` | `7.3 GiB` | `21.0 GiB` | `68.0 s` | `2.4 s` |
+| `8` | `127.13 s` | `0.059` | `14.8 GiB` | `8.4 GiB` | `23.2 GiB` | `78.0 s` | `2.5 s` |
+| `9` | `124.61 s` | `0.054` | `14.8 GiB` | `9.4 GiB` | `24.2 GiB` | `79.1 s` | `2.7 s` |
+
+![Worker trade wall time](assets/phase14-worker-trade-wall-time.png)
+
+![Worker trade total RAM](assets/phase14-worker-trade-total-ram.png)
+
+![Worker trade throughput](assets/phase14-worker-trade-throughput.png)
+
+Linear per-worker throughput fits over this sample:
+
+- CPU: `pixels/s/worker = -0.00171 * workers + 0.04572`
+- GPU: `pixels/s/worker = -0.00208 * workers + 0.07455`
+
+Interpretation:
+
+- GPU outperforms CPU as expected, at the cost of more RAM, so prefer GPU when
+  memory headroom is available.
+- GPU speed improvement starts to stall after `8` workers on this sample.
+- Throughput decreases with multiprocessing overhead as expected; runtime
+  estimates should account for this rather than assuming linear worker scaling.
+- Conclusion: use GPU with `9` workers and include measured throughput
+  scaling when estimating runtime.
+
+## 2026-04-18 Phase 14 Memory-Aware Regional Pre-Planning
+
+The next scheduling question is whether worker plans can be ordered so high-RAM
+pixels are unlikely to peak at the same time while still preserving neighbour
+locality for Gaia-cache reuse. The current regional scheduler builds static
+worker plans: each worker stays busy until its assigned regional plan is done,
+but workers do not steal unfinished pixels from each other. This makes the
+up-front plan order important.
+
+The Galactic-latitude-aware pre-planner assigns `|b| <= 15 deg` regions to a
+low-latitude worker lane and higher-latitude regions to a second lane. The
+worker split is selected by simulation: for each candidate worker count, sweep
+the low-latitude worker count and keep the fastest split that remains under the
+configured total-RAM ceiling. Each latitude lane is balanced by estimated
+runtime, then ordered by Galactic longitude with staggered worker starts. If the
+pending work contains only one latitude lane, all workers are used for that
+lane. Neighbour-first ordering is preserved inside each region, and the parent
+total-RAM guard remains the final protection.
+
+The simulation is a planning estimate, not the runtime authority. In the real
+build, the parent process monitors total RSS across itself and active workers.
+When GPU prediction is enabled, it also reserves a measured GPU-driver
+high-water allowance per active worker so the guard tracks the same total-RAM
+quantity used in the benchmark policy.
+When total RAM approaches the configured parent limit, it targets the heaviest
+workers first: workers trim Gaia/Torch caches and collect garbage at safe
+checkpoints, and under harder pressure can pause before starting another outer
+pixel. The aim is to stay below the configured high-water limit even when
+Python or Torch memory retention prevents the real curve from following the
+simulation exactly.
+
+### Simulation
+
+A runtime simulation is available in `scripts/simulate_regional_schedule_memory.py`.
+The script treats each outer pixel as holding its estimated peak worker RAM for
+the pixel's full estimated runtime. The runtime estimate uses the piecewise
+star-count fit shown above. The RAM plots stack active workers by current memory
+rank, so the top band is the heaviest active worker at that time rather than a
+fixed worker ID. The neutral grey band is the measured total-RAM overhead;
+colored bands are active star-count RAM plus GPU-driver overhead.
+
+The RAM overhead is calibrated by comparing the schedule simulation against the
+real GPU worker-trade study:
+
+```text
+overhead_needed = real_total_ram - simulated_active_ram
+simulated_active_ram = simulated_worker_ram + simulated_gpu_ram
+```
+
+![Regional schedule RAM overhead fit](assets/regional-schedule-ram-overhead-fit.png)
+
+Current linear overhead fit:
+
+```text
+overhead_gib = 9.71929 - 0.66107 * workers
+```
+
+| Workers | Real Total | Sim Worker | Sim GPU | Sim Active | Overhead Needed | Overhead Fit |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `3` | `15.22 GiB` | `4.76 GiB` | `3.15 GiB` | `7.91 GiB` | `7.31 GiB` | `7.74 GiB` |
+| `4` | `18.79 GiB` | `6.19 GiB` | `4.20 GiB` | `10.39 GiB` | `8.39 GiB` | `7.07 GiB` |
+| `5` | `19.08 GiB` | `8.11 GiB` | `5.25 GiB` | `13.36 GiB` | `5.72 GiB` | `6.41 GiB` |
+| `6` | `20.13 GiB` | `8.11 GiB` | `6.30 GiB` | `14.41 GiB` | `5.72 GiB` | `5.75 GiB` |
+| `7` | `21.03 GiB` | `9.32 GiB` | `7.35 GiB` | `16.67 GiB` | `4.35 GiB` | `5.09 GiB` |
+| `8` | `23.22 GiB` | `10.05 GiB` | `8.40 GiB` | `18.45 GiB` | `4.77 GiB` | `4.43 GiB` |
+| `9` | `24.23 GiB` | `10.77 GiB` | `9.45 GiB` | `20.22 GiB` | `4.01 GiB` | `3.77 GiB` |
+
+The `4`-worker point is the largest tension in the fit. A linear overhead is
+about as accurate as the piecewise alternative on the existing worker-trade
+data and is easier to interpret. GPU memory is modeled as a configured-worker
+high-water term, not an active-worker term, matching the MPS driver telemetry
+used in the worker-trade measurements.
+
+The decreasing overhead term should be interpreted as a calibration residual,
+not as a physical memory component that truly shrinks with more workers. It
+likely reflects several effects folded together: simulated worker RAM assumes
+each active pixel holds its peak RAM for the full pixel runtime, high estimated
+pixel peaks may not occur simultaneously in the real run, GPU RAM grows with
+configured worker count, and process-side RAM appears to plateau once enough
+workers are active. In short, the active RAM model over-scales with worker count
+relative to the measured process-side high-water, and the fitted overhead
+absorbs that mismatch.
+
+The 288-pixel validation case uses the same fixed sample as the inference-shape
+benchmarks:
+
+```bash
+./.conda/bin/python scripts/simulate_regional_schedule_memory.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1 \
+  --sample-pixels /Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-compression-sweep-bench-20260416-212643/sample-pixels.ecsv \
+  --workers 3 \
+  --throughput-device gpu \
+  --per-worker-gpu-overhead-gib 1.05 \
+  --plot-output docs/assets/regional-schedule-ram-simulation-288.png
+```
+
+![Simulated 288-pixel regional Traversal RAM over time](assets/regional-schedule-ram-simulation-288.png)
+
+Comparison to the real dense-ladder GPU run on the same sample:
+
+| Case | Pixels | Elapsed | Worker RAM | GPU RAM | RAM Overhead | Total RAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Simulation | `288` | `45.59 s` | `0.18 GiB` | `3.15 GiB` | `7.74 GiB` | `11.07 GiB` |
+| Real run | `288` | `46.90 s` | `2.8 GiB` | `3.1 GiB` | n/a | `6.0 GiB` |
+
+The 288-pixel real RAM row predates parent-level total-RAM high-water sampling,
+so it is useful for runtime comparison but not for calibrating total RAM. The
+worker-trade table below uses the corrected parent-level RAM measurement.
+
+As a second cross-check, the simulator was run on the exact `60`-pixel worker
+trade-study sample and compared against the real GPU worker-trade runs:
+
+| Workers | Real Wall | Sim Wall | Time Sim / Real | Sim Total RAM | Real Total RAM | RAM Sim / Real |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `3` | `315.89 s` | `333.31 s` | `1.06x` | `15.65 GiB` | `15.2 GiB` | `1.03x` |
+| `4` | `219.97 s` | `231.74 s` | `1.05x` | `17.47 GiB` | `18.8 GiB` | `0.93x` |
+| `5` | `169.35 s` | `179.96 s` | `1.06x` | `19.77 GiB` | `19.1 GiB` | `1.04x` |
+| `6` | `168.87 s` | `185.99 s` | `1.10x` | `20.16 GiB` | `20.1 GiB` | `1.00x` |
+| `7` | `141.69 s` | `153.62 s` | `1.08x` | `21.77 GiB` | `21.0 GiB` | `1.04x` |
+| `8` | `127.13 s` | `133.90 s` | `1.05x` | `22.88 GiB` | `23.2 GiB` | `0.99x` |
+| `9` | `124.61 s` | `138.89 s` | `1.11x` | `23.99 GiB` | `24.2 GiB` | `0.99x` |
+
+This cross-check shows that the simulator is conservative on wall time by about
+`5-11%` while preserving the worker-count shape. With the calibrated overhead and
+configured-worker GPU high-water term, simulated RAM is within about `-7%` to
+`+4%` of the corrected real total-RAM high-water over this sample.
+The real worker-trade runs show that `9` workers is only about `2.0%` faster
+than `8` workers on the fixed sample, but the full-sky simulation still selects
+`9` workers when the configured total-RAM ceiling is `26 GiB`.
+
+Interpretation:
+
+- Total Gaia star count is a useful cheap proxy for worker RAM, so it can drive
+  memory-aware pre-planning even though the fitted curve is approximate.
+- Conclusion: pre-planning can use star count plus Galactic-latitude phasing to
+  stagger high-memory pixels while preserving regional/neighbour ordering for
+  cache locality.
+
+### Worker Optimization
+
+Full-sky GPU worker-count simulations with per-worker throughput correction.
+Each cell is elapsed time / total RAM. Cells marked `*` exceed the configured
+`26 GiB` total-RAM ceiling.
+
+| Workers | Low `1` | Low `2` | Low `3` | Low `4` | Low `5` | Low `6` | Low `7` | Low `8` |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `4` | `57.0 h / 18.8 GiB` | `28.5 h / 18.5 GiB` | `26.5 h / 17.9 GiB` | - | - | - | - | - |
+| `5` | `58.3 h / 18.4 GiB` | `29.2 h / 17.4 GiB` | `19.4 h / 20.3 GiB` | `27.9 h / 19.4 GiB` | - | - | - | - |
+| `6` | `60.3 h / 19.8 GiB` | `30.1 h / 19.4 GiB` | `20.1 h / 19.5 GiB` | `15.1 h / 19.7 GiB` | `28.9 h / 20.4 GiB` | - | - | - |
+| `7` | `62.4 h / 19.9 GiB` | `31.2 h / 18.6 GiB` | `20.8 h / 21.5 GiB` | `15.6 h / 20.8 GiB` | `14.9 h / 21.8 GiB` | `29.9 h / 22.0 GiB` | - | - |
+| `8` | `64.6 h / 19.7 GiB` | `32.3 h / 19.4 GiB` | `21.5 h / 20.4 GiB` | `16.2 h / 20.4 GiB` | `13.0 h / 21.9 GiB` | `15.5 h / 23.0 GiB` | `30.9 h / 24.5 GiB` | - |
+| `9` | `67.0 h / 21.3 GiB` | `33.5 h / 21.7 GiB` | `22.3 h / 21.2 GiB` | `16.8 h / 22.5 GiB` | `13.4 h / 23.1 GiB` | `11.2 h / 23.7 GiB` | `16.0 h / 26.6 GiB*` | `32.1 h / 25.6 GiB` |
+
+The selected full-sky simulation is the fastest split under the configured total-RAM ceiling: `9` GPU workers with `6` low-latitude workers.
+
+```bash
+./.conda/bin/python scripts/simulate_regional_schedule_memory.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1 \
+  --schedule-full-sky \
+  --workers 9 \
+  --galactic-low-latitude-workers 6 \
+  --throughput-device gpu \
+  --per-worker-gpu-overhead-gib 1.05 \
+  --plot-output docs/assets/regional-schedule-ram-simulation-full-sky.png
+```
+
+![Simulated full-sky regional Traversal RAM over time](assets/regional-schedule-ram-simulation-full-sky.png)
+
+Interpretation:
+
+- With a RAM ceiling of 26 GiB, the simulation suggests the entire sky can be processed in about 11.2 hours.
+- Conclusion: use `9` GPU workers with `6` low-latitude workers.
+
+### Retained-Policy Smoke
+
+A short real-data smoke was run after encoding the retained defaults in
+`ao-sky.yaml` and the code defaults. This used the first `12` pixels from the
+fixed sample, GPU prediction for both model families, dense inference-shape
+ladders from `1000..25000`, no routine cache clearing, `9` workers, and a
+`26624 MiB` total-RAM guard.
+
+Benchmark root:
+
+`/Volumes/Data/Galaxy/aosky/benchmark-runs/ao-sky-traversal-baseline-20260419-000525`
+
+| Pixels | Workers | Wall | Total RAM | GPU Driver RAM | Cache Clear | Resolved Inference | Averaged Inference |
+| ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| `12` | `9` | `9.09 s` | `2.09 GiB` | `1.05 GiB` | `never` | `1.66 s` | `0.33 s` |
+
+Interpretation:
+
+- The retained defaults are active in a real build path: GPU prediction,
+  dense inference shapes, and no routine cache clear all appeared in telemetry.
+- The smoke completed without memory-pressure failure and stayed far below the
+  `26 GiB` guard on this small sample.

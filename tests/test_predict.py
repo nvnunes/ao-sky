@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from gzip import open as gzip_open
 from pathlib import Path
 
@@ -24,12 +25,25 @@ from ao_sky.build.runtime_config import (
     write_runtime_config,
 )
 from ao_sky.build.traversal import (
+    DEFAULT_BACKEND_BUCKETS,
+    RESOLVED_CACHE_CLEAR_EVERY,
     TraversalGeometry,
-    _filter_neighbours_by_galactic_latitude,
+    TraversalStructureProfile,
+    _backend_buffer_row_count,
+    _backend_row_count,
+    _build_candidate_graph_from_ngs,
+    _build_candidate_set,
+    _build_regional_candidate_graph,
+    _MulticoverSelection,
+    _StarForCoverage,
+    _local_neighbor_index_matrix,
+    _max_regional_combination_work,
+    _regularize_winner_labels,
+    _regional_selector_max_depth,
+    _select_ngs_for_multicover,
+    _stream_batch_size,
     build_base_inner_table,
     prepare_search_inputs,
-    _update_inner_pixel_asterism_field_mean,
-    _update_inner_pixel_asterism_performance,
     build_traversal_products,
 )
 from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
@@ -37,14 +51,13 @@ from ao_sky.gaia._constants import GAIA_SCHEMA_COLUMNS
 from ao_sky.predict import PredictError
 from ao_sky.predict import backend as predict_backend
 from ao_sky.predict import service as predict_service
+from ao_sky.predict.service import build_model_x_from_ngs_arrays
 from ao_sky.predict._models import AOSystemRuntime, PointPredictionBatch, PredictRuntime
 from ao_sky.spatial import get_parent_pixel, get_pixel_skycoord
 
 
 def _write_legacy_config(
     path: Path,
-    *,
-    min_galactic_latitude: float | None = None,
 ) -> Path:
     text = """
 ao_systems:
@@ -65,8 +78,6 @@ ao_systems:
 coverage_ee_threshold_resolved: 0.4
 coverage_ee_threshold_mean: 0.3
 """.strip()
-    if min_galactic_latitude is not None:
-        text += f"\nasterisms_min_galactic_latitude: {float(min_galactic_latitude)}"
     path.write_text(text + "\n", encoding="utf-8")
     return path
 
@@ -75,13 +86,13 @@ def _write_build_definition(path: Path) -> Path:
     path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "build": {},
                 "ao_system": {
                     "band": "R",
                     "fov_arcsec": 120.0,
                     "lgs": [],
-                    "min_wfs": 2,
+                    "min_wfs": 1,
                     "max_wfs": 3,
                     "min_mag": 8.0,
                     "max_mag": 18.5,
@@ -90,10 +101,12 @@ def _write_build_definition(path: Path) -> Path:
                 "prediction": {
                     "wavelength_micron": 1.654,
                     "resolved_models": {
+                        "1star": "point_one",
                         "2star": "point_two",
                         "3star": "point_three",
                     },
                     "averaged_models": {
+                        "1star": "mean_one",
                         "2star": "mean_two",
                         "3star": "mean_three",
                     },
@@ -105,12 +118,13 @@ def _write_build_definition(path: Path) -> Path:
                 "gaia": {
                     "release": "dr3",
                     "epoch": 2028.0,
-                    "min_galactic_latitude_deg": None,
-                    "max_star_density": 6.0,
                     "max_bright_star_mag": 8.0,
+                    "max_bright_star_exclusion_arcsec": 240.0,
                 },
                 "maps": {"max_level": 1},
-                "asterism": {"max_overlap": 0.66},
+                "asterism": {
+                    "winner_ee_epsilon": 0.01,
+                },
                 "best": {
                     "seeing_baseline": {
                         "wavelength_micron": 0.5,
@@ -160,22 +174,13 @@ def load_native_runtime(
         outer_level=definition.outer_level,
         inner_level=definition.inner_level,
         epoch=float(raw.get("asterism_epoch", 2028.0)),
-        min_galactic_latitude=(
-            None
-            if raw.get("asterisms_min_galactic_latitude") is None
-            else float(raw["asterisms_min_galactic_latitude"])
-        ),
-        max_star_density=float(raw.get("asterisms_max_star_density", 2.0)),
         max_bright_star_mag=(
             None
             if raw.get("asterisms_max_bright_star_mag") is None
             else float(raw["asterisms_max_bright_star_mag"])
         ),
-        max_overlap=(
-            None
-            if raw.get("asterisms_max_overlap") is None
-            else float(raw["asterisms_max_overlap"])
-        ),
+        max_bright_star_exclusion=2.0 * ao_system.fov,
+        winner_ee_epsilon=0.01,
         prediction_wavelength=1.654 * u.micron,
         resolved_models={
             str(key): str(value)
@@ -383,7 +388,6 @@ def test_load_native_runtime_applies_defaults_and_model_root(tmp_path: Path) -> 
     assert runtime.seeing_reference_wavelength.to_value() == pytest.approx(0.5)
     assert runtime.coverage_ee_threshold_resolved == pytest.approx(0.4)
     assert runtime.coverage_ee_threshold_averaged == pytest.approx(0.3)
-    assert runtime.max_star_density == pytest.approx(2.0)
     assert len(runtime.ao_system.lgs) == 4
     assert runtime.resolved_models == {"2star": "point_two", "3star": "point_three"}
     assert runtime.averaged_models == {"2star": "mean_two", "3star": "mean_three"}
@@ -417,8 +421,10 @@ def test_runtime_config_round_trips_native_policy(tmp_path: Path) -> None:
     assert loaded.averaged_models == runtime.averaged_models
     assert loaded.outer_level == runtime.outer_level
     assert loaded.inner_level == runtime.inner_level
-    assert loaded.max_star_density == pytest.approx(runtime.max_star_density)
-    assert loaded.max_overlap == pytest.approx(runtime.max_overlap)
+    assert loaded.max_bright_star_exclusion.to_value(u.arcsec) == pytest.approx(
+        runtime.max_bright_star_exclusion.to_value(u.arcsec)
+    )
+    assert loaded.winner_ee_epsilon == pytest.approx(runtime.winner_ee_epsilon)
     assert loaded.prediction_wavelength.to_value(u.micron) == pytest.approx(1.654)
 
 
@@ -445,6 +451,39 @@ def test_load_runtime_config_rejects_invalid_runtime_values(tmp_path: Path) -> N
     filename.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(BuildError, match="fov_arcsec must be positive"):
+        load_runtime_config(filename, model_root=tmp_path / "models")
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "match"),
+    [
+        ("asterism", "max_overlap", 0.66, "max_overlap is legacy-only"),
+        ("asterism", "max_candidate_asterisms", 64, "max_candidate_asterisms was removed"),
+        ("asterism", "winner_ee_epsilon", 1.0, "winner_ee_epsilon must be at least 0"),
+        (
+            "gaia",
+            "max_bright_star_exclusion_arcsec",
+            0.0,
+            "max_bright_star_exclusion_arcsec must be positive",
+        ),
+    ],
+)
+def test_load_runtime_config_rejects_invalid_phase14_values(
+    tmp_path: Path,
+    section: str,
+    key: str,
+    value: object,
+    match: str,
+) -> None:
+    filename = write_runtime_config(
+        tmp_path / "build",
+        _make_predict_runtime(model_root=tmp_path / "models"),
+    )
+    payload = yaml.safe_load(filename.read_text(encoding="utf-8"))
+    payload[section][key] = value
+    filename.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BuildError, match=match):
         load_runtime_config(filename, model_root=tmp_path / "models")
 
 
@@ -506,14 +545,15 @@ def _make_predict_runtime(
     point_model: str = "point-a.pt",
     mean_model: str = "mean-a.pt",
     fov: u.Quantity = 120.0 * u.arcsec,
-    min_galactic_latitude: float | None = None,
+    min_wfs: int = 2,
+    max_wfs: int = 2,
 ) -> PredictRuntime:
     ao_system = AOSystemRuntime(
         band="R",
         fov=fov,
         lgs=(),
-        min_wfs=2,
-        max_wfs=2,
+        min_wfs=min_wfs,
+        max_wfs=max_wfs,
         min_mag=8.0,
         max_mag=18.5,
         min_sep=5.0 * u.arcsec,
@@ -523,13 +563,18 @@ def _make_predict_runtime(
         outer_level=0,
         inner_level=1,
         epoch=2028.0,
-        min_galactic_latitude=min_galactic_latitude,
-        max_star_density=None,
         max_bright_star_mag=None,
-        max_overlap=None,
+        max_bright_star_exclusion=2.0 * fov,
+        winner_ee_epsilon=0.01,
         prediction_wavelength=1.654 * u.micron,
-        resolved_models={"2star": point_model},
-        averaged_models={"2star": mean_model},
+        resolved_models={
+            f"{count}star": point_model
+            for count in range(min_wfs, max_wfs + 1)
+        },
+        averaged_models={
+            f"{count}star": mean_model
+            for count in range(min_wfs, max_wfs + 1)
+        },
         seeing_reference_wavelength=0.5 * u.micron,
         seeing_reference_sr=0.0,
         seeing_reference_ee=0.0,
@@ -538,6 +583,749 @@ def _make_predict_runtime(
         coverage_ee_threshold_averaged=0.25,
         model_root=model_root,
     )
+
+
+def test_candidate_members_are_emitted_in_sensing_magnitude_order(
+    tmp_path: Path,
+) -> None:
+    runtime = replace(
+        _make_predict_runtime(
+            model_root=tmp_path / "models",
+            min_wfs=1,
+            max_wfs=3,
+        ),
+        outer_level=0,
+        inner_level=3,
+    )
+    stars = Table()
+    stars["source_id"] = np.array([30, 20, 10], dtype=np.int64)
+    stars["ra"] = np.array([0.006, 0.003, 0.0], dtype=np.float64)
+    stars["dec"] = np.zeros(3, dtype=np.float64)
+    stars["R"] = np.array([12.0, 10.0, 10.0], dtype=np.float64)
+
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+
+    magnitudes = np.asarray(graph.sorted_ngs["R"], dtype=np.float64)
+    source_ids = np.asarray(graph.sorted_ngs["source_id"], dtype=np.int64)
+    assert source_ids.tolist() == [10, 20, 30]
+    for members in candidate_set.members:
+        valid = members[members >= 0]
+        member_magnitudes = magnitudes[valid]
+        member_source_ids = source_ids[valid]
+        assert np.all(member_magnitudes[:-1] <= member_magnitudes[1:])
+        for first, second in zip(
+            range(len(valid) - 1),
+            range(1, len(valid)),
+            strict=False,
+        ):
+            if member_magnitudes[first] == member_magnitudes[second]:
+                assert member_source_ids[first] < member_source_ids[second]
+
+
+def test_unbounded_candidate_graph_counts_geometry_limited_candidates(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=1,
+        max_wfs=3,
+    )
+    stars = Table()
+    stars["source_id"] = np.array([30, 20, 10, 40], dtype=np.int64)
+    stars["ra"] = np.array([0.006, 0.003, 0.0, 1.0], dtype=np.float64)
+    stars["dec"] = np.zeros(4, dtype=np.float64)
+    stars["R"] = np.array([12.0, 10.0, 10.0, 13.0], dtype=np.float64)
+
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+
+    assert graph.final_count == 4
+    assert len(graph.edges) == 3
+    assert len(graph.triangles) == 1
+    assert graph.candidate_count == 8
+    assert len(candidate_set.members) == 8
+    assert np.asarray(graph.sorted_ngs["source_id"], dtype=np.int64).tolist() == [
+        10,
+        20,
+        30,
+        40,
+    ]
+
+
+def test_regional_candidate_graph_keeps_exact_tractable_region(
+    tmp_path: Path,
+) -> None:
+    runtime = replace(
+        _make_predict_runtime(
+            model_root=tmp_path / "models",
+            min_wfs=1,
+            max_wfs=3,
+        ),
+        outer_level=0,
+        inner_level=3,
+    )
+    stars = Table()
+    stars["source_id"] = np.array([10, 20, 30, 40], dtype=np.int64)
+    stars["ra"] = np.array([0.0, 0.003, 0.006, 0.009], dtype=np.float64)
+    stars["dec"] = np.zeros(4, dtype=np.float64)
+    stars["R"] = np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float64)
+    coverage = _StarForCoverage(
+        pixel_indices=np.zeros(4, dtype=np.int64),
+        starts=np.arange(5, dtype=np.int64),
+        full_depth=np.array([4, 0, 0, 0], dtype=np.uint32),
+        target_depth=np.array([3, 0, 0, 0], dtype=np.uint16),
+    )
+
+    graph, stats = _build_regional_candidate_graph(
+        stars,
+        coverage,
+        runtime,
+    )
+    candidate_set = _build_candidate_set(graph, runtime)
+
+    assert stats.exact_regions == 1
+    assert stats.for_optimized_regions == 0
+    assert stats.max_regional_combination_work == 64
+    assert stats.exact_combination_work == 14
+    assert stats.final_resolved_inferences == 14
+    assert graph.final_count == 4
+    assert graph.candidate_count == 14
+    assert len(candidate_set.members) == 14
+
+
+def test_regional_candidate_graph_uses_for_selection_at_dense_floor(
+    tmp_path: Path,
+) -> None:
+    runtime = replace(
+        _make_predict_runtime(
+            model_root=tmp_path / "models",
+            fov=1000.0 * u.arcsec,
+            min_wfs=1,
+            max_wfs=3,
+        ),
+    )
+    count = 20
+    stars = Table()
+    stars["source_id"] = np.arange(100, 100 + count, dtype=np.int64)
+    stars["ra"] = np.arange(count, dtype=np.float64) * 0.002
+    stars["dec"] = np.zeros(count, dtype=np.float64)
+    stars["R"] = np.arange(count, dtype=np.float64) + 10.0
+    coverage = _StarForCoverage(
+        pixel_indices=np.zeros(count, dtype=np.int64),
+        starts=np.arange(count + 1, dtype=np.int64),
+        full_depth=np.array([count, 0, 0, 0], dtype=np.uint32),
+        target_depth=np.array([3, 0, 0, 0], dtype=np.uint16),
+    )
+
+    graph, stats = _build_regional_candidate_graph(
+        stars,
+        coverage,
+        runtime,
+    )
+    candidate_set = _build_candidate_set(graph, runtime)
+
+    assert stats.exact_regions == 0
+    assert stats.for_optimized_regions == 1
+    assert stats.exact_combination_work == 0
+    assert stats.final_resolved_inferences == 7
+    assert np.asarray(graph.sorted_ngs["source_id"], dtype=np.int64).tolist() == [
+        100,
+        101,
+        102,
+    ]
+    assert graph.candidate_count == 7
+    assert len(candidate_set.members) == 7
+
+
+def test_regional_candidate_graph_uses_unbounded_for_selection_under_budget(
+    tmp_path: Path,
+) -> None:
+    runtime = replace(
+        _make_predict_runtime(
+            model_root=tmp_path / "models",
+            fov=1000.0 * u.arcsec,
+            min_wfs=1,
+            max_wfs=3,
+        ),
+        outer_level=14,
+        inner_level=14,
+    )
+    count = 12
+    stars = Table()
+    stars["source_id"] = np.arange(100, 100 + count, dtype=np.int64)
+    stars["ra"] = np.arange(count, dtype=np.float64) * 0.002
+    stars["dec"] = np.zeros(count, dtype=np.float64)
+    stars["R"] = np.arange(count, dtype=np.float64) + 10.0
+    pixel_rows = [
+        [0],
+        [0],
+        [0, 1],
+        [0, 1],
+        [0, 1],
+        [0],
+        [0],
+        [0],
+        [0],
+        [0],
+        [0],
+        [0],
+    ]
+    starts = np.zeros((count + 1,), dtype=np.int64)
+    starts[1:] = np.cumsum([len(rows) for rows in pixel_rows], dtype=np.int64)
+    coverage = _StarForCoverage(
+        pixel_indices=np.asarray(
+            [pixel for rows in pixel_rows for pixel in rows],
+            dtype=np.int64,
+        ),
+        starts=starts,
+        full_depth=np.array([count, 3, 0, 0], dtype=np.uint32),
+        target_depth=np.array([3, 3, 0, 0], dtype=np.uint16),
+    )
+
+    graph, stats = _build_regional_candidate_graph(
+        stars,
+        coverage,
+        runtime,
+    )
+
+    assert stats.exact_regions == 0
+    assert stats.for_optimized_regions == 1
+    assert stats.incomplete_for_regions == 0
+    assert stats.final_resolved_inferences == 32
+    assert np.asarray(graph.sorted_ngs["source_id"], dtype=np.int64).tolist() == [
+        100,
+        101,
+        102,
+        103,
+        104,
+    ]
+
+
+def test_regional_selector_max_depth_uses_level_above_for_size(
+    tmp_path: Path,
+) -> None:
+    runtime = replace(
+        _make_predict_runtime(
+            model_root=tmp_path / "models",
+            fov=120.0 * u.arcsec,
+            min_wfs=1,
+            max_wfs=3,
+        ),
+        outer_level=6,
+        inner_level=14,
+    )
+
+    assert _regional_selector_max_depth(runtime) == 4
+    assert _max_regional_combination_work(runtime) == 65536
+
+
+def test_regularized_winner_labels_use_local_support_with_epsilon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = replace(
+        _make_predict_runtime(model_root=tmp_path / "models"),
+        winner_ee_epsilon=0.05,
+    )
+    top_refs = np.array(
+        [
+            [1, 2, -1],
+            [2, 1, -1],
+            [2, 1, -1],
+            [3, 1, -1],
+            [4, 1, -1],
+        ],
+        dtype=np.int64,
+    )
+    top_ee = np.array(
+        [
+            [1.00, 0.97, -np.inf],
+            [1.00, 0.97, -np.inf],
+            [1.00, 0.97, -np.inf],
+            [1.00, 0.90, -np.inf],
+            [1.00, 0.97, -np.inf],
+        ],
+        dtype=np.float64,
+    )
+    neighbour_matrix = np.array(
+        [
+            [1, 2, -1, -1, -1, -1, -1, -1],
+            [0, 2, -1, -1, -1, -1, -1, -1],
+            [0, 1, -1, -1, -1, -1, -1, -1],
+            [0, 1, -1, -1, -1, -1, -1, -1],
+            [0, 1, -1, -1, -1, -1, -1, -1],
+        ],
+        dtype=np.int64,
+    )
+    monkeypatch.setattr(
+        "ao_sky.build.traversal._local_neighbor_index_matrix",
+        lambda inner_pixs, inner_level: neighbour_matrix,
+    )
+
+    labels = _regularize_winner_labels(
+        runtime,
+        np.arange(len(top_refs), dtype=np.int64),
+        top_refs,
+        top_ee,
+    )
+
+    assert labels.tolist() == [2, 2, 2, 3, 1]
+
+
+def test_backend_bucket_helpers_cap_logical_batches_at_buffer_size() -> None:
+    buckets = (1024, 2048, 4096)
+
+    assert DEFAULT_BACKEND_BUCKETS == tuple(range(1000, 25001, 1000))
+    assert RESOLVED_CACHE_CLEAR_EVERY == -1
+    assert _stream_batch_size(5000, buckets) == 4096
+    assert _stream_batch_size(3000, buckets) == 3000
+    assert _stream_batch_size(3000, ()) == 3000
+    assert _backend_buffer_row_count(buckets) == 4096
+    assert _backend_buffer_row_count(()) is None
+    assert _backend_row_count(3000, buckets) == 4096
+    assert _backend_row_count(3000, ()) is None
+
+    with pytest.raises(BuildError, match="largest backend bucket"):
+        _backend_row_count(4097, buckets)
+
+
+def test_multicover_selection_keeps_fainter_stars_for_spatial_depth() -> None:
+    ngs = Table()
+    ngs["source_id"] = np.array([10, 20, 30, 40], dtype=np.int64)
+    ngs["R"] = np.array([9.0, 10.0, 14.0, 15.0], dtype=np.float64)
+    coverage = _StarForCoverage(
+        pixel_indices=np.array([0, 1, 0, 1, 2, 0], dtype=np.int64),
+        starts=np.array([0, 2, 4, 5, 6], dtype=np.int64),
+        full_depth=np.array([3, 2, 1], dtype=np.uint32),
+        target_depth=np.array([2, 2, 1], dtype=np.uint16),
+    )
+
+    selection = _select_ngs_for_multicover(ngs, coverage)
+
+    assert isinstance(selection, _MulticoverSelection)
+    assert selection.star_indices.tolist() == [0, 1, 2]
+    assert selection.depth.tolist() == [2, 2, 1]
+
+
+def test_multicover_selection_preserves_only_achievable_depth() -> None:
+    ngs = Table()
+    ngs["source_id"] = np.array([10, 20], dtype=np.int64)
+    ngs["R"] = np.array([9.0, 10.0], dtype=np.float64)
+    coverage = _StarForCoverage(
+        pixel_indices=np.array([0, 1], dtype=np.int64),
+        starts=np.array([0, 1, 2], dtype=np.int64),
+        full_depth=np.array([1, 1, 0], dtype=np.uint32),
+        target_depth=np.array([1, 1, 0], dtype=np.uint16),
+    )
+
+    selection = _select_ngs_for_multicover(ngs, coverage)
+
+    assert selection.star_indices.tolist() == [0, 1]
+    assert selection.depth.tolist() == [1, 1, 0]
+
+
+def test_local_neighbor_index_matrix_requires_dense_inner_pixel_block() -> None:
+    with pytest.raises(BuildError, match="dense contiguous nested inner-pixel block"):
+        _local_neighbor_index_matrix(
+            np.array([100, 102, 101], dtype=np.int64),
+            inner_level=4,
+        )
+
+
+def test_vectorized_model_features_match_backend_layout(tmp_path: Path) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=2,
+    )
+
+    x = build_model_x_from_ngs_arrays(
+        runtime,
+        ngs_zd=np.array([[10.0, 20.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[45.0, 190.0]], dtype=np.float64),
+        ngs_mag=np.array([[11.0, 12.0]], dtype=np.float64),
+    )
+    mean_x = build_model_x_from_ngs_arrays(
+        runtime,
+        ngs_zd=np.array([[10.0, 20.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[45.0, 190.0]], dtype=np.float64),
+        ngs_mag=np.array([[11.0, 12.0]], dtype=np.float64),
+        mean_only=True,
+    )
+
+    assert x.shape == (1, 9)
+    assert x[0, :7] == pytest.approx(
+        [
+            1.654,
+            10.0,
+            np.deg2rad(45.0),
+            11.0,
+            20.0,
+            np.deg2rad(-170.0),
+            12.0,
+        ]
+    )
+    assert x[0, 7:] == pytest.approx([0.0, 0.0])
+    assert mean_x.shape == (1, 7)
+    assert mean_x[0] == pytest.approx(x[0, :7])
+
+
+def test_vectorized_model_features_preserve_tied_magnitude_order(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=2,
+    )
+
+    x = build_model_x_from_ngs_arrays(
+        runtime,
+        ngs_zd=np.array([[20.0, 10.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[190.0, 45.0]], dtype=np.float64),
+        ngs_mag=np.array([[12.0, 12.0]], dtype=np.float64),
+        mean_only=True,
+    )
+
+    assert x[0] == pytest.approx(
+        [
+            1.654,
+            20.0,
+            np.deg2rad(-170.0),
+            12.0,
+            10.0,
+            np.deg2rad(45.0),
+            12.0,
+        ]
+    )
+
+
+def test_vectorized_model_features_reuse_static_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=1,
+        max_wfs=1,
+    )
+    runtime = replace(
+        runtime,
+        ao_system=replace(
+            runtime.ao_system,
+            lgs=(
+                {"zd": 30.0, "az": 0.0},
+                {"zd": 40.0, "az": 90.0},
+            ),
+        ),
+    )
+    predict_service._FEATURE_TEMPLATE_CACHE.clear()
+    original_get_lgs_xy = predict_service._get_ao_lgs_xy
+    calls = 0
+
+    def fake_get_lgs_xy(lgs):
+        nonlocal calls
+        calls += 1
+        return original_get_lgs_xy(lgs)
+
+    monkeypatch.setattr(predict_service, "_get_ao_lgs_xy", fake_get_lgs_xy)
+
+    first = build_model_x_from_ngs_arrays(
+        runtime,
+        ngs_zd=np.array([[20.0], [10.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[190.0], [45.0]], dtype=np.float64),
+        ngs_mag=np.array([[12.0], [11.0]], dtype=np.float64),
+    )
+    second = build_model_x_from_ngs_arrays(
+        runtime,
+        ngs_zd=np.array([[15.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[90.0]], dtype=np.float64),
+        ngs_mag=np.array([[10.0]], dtype=np.float64),
+    )
+
+    assert calls == 1
+    assert first.shape == (2, 8)
+    assert first[:, 0] == pytest.approx([1.654, 1.654])
+    assert first[:, 4:6] == pytest.approx(np.zeros((2, 2), dtype=np.float64))
+    assert first[:, 6:] == pytest.approx(
+        np.array([[30.0, 40.0], [30.0, 40.0]], dtype=np.float64)
+    )
+    assert second[0] == pytest.approx(
+        [
+            1.654,
+            15.0,
+            np.deg2rad(90.0),
+            10.0,
+            0.0,
+            0.0,
+            30.0,
+            40.0,
+        ]
+    )
+
+
+def test_vectorized_prediction_records_feature_and_backend_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=2,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_get_prediction(x, model, skip_cache_clear=False):
+        captured["shape"] = x.shape
+        captured["skip_cache_clear"] = skip_cache_clear
+        return np.ones((x.shape[0], 3), dtype=np.float64)
+
+    monkeypatch.setattr(predict_service.backend, "get_prediction", fake_get_prediction)
+
+    telemetry = predict_service.PredictionArrayTelemetry()
+    result = predict_service.predict_field_mean_arrays(
+        runtime,
+        num_stars=2,
+        model=object(),
+        ngs_zd=np.array([[10.0, 20.0], [15.0, 30.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[45.0, 190.0], [20.0, 10.0]], dtype=np.float64),
+        ngs_mag=np.array([[11.0, 12.0], [12.5, 13.0]], dtype=np.float64),
+        prediction_telemetry=telemetry,
+    )
+
+    assert result.shape == (2,)
+    assert captured == {
+        "shape": (2, 7),
+        "skip_cache_clear": True,
+    }
+    assert telemetry.batches == 1
+    assert telemetry.rows == 2
+    assert telemetry.batch_rows_peak == 2
+    assert telemetry.feature_bytes_peak == 2 * 7 * np.dtype(np.float64).itemsize
+    assert telemetry.feature_seconds >= 0.0
+    assert telemetry.backend_seconds >= 0.0
+
+
+def test_vectorized_prediction_requires_num_stars_to_match_arrays(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=3,
+    )
+
+    with pytest.raises(PredictError, match="num_stars must match"):
+        predict_service.predict_point_arrays(
+            runtime,
+            num_stars=3,
+            model=object(),
+            ngs_zd=np.array([[10.0, 20.0]], dtype=np.float64),
+            ngs_az_deg=np.array([[45.0, 190.0]], dtype=np.float64),
+            ngs_mag=np.array([[11.0, 12.0]], dtype=np.float64),
+        )
+
+    with pytest.raises(PredictError, match="num_stars must match"):
+        predict_service.predict_field_mean_arrays(
+            runtime,
+            num_stars=3,
+            model=object(),
+            ngs_zd=np.array([[10.0, 20.0]], dtype=np.float64),
+            ngs_az_deg=np.array([[45.0, 190.0]], dtype=np.float64),
+            ngs_mag=np.array([[11.0, 12.0]], dtype=np.float64),
+        )
+
+
+def test_vectorized_prediction_can_use_fixed_backend_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=2,
+    )
+    captured: dict[str, object] = {}
+    predict_service._FEATURE_BUFFER_CACHE.clear()
+
+    def fake_get_prediction(x, model, skip_cache_clear=False):
+        captured["shape"] = x.shape
+        captured["last_row"] = x[-1].copy()
+        return np.column_stack(
+            (
+                np.arange(x.shape[0], dtype=np.float64),
+                np.arange(x.shape[0], dtype=np.float64) + 10.0,
+                np.arange(x.shape[0], dtype=np.float64) + 20.0,
+            )
+        )
+
+    monkeypatch.setattr(predict_service.backend, "get_prediction", fake_get_prediction)
+
+    telemetry = predict_service.PredictionArrayTelemetry()
+    result = predict_service.predict_point_arrays(
+        runtime,
+        num_stars=2,
+        model=object(),
+        ngs_zd=np.array([[10.0, 20.0], [15.0, 30.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[45.0, 190.0], [20.0, 10.0]], dtype=np.float64),
+        ngs_mag=np.array([[11.0, 12.0], [12.5, 13.0]], dtype=np.float64),
+        backend_row_count=5,
+        prediction_telemetry=telemetry,
+    )
+
+    assert captured["shape"] == (5, 9)
+    assert captured["last_row"][[1, 3, 4, 6]] == pytest.approx(
+        [0.0, 0.0, 0.0, 0.0]
+    )
+    assert result.sr.tolist() == [0.0, 1.0]
+    assert result.ee.tolist() == [10.0, 11.0]
+    assert result.fwhm.tolist() == [20.0, 21.0]
+    assert telemetry.batches == 1
+    assert telemetry.rows == 2
+    assert telemetry.batch_rows_peak == 2
+    assert telemetry.feature_bytes_peak == 5 * 9 * np.dtype(np.float64).itemsize
+
+
+def test_vectorized_prediction_reuses_fixed_backend_feature_buffer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=2,
+    )
+    captured: list[np.ndarray] = []
+    predict_service._FEATURE_BUFFER_CACHE.clear()
+
+    def fake_get_prediction(x, model, skip_cache_clear=False):
+        captured.append(x)
+        return np.zeros((x.shape[0], 3), dtype=np.float64)
+
+    monkeypatch.setattr(predict_service.backend, "get_prediction", fake_get_prediction)
+
+    model = object()
+    for scale in (1.0, 2.0):
+        predict_service.predict_point_arrays(
+            runtime,
+            num_stars=2,
+            model=model,
+            ngs_zd=np.array(
+                [[10.0 * scale, 20.0 * scale], [15.0 * scale, 30.0 * scale]],
+                dtype=np.float64,
+            ),
+            ngs_az_deg=np.array([[45.0, 190.0], [20.0, 10.0]], dtype=np.float64),
+            ngs_mag=np.array([[11.0, 12.0], [12.5, 13.0]], dtype=np.float64),
+            backend_row_count=5,
+        )
+
+    assert len(captured) == 2
+    assert captured[0] is captured[1]
+    assert captured[1][[0, 1, 4], 0].tolist() == pytest.approx([1.654, 1.654, 1.654])
+    assert captured[1][0, 1] == pytest.approx(20.0)
+    assert captured[1][1, 1] == pytest.approx(30.0)
+    assert captured[1][2, 1] == pytest.approx(0.0)
+
+
+def test_vectorized_prediction_slices_one_larger_feature_buffer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=2,
+    )
+    captured: list[np.ndarray] = []
+    predict_service._FEATURE_BUFFER_CACHE.clear()
+
+    def fake_get_prediction(x, model, skip_cache_clear=False):
+        captured.append(x)
+        return np.zeros((x.shape[0], 3), dtype=np.float64)
+
+    monkeypatch.setattr(predict_service.backend, "get_prediction", fake_get_prediction)
+    model = object()
+
+    predict_service.predict_point_arrays(
+        runtime,
+        num_stars=2,
+        model=model,
+        ngs_zd=np.array(
+            [[10.0, 20.0], [15.0, 30.0], [25.0, 35.0]],
+            dtype=np.float64,
+        ),
+        ngs_az_deg=np.array(
+            [[45.0, 190.0], [20.0, 10.0], [80.0, 120.0]],
+            dtype=np.float64,
+        ),
+        ngs_mag=np.array(
+            [[11.0, 12.0], [12.5, 13.0], [14.0, 15.0]],
+            dtype=np.float64,
+        ),
+        backend_row_count=5,
+    )
+    predict_service.predict_point_arrays(
+        runtime,
+        num_stars=2,
+        model=model,
+        ngs_zd=np.array([[5.0, 6.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[7.0, 8.0]], dtype=np.float64),
+        ngs_mag=np.array([[9.0, 10.0]], dtype=np.float64),
+        backend_row_count=3,
+    )
+
+    large, smaller = captured
+    assert large.shape == (5, 9)
+    assert smaller.shape == (3, 9)
+    assert np.shares_memory(large, smaller)
+    assert smaller[0, [1, 3, 4, 6]] == pytest.approx([5.0, 9.0, 6.0, 10.0])
+    assert smaller[1, [1, 3, 4, 6]] == pytest.approx([15.0, 12.5, 30.0, 13.0])
+    assert smaller[2, [1, 3, 4, 6]] == pytest.approx([25.0, 14.0, 35.0, 15.0])
+
+
+def test_vectorized_prediction_records_mps_memory_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=2,
+    )
+    samples = iter(
+        (
+            (10, 20, 100),
+            (30, 50, 100),
+        )
+    )
+
+    monkeypatch.setattr(predict_service.backend, "get_model_device_type", lambda model: "mps")
+    monkeypatch.setattr(
+        predict_service.backend,
+        "get_mps_memory_bytes",
+        lambda: next(samples),
+    )
+    monkeypatch.setattr(
+        predict_service.backend,
+        "get_prediction",
+        lambda x, model, skip_cache_clear=False: np.ones((x.shape[0], 3)),
+    )
+
+    telemetry = predict_service.PredictionArrayTelemetry()
+    predict_service.predict_field_mean_arrays(
+        runtime,
+        num_stars=2,
+        model=object(),
+        ngs_zd=np.array([[10.0, 20.0]], dtype=np.float64),
+        ngs_az_deg=np.array([[45.0, 190.0]], dtype=np.float64),
+        ngs_mag=np.array([[11.0, 12.0]], dtype=np.float64),
+        prediction_telemetry=telemetry,
+    )
+
+    assert telemetry.mps_current_bytes_peak == 30
+    assert telemetry.mps_driver_bytes_peak == 50
+    assert telemetry.mps_recommended_bytes == 100
 
 
 def test_runtime_gaia_store_caches_epoch_shifted_read_only_rows(tmp_path: Path) -> None:
@@ -748,65 +1536,21 @@ def test_traversal_geometry_does_not_retain_inner_pixel_geometry(tmp_path: Path)
     assert geometry.inner_centres(0) is not geometry.inner_centres(0)
 
 
-def test_neighbour_latitude_filter_uses_outer_pixel_level(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime = _make_predict_runtime(
-        model_root=tmp_path / "models",
-        fov=30.0 * u.deg,
-        min_galactic_latitude=10.0,
-    )
-    geometry = TraversalGeometry.from_runtime(runtime)
-    stars = Table(
-        [
-            np.array([101, 202], dtype=np.int64),
-            np.array([0, 1], dtype=np.int64),
-        ],
-        names=("source_id", "source_outer_pix"),
-    )
-    seen_levels: list[int] = []
-
-    def fake_get_pixel_skycoord(level: int, pix: int):
-        seen_levels.append(int(level))
-        assert level == runtime.outer_level
-
-        class _B:
-            degree = 0.0 if pix == 1 else 90.0
-
-        class _Galactic:
-            b = _B()
-
-        class _Coord:
-            galactic = _Galactic()
-
-        return _Coord()
-
-    monkeypatch.setattr(
-        "ao_sky.build.traversal.get_pixel_skycoord",
-        fake_get_pixel_skycoord,
-    )
-
-    filtered = _filter_neighbours_by_galactic_latitude(
-        stars,
-        outer_pix=0,
-        geometry=geometry,
-    )
-
-    assert filtered["source_id"].tolist() == [101]
-    assert seen_levels == [runtime.outer_level]
-
-
 def test_model_cache_key_includes_model_root_and_model_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     predict_service._POINT_MODEL_CACHE.clear()
     predict_service._MEAN_MODEL_CACHE.clear()
-    loaded: list[tuple[Path, str]] = []
+    monkeypatch.delenv(predict_service.PREDICT_DEVICE_ENV_VAR, raising=False)
+    loaded: list[tuple[Path, str, bool]] = []
 
-    def fake_load_model(model_root: Path, model_name: str, force_cpu: bool = True) -> object:
-        loaded.append((Path(model_root), model_name))
+    def fake_load_model(
+        model_root: Path,
+        model_name: str,
+        force_cpu: bool = True,
+    ) -> object:
+        loaded.append((Path(model_root), model_name, bool(force_cpu)))
         return f"{Path(model_root).name}:{model_name}"
 
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
@@ -823,10 +1567,119 @@ def test_model_cache_key_includes_model_root_and_model_name(
     assert predict_service.get_point_model(runtime_a, 2) == "models-a:point-a.pt"
 
     assert loaded == [
-        (tmp_path / "models-a", "point-a.pt"),
-        (tmp_path / "models-b", "point-a.pt"),
-        (tmp_path / "models-a", "point-c.pt"),
+        (tmp_path / "models-a", "point-a.pt", True),
+        (tmp_path / "models-b", "point-a.pt", True),
+        (tmp_path / "models-a", "point-c.pt", True),
     ]
+
+
+def test_model_cache_key_includes_backend_device_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predict_service._POINT_MODEL_CACHE.clear()
+    predict_service._MEAN_MODEL_CACHE.clear()
+    loaded: list[bool] = []
+
+    def fake_load_model(
+        model_root: Path,
+        model_name: str,
+        force_cpu: bool = True,
+    ) -> object:
+        loaded.append(bool(force_cpu))
+        return f"force_cpu={bool(force_cpu)}"
+
+    monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
+    runtime = _make_predict_runtime(model_root=tmp_path / "models")
+
+    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "cpu")
+    assert predict_service.get_point_model(runtime, 2) == "force_cpu=True"
+
+    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "auto")
+    assert predict_service.get_point_model(runtime, 2) == "force_cpu=False"
+
+    assert loaded == [True, False]
+
+
+def test_mean_model_stays_on_cpu_when_resolved_allows_auto_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predict_service._POINT_MODEL_CACHE.clear()
+    predict_service._MEAN_MODEL_CACHE.clear()
+    loaded: list[bool] = []
+
+    def fake_load_model(
+        model_root: Path,
+        model_name: str,
+        force_cpu: bool = True,
+    ) -> object:
+        loaded.append(bool(force_cpu))
+        return f"force_cpu={bool(force_cpu)}"
+
+    monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
+    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "auto")
+    monkeypatch.delenv(predict_service.AVERAGED_PREDICT_DEVICE_ENV_VAR, raising=False)
+
+    runtime = _make_predict_runtime(model_root=tmp_path / "models")
+
+    assert predict_service.get_mean_model(runtime, 2) == "force_cpu=True"
+    assert loaded == [True]
+
+
+def test_mean_model_can_use_auto_device_when_explicitly_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predict_service._POINT_MODEL_CACHE.clear()
+    predict_service._MEAN_MODEL_CACHE.clear()
+    loaded: list[bool] = []
+
+    def fake_load_model(
+        model_root: Path,
+        model_name: str,
+        force_cpu: bool = True,
+    ) -> object:
+        loaded.append(bool(force_cpu))
+        return f"force_cpu={bool(force_cpu)}"
+
+    monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
+    monkeypatch.setenv(predict_service.AVERAGED_PREDICT_DEVICE_ENV_VAR, "auto")
+
+    runtime = _make_predict_runtime(model_root=tmp_path / "models")
+
+    assert predict_service.get_mean_model(runtime, 2) == "force_cpu=False"
+    assert loaded == [False]
+
+
+def test_model_device_policy_rejects_unknown_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predict_service._POINT_MODEL_CACHE.clear()
+    predict_service._MEAN_MODEL_CACHE.clear()
+    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "mps")
+
+    with pytest.raises(PredictError, match="AO_SKY_PREDICT_DEVICE"):
+        predict_service.get_point_model(
+            _make_predict_runtime(model_root=tmp_path / "models"),
+            2,
+        )
+
+
+def test_mean_model_validates_averaged_device_policy_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predict_service._POINT_MODEL_CACHE.clear()
+    predict_service._MEAN_MODEL_CACHE.clear()
+    monkeypatch.setenv(predict_service.AVERAGED_PREDICT_DEVICE_ENV_VAR, "mps")
+
+    with pytest.raises(PredictError, match="AO_SKY_AVERAGED_PREDICT_DEVICE"):
+        predict_service.get_mean_model(
+            _make_predict_runtime(model_root=tmp_path / "models"),
+            2,
+        )
 
 
 def test_configure_inference_threads_sets_backend_thread_limits(
@@ -844,182 +1697,15 @@ def test_configure_inference_threads_sets_backend_thread_limits(
     assert calls == [1]
 
 
-def test_winner_fields_remain_local_when_neighbour_has_better_best_ee(
+@pytest.mark.parametrize(
+    ("cache_clear_every", "expected_clear_count"),
+    [(1, 4), (0, 1)],
+)
+def test_build_traversal_products_retains_regularized_winners(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
-    definition = BuildDefinition(
-        lineage_name="baseline",
-        gaia_release="dr3",
-        outer_level=0,
-        inner_level=1,
-        max_data_level=1,
-    )
-    runtime = load_native_runtime(
-        definition,
-        legacy_config_path=legacy,
-        model_root=tmp_path / "models",
-    )
-    inner = Table(
-        [
-            np.array([0], dtype=np.int64),
-            np.array([0], dtype=np.int64),
-            np.array([0], dtype=np.int64),
-            np.array([2], dtype=np.int64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([-1], dtype=np.int64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([False], dtype=np.bool_),
-            np.array([False], dtype=np.bool_),
-        ],
-        names=(
-            "pix",
-            "star_count",
-            "ngs_count",
-            "asterism_count",
-            "best_ee",
-            "best_sr",
-            "best_fwhm",
-            "winner_asterism_id",
-            "winner_distance_arcsec",
-            "winner_ee_resolved",
-            "winner_ee_averaged",
-            "coverage_resolved",
-            "coverage_averaged",
-        ),
-    )
-    context = type("Context", (), {})()
-    context.pixel_idxs = np.array([0, 0], dtype=np.int64)
-    context.asterism_idxs = np.array([0, 1], dtype=np.int64)
-    context.local_asterism_mask = np.array([True, False], dtype=np.bool_)
-    context.inner_x = np.array([0.0], dtype=np.float64)
-    context.inner_y = np.array([0.0], dtype=np.float64)
-    context.asterism_x = np.array([1.0, 2.0], dtype=np.float64)
-    context.asterism_y = np.array([0.0, 0.0], dtype=np.float64)
-    context.asterisms = Table(
-        [
-            np.array([7, 8], dtype=np.int64),
-            np.array([2, 2], dtype=np.int64),
-            np.array([10.0, 10.0], dtype=np.float64),
-            np.array([11.0, 11.0], dtype=np.float64),
-            np.array([12.0, 12.0], dtype=np.float64),
-            np.array([13.0, 13.0], dtype=np.float64),
-        ],
-        names=(
-            "asterism_id",
-            "num_stars",
-            "star1_mag",
-            "star2_mag",
-            "star1_ra",
-            "star2_ra",
-        ),
-    )
-    monkeypatch.setattr(
-        "ao_sky.build.traversal._get_valid_ngs_from_context_pair",
-        lambda *args, **kwargs: [
-            {"zd": 1.0, "az": 0.0, "mag": 10.0},
-            {"zd": 2.0, "az": 90.0, "mag": 11.0},
-        ],
-    )
-    monkeypatch.setattr("ao_sky.build.traversal.get_point_model", lambda runtime, surviving_stars: object())
-    monkeypatch.setattr(
-        "ao_sky.build.traversal.predict_point_batch",
-        lambda runtime, num_stars, model, ngs: PointPredictionBatch(
-            sr=np.array([0.4, 0.6], dtype=np.float64),
-            ee=np.array([0.7, 0.8], dtype=np.float64),
-            fwhm=np.array([0.5, 0.3], dtype=np.float64),
-            ee_angle=np.array([0.0, 15.0], dtype=np.float64),
-        ),
-    )
-    monkeypatch.setattr("ao_sky.build.traversal.clear_backend_cache", lambda: None)
-
-    winner_idxs, winner_ngs_payloads = _update_inner_pixel_asterism_performance(
-        runtime,
-        inner,
-        context,
-    )
-
-    assert float(inner["best_ee"][0]) == pytest.approx(0.8)
-    assert float(inner["winner_ee_resolved"][0]) == pytest.approx(0.7)
-    assert int(inner["winner_asterism_id"][0]) == 7
-    assert float(inner["winner_distance_arcsec"][0]) == pytest.approx(1.0)
-    assert int(winner_idxs[0]) == 0
-    assert winner_ngs_payloads[0] == [
-        {"zd": 1.0, "az": 0.0, "mag": 10.0},
-        {"zd": 2.0, "az": 90.0, "mag": 11.0},
-    ]
-
-
-def test_field_mean_reuses_winner_ngs_payload(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime = load_native_runtime(
-        BuildDefinition(
-            lineage_name="baseline",
-            gaia_release="dr3",
-            outer_level=0,
-            inner_level=1,
-            max_data_level=1,
-        ),
-        legacy_config_path=_write_legacy_config(tmp_path / "legacy.yaml"),
-        model_root=tmp_path / "models",
-    )
-    inner = Table(
-        [
-            np.array([0], dtype=np.int64),
-            np.array([np.nan], dtype=np.float64),
-        ],
-        names=("pix", "winner_ee_averaged"),
-    )
-    payload = [
-        {"zd": 1.0, "az": 0.0, "mag": 10.0},
-        {"zd": 2.0, "az": 90.0, "mag": 11.0},
-    ]
-    winner_payloads = np.empty((1,), dtype=object)
-    winner_payloads[0] = payload
-    seen: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        "ao_sky.build.traversal._get_valid_ngs_from_context_pair",
-        lambda *args, **kwargs: pytest.fail("winner NGS payload was recomputed"),
-    )
-    monkeypatch.setattr("ao_sky.build.traversal.get_mean_model", lambda runtime, surviving_stars: object())
-
-    def fake_predict_field_mean_batch(runtime, num_stars, model, ngs):
-        seen["num_stars"] = num_stars
-        seen["ngs"] = ngs
-        return np.array([0.42], dtype=np.float64)
-
-    monkeypatch.setattr(
-        "ao_sky.build.traversal.predict_field_mean_batch",
-        fake_predict_field_mean_batch,
-    )
-    monkeypatch.setattr("ao_sky.build.traversal.clear_backend_cache", lambda: None)
-
-    _update_inner_pixel_asterism_field_mean(
-        runtime,
-        inner,
-        context=object(),
-        winner_asterism_idxs=np.array([0], dtype=np.int64),
-        winner_ngs_payloads=winner_payloads,
-    )
-
-    assert float(inner["winner_ee_averaged"][0]) == pytest.approx(0.42)
-    assert seen == {
-        "num_stars": 2,
-        "ngs": [payload],
-    }
-
-
-def test_build_traversal_products_uses_expanded_asterisms_for_inner_context(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    cache_clear_every: int,
+    expected_clear_count: int,
 ) -> None:
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     definition = BuildDefinition(
@@ -1034,77 +1720,24 @@ def test_build_traversal_products_uses_expanded_asterisms_for_inner_context(
         legacy_config_path=legacy,
         model_root=tmp_path / "models",
     )
-    local_coord = get_pixel_skycoord(runtime.outer_level, 0)
-    nonlocal_coord = get_pixel_skycoord(runtime.outer_level, 1)
-    expanded_asterisms = Table()
-    expanded_asterisms["asterism_id"] = np.array([10, 20], dtype=np.int64)
-    expanded_asterisms["ra"] = np.array(
-        [local_coord.ra.deg, nonlocal_coord.ra.deg],
-        dtype=np.float64,
-    )
-    expanded_asterisms["dec"] = np.array(
-        [local_coord.dec.deg, nonlocal_coord.dec.deg],
-        dtype=np.float64,
-    )
-    expanded_asterisms["num_stars"] = np.array([2, 2], dtype=np.int64)
-    expanded_asterisms["pix"] = np.array([0, 4], dtype=np.int64)
-    for index in (1, 2, 3):
-        expanded_asterisms[f"star{index}_source_id"] = np.array(
-            [index, index + 10],
-            dtype=np.int64,
-        )
-        expanded_asterisms[f"star{index}_ra"] = np.array(
-            [local_coord.ra.deg, nonlocal_coord.ra.deg],
-            dtype=np.float64,
-        )
-        expanded_asterisms[f"star{index}_dec"] = np.array(
-            [local_coord.dec.deg, nonlocal_coord.dec.deg],
-            dtype=np.float64,
-        )
-        expanded_asterisms[f"star{index}_mag"] = np.array([10.0, 10.5], dtype=np.float64)
-
-    inner = Table(
-        [
-            np.array([0], dtype=np.int64),
-            np.array([0], dtype=np.int64),
-            np.array([0], dtype=np.int64),
-            np.array([1], dtype=np.int64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([-1], dtype=np.int64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([np.nan], dtype=np.float64),
-            np.array([False], dtype=np.bool_),
-            np.array([False], dtype=np.bool_),
-        ],
-        names=(
-            "pix",
-            "star_count",
-            "ngs_count",
-            "asterism_count",
-            "best_ee",
-            "best_sr",
-            "best_fwhm",
-            "winner_asterism_id",
-            "winner_distance_arcsec",
-            "winner_ee_resolved",
-            "winner_ee_averaged",
-            "coverage_resolved",
-            "coverage_averaged",
-        ),
-    )
+    geometry = TraversalGeometry.from_runtime(runtime)
+    inner_pixs = geometry.inner_pixs(0)
+    first_centre = get_pixel_skycoord(runtime.inner_level, int(inner_pixs[0]))
+    star1 = first_centre.directional_offset_by(90.0 * u.deg, 10.0 * u.arcsec)
+    star2 = first_centre.directional_offset_by(270.0 * u.deg, 10.0 * u.arcsec)
+    stars = Table()
+    stars["source_id"] = np.array([101, 102], dtype=np.int64)
+    stars["ra"] = np.array([star1.ra.deg, star2.ra.deg], dtype=np.float64)
+    stars["dec"] = np.array([star1.dec.deg, star2.dec.deg], dtype=np.float64)
+    stars["R"] = np.array([10.0, 10.1], dtype=np.float64)
+    stars["pmra"] = np.zeros(2, dtype=np.float64)
+    stars["pmdec"] = np.zeros(2, dtype=np.float64)
+    stars["ref_epoch"] = np.full(2, 2016.0, dtype=np.float64)
     seen: dict[str, object] = {}
 
     monkeypatch.setattr(
-        "ao_sky.build.traversal._build_expanded_outer_pixel_asterisms",
-        lambda store, runtime, outer_pix, **kwargs: (
-            _empty_gaia_table(),
-            _empty_gaia_table(),
-            expanded_asterisms,
-            get_pixel_skycoord(runtime.inner_level, np.asarray(expanded_asterisms["pix"])),
-        ),
+        "ao_sky.build.traversal.prepare_search_inputs",
+        lambda store, runtime, outer_pix, **kwargs: (stars, stars),
     )
 
     def fake_build_base_inner_table(
@@ -1115,83 +1748,129 @@ def test_build_traversal_products_uses_expanded_asterisms_for_inner_context(
         geometry=None,
         asterisms=None,
     ):
-        seen["persisted_candidate_ids"] = np.asarray(
-            asterisms["asterism_id"],
-            dtype=np.int64,
-        ).tolist()
-        return inner.copy(copy_data=True)
+        pixs = geometry.inner_pixs(outer_pix)
+        size = len(pixs)
+        return Table(
+            [
+                np.asarray(pixs, dtype=np.int64),
+                np.zeros(size, dtype=np.int64),
+                np.zeros(size, dtype=np.int64),
+                np.full(size, np.nan, dtype=np.float64),
+                np.full(size, np.nan, dtype=np.float64),
+                np.full(size, np.nan, dtype=np.float64),
+                np.full(size, -1, dtype=np.int64),
+                np.full(size, np.nan, dtype=np.float64),
+                np.full(size, np.nan, dtype=np.float64),
+                np.zeros(size, dtype=np.bool_),
+                np.zeros(size, dtype=np.bool_),
+            ],
+            names=(
+                "pix",
+                "star_count",
+                "ngs_count",
+                "best_ee",
+                "best_sr",
+                "best_fwhm",
+                "winner_asterism_id",
+                "winner_ee_resolved",
+                "winner_ee_averaged",
+                "coverage_resolved",
+                "coverage_averaged",
+            ),
+        )
 
     monkeypatch.setattr("ao_sky.build.traversal.build_base_inner_table", fake_build_base_inner_table)
-    monkeypatch.setattr(
-        "ao_sky.build.traversal.search_around_sky",
-        lambda *args, **kwargs: (
-            np.array([0, 0], dtype=np.int64),
-            np.array([0, 1], dtype=np.int64),
-            None,
-            None,
-        ),
-    )
+    monkeypatch.setattr("ao_sky.build.traversal.get_point_model", lambda runtime, num_stars: object())
+    monkeypatch.setattr("ao_sky.build.traversal.get_mean_model", lambda runtime, num_stars: object())
 
-    def fake_update_performance(runtime, inner, context):
-        seen["context_candidate_ids"] = np.asarray(
-            context.asterisms["asterism_id"],
-            dtype=np.int64,
-        ).tolist()
-        seen["local_asterism_mask"] = context.local_asterism_mask.tolist()
-        inner["best_ee"][0] = 0.8
-        winner_payloads = np.empty((1,), dtype=object)
-        winner_payloads[:] = None
-        return (
-            np.array([-1], dtype=np.int64),
-            winner_payloads,
+    def fake_predict_point_arrays(
+        runtime,
+        num_stars,
+        model,
+        ngs_zd,
+        ngs_az_deg,
+        ngs_mag,
+        backend_row_count=None,
+        feature_buffer_row_count=None,
+        prediction_telemetry=None,
+    ):
+        seen["resolved_num_stars"] = num_stars
+        seen["resolved_payload_count"] = len(ngs_zd)
+        return PointPredictionBatch(
+            sr=np.full(len(ngs_zd), 0.5, dtype=np.float64),
+            ee=np.full(len(ngs_zd), 0.7, dtype=np.float64),
+            fwhm=np.full(len(ngs_zd), 100.0, dtype=np.float64),
+            ee_angle=np.zeros(len(ngs_zd), dtype=np.float64),
         )
 
     monkeypatch.setattr(
-        "ao_sky.build.traversal._update_inner_pixel_asterism_performance",
-        fake_update_performance,
+        "ao_sky.build.traversal.predict_point_arrays",
+        fake_predict_point_arrays,
+    )
+
+    def fake_predict_field_mean_arrays(
+        runtime,
+        num_stars,
+        model,
+        ngs_zd,
+        ngs_az_deg,
+        ngs_mag,
+        backend_row_count=None,
+        feature_buffer_row_count=None,
+        prediction_telemetry=None,
+    ):
+        seen["averaged_num_stars"] = num_stars
+        seen["averaged_payload_count"] = len(ngs_zd)
+        return np.full(len(ngs_zd), 0.6, dtype=np.float64)
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.predict_field_mean_arrays",
+        fake_predict_field_mean_arrays,
     )
     monkeypatch.setattr("ao_sky.build.traversal.add_gaia_a0_to_inner", lambda inner, **kwargs: inner)
+    cleared_backend_cache: list[None] = []
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.RESOLVED_CACHE_CLEAR_EVERY",
+        cache_clear_every,
+    )
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.clear_backend_cache",
+        lambda: cleared_backend_cache.append(None),
+    )
 
+    structure_profile = TraversalStructureProfile()
     asterisms, result_inner = build_traversal_products(
         _FakeStore(),
         runtime,
         0,
         dust_root=tmp_path / "dust",
         max_data_level=2,
+        structure_profile=structure_profile,
     )
+    structure_stats = structure_profile.to_stats()
 
-    assert seen["persisted_candidate_ids"] == [10]
-    assert seen["context_candidate_ids"] == [10, 20]
-    assert seen["local_asterism_mask"] == [True, False]
-    assert asterisms["asterism_id"].tolist() == [10]
-    assert float(result_inner["best_ee"][0]) == pytest.approx(0.8)
-
-
-def test_build_traversal_products_skip_path_still_injects_dust(tmp_path: Path) -> None:
-    legacy = _write_legacy_config(tmp_path / "legacy.yaml", min_galactic_latitude=90.0)
-    definition = BuildDefinition(
-        lineage_name="baseline",
-        gaia_release="dr3",
-        outer_level=0,
-        inner_level=1,
-        max_data_level=1,
-    )
-    runtime = load_native_runtime(
-        definition,
-        legacy_config_path=legacy,
-        model_root=tmp_path / "models",
-    )
-    _write_gaia_tge_map(tmp_path / "dust", [(healpix_id, 1, healpix_id + 0.25) for healpix_id in range(48)])
-
-    asterisms, inner = build_traversal_products(
-        _FakeStore(),
-        runtime,
-        0,
-        dust_root=tmp_path / "dust",
-        max_data_level=1,
-    )
-
-    assert len(asterisms) == 0
-    assert "gaia_A0" in inner.colnames
-    assert inner.colnames[1] == "gaia_A0"
-    assert np.all(np.isfinite(np.asarray(inner["gaia_A0"], dtype=np.float64)))
+    assert seen == {
+        "resolved_num_stars": 2,
+        "resolved_payload_count": 1,
+        "averaged_num_stars": 2,
+        "averaged_payload_count": 1,
+    }
+    assert len(asterisms) == 1
+    assert int(asterisms["asterism_id"][0]) == 1
+    assert int(asterisms["num_stars"][0]) == 2
+    assert sorted(
+        [
+            int(asterisms["star1_source_id"][0]),
+            int(asterisms["star2_source_id"][0]),
+        ]
+    ) == [101, 102]
+    assert float(result_inner["best_ee"][0]) == pytest.approx(0.7)
+    assert float(result_inner["winner_ee_resolved"][0]) == pytest.approx(0.7)
+    assert float(result_inner["winner_ee_averaged"][0]) == pytest.approx(0.6)
+    assert int(result_inner["winner_asterism_id"][0]) == 1
+    assert bool(result_inner["coverage_resolved"][0])
+    assert bool(result_inner["coverage_averaged"][0])
+    assert np.all(np.asarray(result_inner["winner_asterism_id"][1:], dtype=np.int64) == -1)
+    assert structure_stats.raw_asterism_rows_peak == 1
+    assert structure_stats.winner_payload_rows_peak == 1
+    assert len(cleared_backend_cache) == expected_clear_count

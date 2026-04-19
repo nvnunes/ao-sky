@@ -116,8 +116,8 @@ def test_module_cli_help_lists_run_worker_options() -> None:
     assert "--gaia-cache-entries" in restart_result.stdout
     assert "--gaia-cache-mb" in run_result.stdout
     assert "--gaia-cache-mb" in restart_result.stdout
-    assert "--worker-memory-limit-mb" in run_result.stdout
-    assert "--worker-memory-limit-mb" in restart_result.stdout
+    assert "--worker-memory-limit-mb" not in run_result.stdout
+    assert "--worker-memory-limit-mb" not in restart_result.stdout
     assert "--parent-memory-limit-mb" in run_result.stdout
     assert "--parent-memory-limit-mb" in restart_result.stdout
     assert "--telemetry" in run_result.stdout
@@ -141,12 +141,12 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
     config = tmp_path / "build.yaml"
     config.write_text(
         """
-schema_version: 1
+schema_version: 2
 ao_system:
   band: R
   fov_arcsec: 120.0
   lgs: []
-  min_wfs: 2
+  min_wfs: 1
   max_wfs: 3
   min_mag: 8.0
   max_mag: 18.5
@@ -154,9 +154,11 @@ ao_system:
 prediction:
   wavelength_micron: 1.654
   resolved_models:
+    1star: point_one
     2star: point_two
     3star: point_three
   averaged_models:
+    1star: mean_one
     2star: mean_two
     3star: mean_three
 traversal:
@@ -165,13 +167,12 @@ traversal:
 gaia:
   release: dr3
   epoch: 2028.0
-  min_galactic_latitude_deg: null
-  max_star_density: 6.0
   max_bright_star_mag: 8.0
+  max_bright_star_exclusion_arcsec: 240.0
 maps:
   max_level: 1
 asterism:
-  max_overlap: 0.66
+  winner_ee_epsilon: 0.01
 best:
   seeing_baseline:
     wavelength_micron: 0.5
@@ -187,7 +188,14 @@ coverage:
     gaia_root = tmp_path / "gaia"
     build_root = tmp_path / "builds"
     model_root = tmp_path / "models"
-    for model_name in ("point_two", "point_three", "mean_two", "mean_three"):
+    for model_name in (
+        "point_one",
+        "point_two",
+        "point_three",
+        "mean_one",
+        "mean_two",
+        "mean_three",
+    ):
         model_root.mkdir(parents=True, exist_ok=True)
         (model_root / f"{model_name}.pt").write_bytes(model_name.encode("utf-8") + b":pt")
         (model_root / f"{model_name}_metadata.pkl").write_bytes(

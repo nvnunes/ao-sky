@@ -13,7 +13,7 @@ from ..predict import AOSystemRuntime, PredictRuntime
 from ._constants import RUNTIME_CONFIG_FILENAME
 from ._exceptions import BuildError
 
-RUNTIME_CONFIG_SCHEMA_VERSION = 1
+RUNTIME_CONFIG_SCHEMA_VERSION = 2
 
 
 def runtime_config_filename(build_path: Path) -> Path:
@@ -89,18 +89,32 @@ def load_runtime_config(
     inner_level = _required_int(traversal_raw, "inner_level", "traversal")
 
     epoch = _required_float(gaia_raw, "epoch", "gaia")
-    max_star_density = _optional_float(
-        gaia_raw.get("max_star_density"),
-        field_name="gaia.max_star_density",
-    )
     max_bright_star_mag = _optional_float(
         gaia_raw.get("max_bright_star_mag"),
         field_name="gaia.max_bright_star_mag",
     )
-    max_overlap = _optional_float(
-        asterism_raw.get("max_overlap"),
-        field_name="asterism.max_overlap",
+    max_bright_star_exclusion_arcsec = _optional_float(
+        gaia_raw.get("max_bright_star_exclusion_arcsec"),
+        field_name="gaia.max_bright_star_exclusion_arcsec",
     )
+    if max_bright_star_exclusion_arcsec is None:
+        max_bright_star_exclusion_arcsec = 2.0 * fov_arcsec
+    if "max_overlap" in asterism_raw:
+        raise BuildError(
+            "Runtime config asterism.max_overlap is legacy-only and is not "
+            "supported by schema_version 2"
+        )
+    if "max_candidate_asterisms" in asterism_raw:
+        raise BuildError(
+            "Runtime config asterism.max_candidate_asterisms was removed and is not "
+            "supported by schema_version 2"
+        )
+    winner_ee_epsilon = _optional_float(
+        asterism_raw.get("winner_ee_epsilon"),
+        field_name="asterism.winner_ee_epsilon",
+    )
+    if winner_ee_epsilon is None:
+        winner_ee_epsilon = 0.01
     prediction_wavelength = _required_float(
         prediction_raw,
         "wavelength_micron",
@@ -134,8 +148,8 @@ def load_runtime_config(
         min_sep_arcsec=min_sep_arcsec,
         outer_level=outer_level,
         inner_level=inner_level,
-        max_star_density=max_star_density,
-        max_overlap=max_overlap,
+        max_bright_star_exclusion_arcsec=max_bright_star_exclusion_arcsec,
+        winner_ee_epsilon=winner_ee_epsilon,
         prediction_wavelength=prediction_wavelength,
         seeing_wavelength=seeing_wavelength,
         seeing_fwhm=seeing_fwhm,
@@ -168,13 +182,9 @@ def load_runtime_config(
         outer_level=outer_level,
         inner_level=inner_level,
         epoch=epoch,
-        min_galactic_latitude=_optional_float(
-            gaia_raw.get("min_galactic_latitude_deg"),
-            field_name="gaia.min_galactic_latitude_deg",
-        ),
-        max_star_density=max_star_density,
         max_bright_star_mag=max_bright_star_mag,
-        max_overlap=max_overlap,
+        max_bright_star_exclusion=max_bright_star_exclusion_arcsec * u.arcsec,
+        winner_ee_epsilon=winner_ee_epsilon,
         prediction_wavelength=prediction_wavelength * u.micron,
         resolved_models=resolved_models,
         averaged_models=averaged_models,
@@ -223,12 +233,13 @@ def runtime_to_config(runtime: PredictRuntime) -> dict[str, Any]:
             },
             "gaia": {
                 "epoch": float(runtime.epoch),
-                "min_galactic_latitude_deg": runtime.min_galactic_latitude,
-                "max_star_density": runtime.max_star_density,
                 "max_bright_star_mag": runtime.max_bright_star_mag,
+                "max_bright_star_exclusion_arcsec": float(
+                    runtime.max_bright_star_exclusion.to_value(u.arcsec)
+                ),
             },
             "asterism": {
-                "max_overlap": runtime.max_overlap,
+                "winner_ee_epsilon": float(runtime.winner_ee_epsilon),
             },
             "best": {
                 "seeing_baseline": {
@@ -383,8 +394,8 @@ def _validate_runtime_values(
     min_sep_arcsec: float,
     outer_level: int,
     inner_level: int,
-    max_star_density: float | None,
-    max_overlap: float | None,
+    max_bright_star_exclusion_arcsec: float,
+    winner_ee_epsilon: float,
     prediction_wavelength: float,
     seeing_wavelength: float,
     seeing_fwhm: float,
@@ -405,10 +416,14 @@ def _validate_runtime_values(
         raise BuildError("Runtime config traversal.outer_level must be non-negative")
     if inner_level <= outer_level:
         raise BuildError("Runtime config traversal.inner_level must be larger than outer_level")
-    if max_star_density is not None and max_star_density <= 0:
-        raise BuildError("Runtime config gaia.max_star_density must be positive")
-    if max_overlap is not None and not 0 <= max_overlap <= 1:
-        raise BuildError("Runtime config asterism.max_overlap must be between 0 and 1")
+    if max_bright_star_exclusion_arcsec <= 0:
+        raise BuildError(
+            "Runtime config gaia.max_bright_star_exclusion_arcsec must be positive"
+        )
+    if not 0 <= winner_ee_epsilon < 1:
+        raise BuildError(
+            "Runtime config asterism.winner_ee_epsilon must be at least 0 and less than 1"
+        )
     if prediction_wavelength <= 0:
         raise BuildError("Runtime config prediction.wavelength_micron must be positive")
     if seeing_wavelength <= 0:

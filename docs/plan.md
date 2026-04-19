@@ -388,7 +388,8 @@ wrapper code.
 ### Phase 13: Major Traversal Optimization Pass
 
 Status: complete. Phase 13 is the known-good legacy-preserving state before
-Phase 14 intentionally changes the winner/overlap algorithm.
+Phase 14 intentionally changes winner selection and dense-field candidate
+control.
 
 - Treated this as an end-to-end Traversal optimization pass across scheduling,
   runtime caching, memory safety, artifact IO, compression, telemetry,
@@ -410,7 +411,7 @@ Phase 14 intentionally changes the winner/overlap algorithm.
   pragmatic buffer for high-proper-motion stars that originate just outside the
   raw outer-pixel boundary but can move into the relevant edge footprint.
 - Implemented a worker-local in-memory LRU cache for runtime Gaia tables,
-  controlled by both an entry target and a per-worker memory cap. Canonical
+  controlled by both an entry target and a cache memory cap. Canonical
   Gaia files remain raw, but cached runtime rows are shifted to the build
   epoch, enriched with `R` and `hpx14`, and marked read-only so Traversal does
   not repeatedly apply proper motion or recompute fine HEALPix projections.
@@ -431,14 +432,14 @@ Phase 14 intentionally changes the winner/overlap algorithm.
   `build.h5` for every row update.
 - Kept successful build-log output periodic and failure logs per-pixel, avoiding
   high-volume per-pixel success log I/O.
-- Exposed worker count, Gaia cache, per-worker memory guard, parent aggregate
-  memory guard, and telemetry settings as runtime CLI options with optional
+- Exposed worker count, Gaia cache, parent aggregate memory guard, and
+  telemetry settings as runtime CLI options with optional
   `ao-sky.yaml` defaults, without persisting them into build metadata. The
   regional assignment level is derived internally from `outer_level` and
   `workers` rather than exposed as a config knob.
-- Set the current local operating defaults to `workers=6`,
-  `worker_memory_limit_mb=2048`, `parent_memory_limit_mb=12288`, Gaia data on
-  the SSD mirror, worker-local cache enabled, and direct HDD artifact writes.
+- Set the Phase 13 local operating defaults to `workers=6`,
+  `build.memory_limit_mb=12288`, Gaia data on the SSD mirror, worker-local
+  cache enabled, and direct HDD artifact writes.
 - Persisted a build-local native `build.yaml` at `init`. Legacy YAML conversion,
   when needed for comparison work, now happens outside the build API and passes
   the resulting native runtime config into `init`.
@@ -488,39 +489,185 @@ Measured optimization decisions retained from Phase 13:
 - Build-log batching stays low priority because successful progress logging is
   already periodic; revisit only if measurement shows it contributes meaningful
   overhead.
-- Higher-density memory pressure remains a Phase 15 problem. The Phase 13
+- Higher-density memory pressure moves into Phases 14 and 15. The Phase 13
   optimization pass added coarse summary-based skipping and memory guards, but
   the next algorithmic memory reductions should focus on bounded asterism
-  search, bounded inner/asterism context construction, and finer density
-  indexes.
+  search, bounded candidate-pixel evaluation, FOR-optimized dense-field NGS
+  control, and dense-region stress validation.
 
-### Phase 14: Improve The Winning-Asterism Algorithm
+### Phase 14: Replace Winner Selection And Dense-Field Candidate Control
 
-- Revisit the interim winning-asterism selection path after the preceding
-  build-product and audit phases have exposed the remaining weaknesses.
-- Replace the legacy-style overlap-plus-winner heuristic with a winner-map-first
-  formulation that solves for the winning asterism at each inner pixel.
-- Add regularization or smoothing to that winner field so the resulting winner
-  map is not dominated by highly pixelated local switches driven by small EE
-  differences.
-- Treat retained asterisms as the unique asterisms that win somewhere in the
-  solved winner field, rather than as the result of a separate heuristic
-  overlap-pruning step.
-- Improve the winner-selection algorithm itself rather than just reproducing
-  the current legacy behavior.
-- Validate the improved winner path against the richer per-outer-pixel and
-  all-sky products before compatibility adoption proceeds.
+Status: complete. The core algorithm, benchmark-driven performance policy,
+retained runtime defaults, closeout documentation, and smoke benchmark have
+been completed. Phase 15 is the next active validation phase.
 
-### Phase 15: Explore Ways to Handle Higher Stellar Density
+- Replace the legacy-style overlap-plus-winner heuristic with the
+  winner-map-first algorithm described in [`algorithms.md`](algorithms.md).
+- Merge the earlier higher-density handling work into this phase rather than
+  treating it as a separate later phase.
+- Replaced the earlier candidate-budget/adaptive-`max_mag` idea with regional
+  FOR-optimized NGS selection. Use all configured NGS in regions whose exact
+  candidate graph keeps regional combination work under the internal
+  tractability threshold, subdivide dense regions, and apply FOR-optimized NGS
+  selection only where local combinatorics remain too expensive. Derive
+  `max_regional_combination_work` from the number of inner pixels per outer
+  pixel rather than exposing a new user-facing knob.
+- Support exact 1-, 2-, and 3-star candidate sets according to
+  `ao_system.min_wfs..ao_system.max_wfs`; schema-version-2 examples use
+  `min_wfs=1` and `max_wfs=3` so all enabled star counts compete directly.
+- Precompute star-to-inner-pixel field-of-regard bitsets and stream eligible
+  candidate-pixel rows into model inference without materializing the full
+  candidate-pair table.
+- Apply bright-star masking before FOR-optimized NGS selection and model
+  evaluation. `gaia.max_bright_star_exclusion_arcsec` defaults to twice the
+  AO-system field of view when the bright-star magnitude threshold is enabled.
+- Drop the Galactic latitude Traversal cut and remove `gaia.max_star_density`.
+  Regional FOR-optimized NGS selection now handles dense fields without coarse
+  sky or density skips.
+- Use predicted EE as the only optimization metric. Update `best_ee`,
+  `best_sr`, and `best_fwhm` together from the EE-best candidate, with seeing
+  baseline retained for continuous maps.
+- Add configurable `asterism.winner_ee_epsilon`; keep top-K size and
+  regularization pass count internal until benchmark evidence justifies
+  exposing them.
+- Regularize winners with local inner-pixel neighbor agreement inside the
+  current outer pixel, and retain only unique regularized winning asterisms.
+- Remove the inner fields `asterism_count` and `winner_distance_arcsec`.
+- Treat the current legacy-preserving Traversal artifact layout/schema as
+  version 1 and bump the replacement Traversal artifact layout/schema to
+  version 2.
+- Validate the new path with repo-native algorithm tests and benchmarks.
+  Legacy comparison tooling may remain useful as a diagnostic, but it is no
+  longer the acceptance authority for this phase.
+- Retained Phase 14 algorithmic optimizations:
+  - vectorized local winner regularization
+  - vectorized prediction feature construction
+  - reusable static prediction-feature templates and feature buffers
+  - magnitude-ordered NGS slots without inner-pixel-dependent `zd`/`az`
+    tie-breaking
+  - NumPy row buffering for prediction streams
+  - `np.unpackbits` bitset extraction
+  - direct top-K writeback into per-inner-pixel state
+- Retained Phase 14 prediction policy from the benchmark evidence:
+  - keep the internal row-buffer cap at `25,000` rows
+  - use dense inference-shape ladders from `1000` to `25000` rows in
+    `1000`-row steps for both resolved and averaged prediction when running on
+    GPU
+  - avoid routine `torch.mps.empty_cache()` calls; use cache clearing only as a
+    memory-pressure tool
+  - use GPU prediction by default, while keeping CPU prediction as the
+    lower-memory fallback
+- Retained Phase 14 scheduling and memory policy:
+  - use the Galactic-latitude-aware regional scheduler as the only regional
+    pre-planning path
+  - use Gaia summary `star_count` as the cheap proxy for worker RAM
+  - stagger high-memory low-latitude work while preserving regional/neighbour
+    ordering for Gaia-cache locality
+  - keep the parent total-RAM guard as the machine-specific authority; workers
+    respond to parent memory-pressure commands by trimming caches and pausing at
+    safe checkpoints
+  - remove per-worker memory guards from the normal policy
+  - use `scripts/simulate_regional_schedule_memory.py` as planning evidence,
+    not as the runtime authority
+- Retained local operating guidance from the worker trade study:
+  - use a `26 GiB` parent total-RAM ceiling on the current machine
+  - use GPU prediction with `9` workers and `6` low-latitude workers when the
+    machine is otherwise quiet
+  - use fewer GPU workers only when the available RAM budget is lower
+  - account for measured per-worker throughput loss when estimating runtime;
+    do not assume linear worker scaling
+- Completed Phase 14 closeout:
+  - encoded the retained GPU prediction policy into `ao-sky.yaml` with
+    `prediction.resolved_device: auto` and `prediction.averaged_device: auto`
+  - renamed the YAML total-RAM guard to `build.memory_limit_mb`
+  - updated the retained local baseline to `build.workers: 9` and
+    `build.memory_limit_mb: 26624`
+  - documented that the parent total-RAM guard includes a GPU-driver reserve
+    when GPU prediction is enabled
+  - ran a short retained-policy real-data smoke benchmark with GPU prediction,
+    dense inference shapes, no routine cache clearing, `9` workers, and a
+    `26624 MiB` total-RAM guard
 
-- Currently the asterism code explodes when there are too many stars in an outer pixel
-- Explore ways to improve the algorithm so higher density fields can still be used
-- Revisit the coarse Gaia-summary density prefilter from the Phase 13
-  optimization pass and consider a finer persisted Gaia density index, such as
-  per-file FOV-level counts, so Traversal can avoid loading or preparing rows
-  from rejected high-density subcells rather than skipping whole outer pixels.
+### Phase 15: Validate Physical Behavior And Tune Winner-Algorithm Policy
 
-### Phase 16: Rebuild The Asterism Catalog Export Path
+- Treat this phase as the physical-meaning validation layer after the Phase 14
+  algorithm works mechanically.
+- Use `resolved` for inner-pixel-center performance and `averaged` for
+  field-of-view mean performance; continue to ignore rotation/orientation.
+- Define tolerance-based CPU/GPU artifact comparison expectations, because
+  GPU prediction is not expected to be byte-identical to CPU prediction
+- Define representative validation samples across sparse fields, moderate
+  fields, dense fields, low Galactic latitude, high dust, low dust, and
+  boundary-heavy outer pixels.
+- Treat validation cost as a first-order constraint because building the sky is
+  expensive. Start with low star-count outer pixels and small parameter sweeps,
+  then run only a few high star-count samples to verify dense-field performance.
+- Before attempting an all-sky build, build and validate a contiguous map
+  region large enough to expose spatial artifacts, outer-pixel boundary
+  behavior, coverage structure, and aggregation behavior.
+- Evaluate whether FOR-optimized NGS selection, `winner_ee_epsilon`,
+  internal top-K, and internal regularization pass count produce spatially
+  coherent and physically meaningful winner fields.
+- Compare raw resolved `best_*` maps, regularized `winner_*` maps, averaged EE
+  coverage maps, retained asterism footprints, selected-NGS availability maps,
+  candidate counts, and EE-loss telemetry across parameter sweeps.
+- Build Phase 15 validation products from inner-pixel maps: averaged EE
+  coverage curves, area-weighted observability-limited curves under transit
+  airmass cuts, averaged EE uniformity, and a prototype spatial-coherence
+  statistic.
+- Treat `winner_ee_averaged` as the primary coverage and uniformity metric;
+  use resolved quantities as diagnostics for point-performance behavior.
+- Validate field and survey aggregations from the inner-pixel source of truth,
+  including direct footprint aggregation for science fields that are not
+  aligned with outer HEALPix pixels.
+- Compare against legacy outputs as a physical sanity reference rather than as
+  a parity target. The new algorithm is expected to differ, but large-scale
+  coverage, performance distributions, bright/dark sky structure, and obvious
+  AO-rich regions should remain broadly similar because both paths observe the
+  same sky with the same model family.
+- Check for artifacts such as over-smoothed winner regions, isolated winner
+  speckles, discontinuities at outer-pixel boundaries, excessive fallback to
+  1-star asterisms, and physically implausible dense-field behavior.
+- Validate physical dense-field behavior directly now that the Galactic latitude
+  cut has been removed.
+- Treat dust and stellar-density cuts as later field-selection policy, not as
+  Traversal tractability requirements.
+- Record retained defaults and validation evidence in
+  [`benchmarking.md`](benchmarking.md) and update
+  [`algorithms.md`](algorithms.md) when physical-policy decisions change.
+- Keep this phase separate from Phase 14 so "the algorithm runs" does not get
+  confused with "the algorithm is physically credible."
+
+### Phase 16: Modernize Public `find_asterisms`
+
+- Modernize the public `ao_sky.asterisms.find_asterisms` implementation after
+  Phase 15 has established physically credible Traversal candidate behavior.
+- Keep exact enumeration as the default public behavior so existing callers that
+  expect all valid combinations are not surprised.
+- Add an explicit bounded-search option only if the public API contract can name
+  the behavior clearly, including whether the returned table is exact or
+  budgeted.
+- Reuse or extract the Phase 14 candidate-count and close-pair graph primitives
+  where they fit, so public asterism search and Traversal candidate generation
+  do not drift unnecessarily.
+- Consider adaptive brighter-star subset budgeting for dense public search
+  calls: sort by sensing magnitude and source ID, respect magnitude tie groups,
+  estimate enabled 1-, 2-, and 3-star counts, and reduce the effective faint
+  limit when a caller-provided candidate budget would otherwise be exceeded.
+- Consider an internal streaming/chunked candidate-construction path to reduce
+  peak memory while preserving the table-returning public API.
+- Preserve the current output schema unless this phase explicitly defines a
+  versioned public API change.
+- Keep winner selection, bright-star masking, regularization, and AO model
+  prediction out of `find_asterisms`; those remain build Traversal policy.
+- Do not make build Traversal depend on the public `find_asterisms` API again.
+  Shared lower-level graph/counting utilities are acceptable; the high-level
+  build path should remain winner-map-first and streaming.
+- Validate the modernized API with existing exact-search tests, dense synthetic
+  fields, budgeted-search tests, deterministic tie handling, and memory
+  benchmarks.
+
+### Phase 17: Rebuild The Asterism Catalog Export Path
 
 - Rebuild the asterism catalog export workflow on top of the richer `ao-sky`
   build products rather than the legacy `aomap` export path.
@@ -531,7 +678,7 @@ Measured optimization decisions retained from Phase 13:
 - Validate exported catalogs against the intended downstream use cases before
   compatibility adoption proceeds.
 
-### Phase 17: Define The WFS Photometric Proxy Layer
+### Phase 18: Define The WFS Photometric Proxy Layer
 
 - Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
   AO-system-specific photometric products.
@@ -546,7 +693,33 @@ Measured optimization decisions retained from Phase 13:
 - Define uncertainty handling and the downstream contract for asterism-building
   and AO-simulation consumers.
 
-### Phase 18: Add Build Provenance, Introspection, And Validation Support
+### Phase 19: Upgrade Prediction Model Ordering Contract
+
+- Treat this as required prediction-model/interface work before publishing the
+  new `ao-sky` Traversal path.
+- Make the prediction models match the `ao-sky` ordering assumption:
+  NGS slots are ordered by sensing magnitude, not by inner-pixel-dependent
+  `zd`/`az` tie-breaks.
+- Preserve magnitude ordering as the primary NGS slot convention because
+  brightest-to-faintest ordering likely helps the model learn stable feature
+  roles.
+- Do not require exact magnitude ties to be sorted by `zd` and `az`. Those
+  coordinates are measured relative to each inner-pixel center and can change
+  the slot order across the same asterism footprint.
+- Define the required tie behavior explicitly, such as stable non-geometric
+  tie-breaking or training/validation that makes exact tied-magnitude slot order
+  insensitive.
+- Train the production prediction models with this ordering contract, then
+  validate tied-magnitude behavior against held-out simulations and physically
+  representative asterisms.
+- The `ao-sky` Traversal implementation already assumes this contract by
+  preordering candidate members once by sensing magnitude and removing
+  per-batch row-wise `(mag, zd, az)` canonicalization.
+- Treat existing models that were trained with the older exact tie-break
+  contract as development/validation inputs only until production models are
+  retrained or validated under the `ao-sky` ordering contract.
+
+### Phase 20: Add Build Provenance, Introspection, And Validation Support
 
 - Add a build-root provenance manifest that summarizes existing authoritative
   metadata rather than replacing `build.h5`, `build.yaml`, Gaia
@@ -571,7 +744,7 @@ Measured optimization decisions retained from Phase 13:
   winner-algorithm and photometric-proxy phases intentionally move beyond exact
   legacy parity.
 
-### Phase 19: Compatibility Adoption In `survey_tools` And `girmos-aosims`
+### Phase 21: Compatibility Adoption In `survey_tools` And `girmos-aosims`
 
 - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
 - Add the downstream adoption work needed for `girmos-aosims` to consume the
@@ -582,7 +755,7 @@ Measured optimization decisions retained from Phase 13:
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
 
-### Phase 20: Deduplication And Final Handoff
+### Phase 22: Deduplication And Final Handoff
 
 - Remove the superseded legacy implementation from `survey_tools`.
 - Retain only the compatibility surface that is still worth carrying.

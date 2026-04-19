@@ -38,7 +38,6 @@ class TraversalTaskContext:
     definition: BuildDefinition
     roots: BuildPaths
     runtime_config_path: Path
-    coarse_density_skip_outer_pixs: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +57,10 @@ class TraversalExecutionConfig:
     gaia_cache_entries: int = 64
     gaia_cache_mb: int = 2048
     region_level: int = 0
-    worker_memory_limit_mb: int = 0
     parent_memory_limit_mb: int = 0
     telemetry: str = "basic"
+    prediction_device: str | None = None
+    averaged_prediction_device: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,14 +97,28 @@ class TraversalStageStats:
     candidate_generation_seconds: float = 0.0
     filtering_seconds: float = 0.0
     bright_star_filter_seconds: float = 0.0
-    overlap_quality_seconds: float = 0.0
-    overlap_geometry_seconds: float = 0.0
     inner_assignment_seconds: float = 0.0
     local_selection_seconds: float = 0.0
     inner_table_seconds: float = 0.0
     context_seconds: float = 0.0
     point_prediction_seconds: float = 0.0
+    point_prediction_eligibility_seconds: float = 0.0
+    point_prediction_eligibility_intersection_seconds: float = 0.0
+    point_prediction_eligibility_extract_seconds: float = 0.0
+    point_prediction_buffer_seconds: float = 0.0
+    point_prediction_ngs_array_seconds: float = 0.0
+    point_prediction_model_seconds: float = 0.0
+    point_prediction_feature_seconds: float = 0.0
+    point_prediction_backend_seconds: float = 0.0
+    point_prediction_scatter_seconds: float = 0.0
+    point_prediction_scatter_filter_seconds: float = 0.0
+    point_prediction_scatter_merge_seconds: float = 0.0
+    point_prediction_scatter_sort_seconds: float = 0.0
+    point_prediction_scatter_write_seconds: float = 0.0
+    point_prediction_cache_clear_seconds: float = 0.0
     field_mean_prediction_seconds: float = 0.0
+    field_mean_prediction_feature_seconds: float = 0.0
+    field_mean_prediction_backend_seconds: float = 0.0
     coverage_seconds: float = 0.0
     dust_seconds: float = 0.0
     persisted_asterisms_seconds: float = 0.0
@@ -121,11 +135,33 @@ class TraversalStructureStats:
     raw_asterism_rows: int = 0
     dedupe_key_rows: int = 0
     post_bright_asterism_rows: int = 0
-    post_overlap_asterism_rows: int = 0
+    candidate_graph_rows: int = 0
     local_asterism_rows: int = 0
     context_pair_rows: int = 0
     winner_rows: int = 0
     winner_payload_rows: int = 0
+    point_prediction_batches: int = 0
+    point_prediction_rows: int = 0
+    point_prediction_batch_rows_peak: int = 0
+    point_prediction_backend_rows: int = 0
+    point_prediction_backend_batch_rows_peak: int = 0
+    point_prediction_backend_bucket_counts: tuple[tuple[int, int], ...] = ()
+    point_prediction_backend_bucket_rows: tuple[tuple[int, int], ...] = ()
+    point_feature_bytes_peak: int = 0
+    point_mps_current_bytes_peak: int = 0
+    point_mps_driver_bytes_peak: int = 0
+    point_mps_recommended_bytes: int = 0
+    field_mean_prediction_batches: int = 0
+    field_mean_prediction_rows: int = 0
+    field_mean_prediction_batch_rows_peak: int = 0
+    field_mean_prediction_backend_rows: int = 0
+    field_mean_prediction_backend_batch_rows_peak: int = 0
+    field_mean_prediction_backend_bucket_counts: tuple[tuple[int, int], ...] = ()
+    field_mean_prediction_backend_bucket_rows: tuple[tuple[int, int], ...] = ()
+    field_mean_feature_bytes_peak: int = 0
+    field_mean_mps_current_bytes_peak: int = 0
+    field_mean_mps_driver_bytes_peak: int = 0
+    field_mean_mps_recommended_bytes: int = 0
     search_star_rows_peak: int = 0
     ngs_rows_peak: int = 0
     close_pair_rows_peak: int = 0
@@ -193,8 +229,8 @@ class TraversalMemorySample:
     peak_rss_start_mb: float = 0.0
     rss_after_star_selection_mb: float = 0.0
     peak_rss_after_star_selection_mb: float = 0.0
-    rss_after_find_asterisms_mb: float = 0.0
-    peak_rss_after_find_asterisms_mb: float = 0.0
+    rss_after_candidate_generation_mb: float = 0.0
+    peak_rss_after_candidate_generation_mb: float = 0.0
     rss_after_filtering_mb: float = 0.0
     peak_rss_after_filtering_mb: float = 0.0
     rss_after_context_mb: float = 0.0
@@ -217,10 +253,32 @@ class TraversalMemorySample:
     ngs_rows: int = 0
     close_pair_rows: int = 0
     raw_asterism_rows: int = 0
-    post_overlap_asterism_rows: int = 0
+    candidate_graph_rows: int = 0
     local_asterism_rows: int = 0
     context_pair_rows: int = 0
     winner_payload_rows: int = 0
+    point_prediction_batches: int = 0
+    point_prediction_rows: int = 0
+    point_prediction_batch_rows_peak: int = 0
+    point_prediction_backend_rows: int = 0
+    point_prediction_backend_batch_rows_peak: int = 0
+    point_prediction_backend_bucket_counts: str = ""
+    point_prediction_backend_bucket_rows: str = ""
+    point_feature_mib_peak: float = 0.0
+    point_mps_current_mib_peak: float = 0.0
+    point_mps_driver_mib_peak: float = 0.0
+    point_mps_recommended_mib: float = 0.0
+    field_mean_prediction_batches: int = 0
+    field_mean_prediction_rows: int = 0
+    field_mean_prediction_batch_rows_peak: int = 0
+    field_mean_prediction_backend_rows: int = 0
+    field_mean_prediction_backend_batch_rows_peak: int = 0
+    field_mean_prediction_backend_bucket_counts: str = ""
+    field_mean_prediction_backend_bucket_rows: str = ""
+    field_mean_feature_mib_peak: float = 0.0
+    field_mean_mps_current_mib_peak: float = 0.0
+    field_mean_mps_driver_mib_peak: float = 0.0
+    field_mean_mps_recommended_mib: float = 0.0
     artifact_inner_structured_mib: float = 0.0
     artifact_asterism_structured_mib: float = 0.0
     error_message: str = ""

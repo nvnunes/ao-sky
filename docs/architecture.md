@@ -95,8 +95,8 @@ The canonical package is split by ownership:
   - star assembly for asterism search
   - asterism search
   - geometry
-  - overlap logic
-  - filtering and scoring seams
+  - legacy overlap/filtering helpers for `find_asterisms`
+  - public search seams kept separate from active build Traversal policy
 - `ao_sky.dust`
   - Gaia TGE source loading and build-local dense A0 cache creation
   - mmap-backed local dust-field sampling
@@ -213,10 +213,8 @@ Build execution is organized around restartable outer-pixel work.
 - Work balancing should use star count or another practical work proxy.
 - Traversal uses a long-lived worker runtime even when `workers=1`, and can run
   with multiple regional process workers as an execution-time option; worker
-  count, regional scheduling, and Gaia memory-cache settings are not part of
-  the persisted build contract. The optional worker memory limit is also an
-  execution-time guard: it fails the run cleanly if a worker reports peak RSS
-  above the configured limit.
+  count, regional scheduling, Gaia memory-cache settings, and parent aggregate
+  memory pressure controls are not part of the persisted build contract.
 - Canonical Gaia files remain raw on disk, but long-lived Traversal workers
   use a runtime-local Gaia cache whose rows are shifted to the build epoch,
   enriched with `R` and `hpx14`, and then marked read-only. Downstream

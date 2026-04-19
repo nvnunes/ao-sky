@@ -8,9 +8,8 @@ from .service import (
     get_mean_model,
     get_point_model,
     get_seeing_baseline_performance,
-    predict_asterism_ee,
-    predict_field_mean_batch,
-    predict_point_batch,
+    predict_field_mean_arrays,
+    predict_point_arrays,
     warm_model_cache,
 )
 
@@ -25,8 +24,7 @@ __all__ = [
     "get_mean_model",
     "get_point_model",
     "get_seeing_baseline_performance",
-    "predict_asterism_ee",
-    "predict_field_mean_batch",
-    "predict_point_batch",
+    "predict_field_mean_arrays",
+    "predict_point_arrays",
     "warm_model_cache",
 ]

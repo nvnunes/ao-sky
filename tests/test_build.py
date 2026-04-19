@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 from gzip import open as gzip_open
 
@@ -64,15 +65,21 @@ from ao_sky.build.runtime_config import load_runtime_config, runtime_to_config, 
 from ao_sky.build.model_snapshot import fetch_model_data
 from ao_sky.build.survey_snapshot import fetch_survey_data
 from ao_sky.build.scheduler import OuterPixelScheduler
-from ao_sky.build.regional import build_regional_worker_plans, order_region_outer_pixs
+from ao_sky.build.regional import (
+    build_regional_worker_plans,
+    order_region_outer_pixs,
+)
 from ao_sky.build.artifacts import (
     DEFAULT_ARTIFACT_BLOSC_LEVEL,
     HDF5_BLOSC_FILTER_ID,
     write_outer_artifact,
     write_outer_artifact_profiled,
 )
-from ao_sky.build._models import BuildDefinition, TraversalExecutionConfig, TraversalTaskResult
-from ao_sky.build.traversal import coarse_density_skip_outer_pixs
+from ao_sky.build._models import (
+    BuildDefinition,
+    TraversalExecutionConfig,
+    TraversalTaskResult,
+)
 from ao_sky.dust import gaia_tge_a0_cache_filename, prepare_gaia_tge_a0_cache
 from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
 from ao_sky.predict import AOSystemRuntime, PredictRuntime
@@ -92,13 +99,13 @@ def _write_build_definition(
     survey_overlays: list[dict[str, object]] | None = None,
 ) -> Path:
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "build": {},
         "ao_system": {
             "band": "R",
             "fov_arcsec": 120.0,
             "lgs": [],
-            "min_wfs": 2,
+            "min_wfs": 1,
             "max_wfs": 3,
             "min_mag": 8.0,
             "max_mag": 18.5,
@@ -107,10 +114,12 @@ def _write_build_definition(
         "prediction": {
             "wavelength_micron": 1.654,
             "resolved_models": {
+                "1star": "point_one",
                 "2star": "point_two",
                 "3star": "point_three",
             },
             "averaged_models": {
+                "1star": "mean_one",
                 "2star": "mean_two",
                 "3star": "mean_three",
             },
@@ -122,12 +131,13 @@ def _write_build_definition(
         "gaia": {
             "release": "dr3",
             "epoch": 2028.0,
-            "min_galactic_latitude_deg": None,
-            "max_star_density": 6.0,
             "max_bright_star_mag": 8.0,
+            "max_bright_star_exclusion_arcsec": 240.0,
         },
         "maps": {"max_level": max_data_level},
-        "asterism": {"max_overlap": 0.66},
+        "asterism": {
+            "winner_ee_epsilon": 0.01,
+        },
         "best": {
             "seeing_baseline": {
                 "wavelength_micron": 0.5,
@@ -149,8 +159,6 @@ def _write_build_definition(
 
 def _write_legacy_config(
     path: Path,
-    *,
-    min_galactic_latitude: float | None = None,
 ) -> Path:
     text = """
 ao_systems:
@@ -168,14 +176,11 @@ ao_systems:
     models:
       2star: mean_two
       3star: mean_three
-asterisms_max_star_density: 6.0
 asterisms_max_bright_star_mag: 8.0
 asterisms_max_overlap: 0.66
 coverage_ee_threshold_resolved: 0.4
 coverage_ee_threshold_mean: 0.3
 """.strip()
-    if min_galactic_latitude is not None:
-        text += f"\nasterisms_min_galactic_latitude: {float(min_galactic_latitude)}"
     path.write_text(text + "\n", encoding="utf-8")
     return path
 
@@ -198,7 +203,6 @@ ao_systems:
     models:
       2star: mean_two
       3star: shared_three
-asterisms_max_star_density: 6.0
 asterisms_max_bright_star_mag: 8.0
 asterisms_max_overlap: 0.66
 coverage_ee_threshold_resolved: 0.4
@@ -234,22 +238,13 @@ def load_native_runtime(
         outer_level=definition.outer_level,
         inner_level=definition.inner_level,
         epoch=float(raw.get("asterism_epoch", 2028.0)),
-        min_galactic_latitude=(
-            None
-            if raw.get("asterisms_min_galactic_latitude") is None
-            else float(raw["asterisms_min_galactic_latitude"])
-        ),
-        max_star_density=float(raw.get("asterisms_max_star_density", 2.0)),
         max_bright_star_mag=(
             None
             if raw.get("asterisms_max_bright_star_mag") is None
             else float(raw["asterisms_max_bright_star_mag"])
         ),
-        max_overlap=(
-            None
-            if raw.get("asterisms_max_overlap") is None
-            else float(raw["asterisms_max_overlap"])
-        ),
+        max_bright_star_exclusion=2.0 * ao_system.fov,
+        winner_ee_epsilon=0.01,
         prediction_wavelength=1.654 * u.micron,
         resolved_models={
             str(key): str(value)
@@ -414,12 +409,10 @@ def _make_inner(
     gaia_a0: float = np.nan,
     star_count: int = 0,
     ngs_count: int = 0,
-    asterism_count: int = 0,
     best_ee: float = np.nan,
     best_sr: float = np.nan,
     best_fwhm: float = np.nan,
     winner_asterism_id: int = -1,
-    winner_distance_arcsec: float = np.nan,
     winner_ee_resolved: float = np.nan,
     winner_ee_averaged: float = np.nan,
     coverage_resolved: bool = False,
@@ -433,12 +426,10 @@ def _make_inner(
             np.full(nrows, gaia_a0, dtype=np.float64),
             np.full(nrows, star_count, dtype=np.int64),
             np.full(nrows, ngs_count, dtype=np.int64),
-            np.full(nrows, asterism_count, dtype=np.int64),
             np.full(nrows, best_ee, dtype=np.float64),
             np.full(nrows, best_sr, dtype=np.float64),
             np.full(nrows, best_fwhm, dtype=np.float64),
             np.full(nrows, winner_asterism_id, dtype=np.int64),
-            np.full(nrows, winner_distance_arcsec, dtype=np.float64),
             np.full(nrows, winner_ee_resolved, dtype=np.float64),
             np.full(nrows, winner_ee_averaged, dtype=np.float64),
             np.full(nrows, coverage_resolved, dtype=np.bool_),
@@ -449,12 +440,10 @@ def _make_inner(
             "gaia_A0",
             "star_count",
             "ngs_count",
-            "asterism_count",
             "best_ee",
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_distance_arcsec",
             "winner_ee_resolved",
             "winner_ee_averaged",
             "coverage_resolved",
@@ -616,7 +605,6 @@ def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
     assert "source" not in runtime_payload
     assert "build" not in runtime_payload
     assert runtime.ao_system.band == "R"
-    assert runtime.max_star_density == pytest.approx(6.0)
 
 
 def test_init_build_uses_ao_sky_yaml_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -793,17 +781,22 @@ def test_fetch_gaia_data_propagates_force_flag(tmp_path: Path, monkeypatch: pyte
 
 def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("AO_SKY_PREDICT_DEVICE", raising=False)
+    monkeypatch.delenv("AO_SKY_AVERAGED_PREDICT_DEVICE", raising=False)
     conf = tmp_path / "ao-sky.yaml"
     conf.write_text(
         "\n".join(
             (
                 "build:",
                 "  workers: 5",
-                "  worker_memory_limit_mb: 8192",
-                "  parent_memory_limit_mb: 12288",
+                "  memory_limit_mb: 12288",
                 "gaia_cache_entries: 128",
                 "gaia_cache_mb: 4096",
+                "prediction:",
+                "  resolved_device: auto",
+                "  averaged_device: auto",
             )
         )
         + "\n",
@@ -817,15 +810,18 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         gaia_cache_entries=128,
         gaia_cache_mb=4096,
         region_level=3,
-        worker_memory_limit_mb=8192,
         parent_memory_limit_mb=12288,
+        prediction_device="auto",
+        averaged_prediction_device="auto",
     )
+    assert "AO_SKY_PREDICT_DEVICE" not in os.environ
+    assert "AO_SKY_AVERAGED_PREDICT_DEVICE" not in os.environ
+
     override = resolve_traversal_execution_config(
         outer_level=6,
         workers=3,
         gaia_cache_entries=64,
         gaia_cache_mb=2048,
-        worker_memory_limit_mb=4096,
         parent_memory_limit_mb=8192,
         aosky_yaml=conf,
     )
@@ -834,41 +830,64 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         gaia_cache_entries=64,
         gaia_cache_mb=2048,
         region_level=4,
-        worker_memory_limit_mb=4096,
         parent_memory_limit_mb=8192,
+        prediction_device="auto",
+        averaged_prediction_device="auto",
     )
 
+    conf.write_text(
+        "\n".join(("build:", "  workers: 2")) + "\n",
+        encoding="utf-8",
+    )
+    without_device = resolve_traversal_execution_config(outer_level=6, aosky_yaml=conf)
+    assert without_device.prediction_device is None
+    assert without_device.averaged_prediction_device is None
 
-def test_resolve_traversal_execution_config_validates_values() -> None:
+
+def test_resolve_traversal_execution_config_validates_values(tmp_path: Path) -> None:
     with pytest.raises(BuildError, match="workers must be at least 1"):
         resolve_traversal_execution_config(outer_level=2, workers=0)
     with pytest.raises(BuildError, match="gaia_cache_entries must be non-negative"):
         resolve_traversal_execution_config(outer_level=2, gaia_cache_entries=-1)
-    with pytest.raises(BuildError, match="worker_memory_limit_mb must be non-negative"):
-        resolve_traversal_execution_config(outer_level=2, worker_memory_limit_mb=-1)
-    with pytest.raises(BuildError, match="parent_memory_limit_mb must be non-negative"):
+    with pytest.raises(BuildError, match="memory_limit_mb must be non-negative"):
         resolve_traversal_execution_config(outer_level=2, parent_memory_limit_mb=-1)
     with pytest.raises(BuildError, match="telemetry must be either"):
         resolve_traversal_execution_config(outer_level=2, telemetry="verbose")
 
+    conf = tmp_path / "ao-sky.yaml"
+    conf.write_text(
+        "\n".join(("prediction:", "  resolved_device: mps")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BuildError, match="prediction.resolved_device"):
+        resolve_traversal_execution_config(outer_level=2, aosky_yaml=conf)
 
-def test_regional_worker_plans_balance_regions_by_star_count() -> None:
-    state = _make_scheduler_state([WORK_STATUS_PENDING] * 16)
-    star_counts = np.arange(16, dtype=np.int64)
+    conf.write_text(
+        "\n".join(("build:", "  parent_memory_limit_mb: 12288")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BuildError, match="build.memory_limit_mb"):
+        resolve_traversal_execution_config(outer_level=2, aosky_yaml=conf)
+
+
+def test_regional_worker_plans_can_reserve_low_latitude_workers() -> None:
+    state = _make_scheduler_state([WORK_STATUS_PENDING] * 64)
+    star_counts = np.arange(64, dtype=np.int64) + 1
 
     plans = build_regional_worker_plans(
         state=state,
-        outer_level=1,
-        region_level=0,
+        outer_level=2,
+        region_level=1,
         workers=3,
         status_field="traversal_status",
         star_counts=star_counts,
+        low_latitude_deg=90.0,
+        low_latitude_workers=2,
     )
 
-    assert len(plans) == 3
-    assert sorted(pix for plan in plans for pix in plan.outer_pixs) == list(range(16))
-    assert sorted(pix for plan in plans for pix in plan.region_pixs) == [0, 1, 2, 3]
-    assert [plan.estimated_star_count for plan in plans] == [54, 38, 28]
+    assert {plan.worker_id for plan in plans} == {0, 1, 2}
+    assert sorted(pix for plan in plans for pix in plan.outer_pixs) == list(range(64))
+    assert sum(plan.estimated_star_count for plan in plans) == int(np.sum(star_counts))
 
 
 def test_order_region_outer_pixs_prefers_neighbours(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -888,6 +907,28 @@ def test_order_region_outer_pixs_prefers_neighbours(monkeypatch: pytest.MonkeyPa
         3,
         2,
         1,
+        0,
+    )
+
+
+def test_order_region_outer_pixs_can_stagger_initial_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ao_sky.build.regional.get_pixel_neighbours",
+        lambda level, pix: np.asarray([], dtype=np.int64),
+    )
+    star_counts = np.asarray([10, 20, 30, 40], dtype=np.int64)
+
+    assert order_region_outer_pixs(
+        [0, 1, 2, 3],
+        outer_level=0,
+        star_counts=star_counts,
+        seed_rank=2,
+    ) == (
+        1,
+        3,
+        2,
         0,
     )
 
@@ -1345,12 +1386,10 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
                 gaia_a0=0.12,
                 star_count=3,
                 ngs_count=2,
-                asterism_count=5,
                 best_ee=0.5,
                 best_sr=0.4,
                 best_fwhm=0.3,
                 winner_asterism_id=7,
-                winner_distance_arcsec=12.0,
                 winner_ee_resolved=0.5,
                 winner_ee_averaged=0.45,
                 coverage_resolved=True,
@@ -1382,12 +1421,10 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
             "gaia_A0",
             "star_count",
             "ngs_count",
-            "asterism_count",
             "best_ee",
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_distance_arcsec",
             "winner_ee_resolved",
             "winner_ee_averaged",
             "coverage_resolved",
@@ -1433,7 +1470,8 @@ def test_run_build_uses_gaia_summary_star_counts_for_initial_seed(
 
     run_build(build_path)
 
-    assert visited[0] == 3
+    assert sorted(visited) == list(range(12))
+    assert 3 in visited
 
 
 def test_run_build_rejects_invalid_worker_count(tmp_path: Path) -> None:
@@ -1509,7 +1547,7 @@ def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_s
 
     run_build(build_path, workers=3, gaia_cache_entries=0)
 
-    assert seen_workers == [0]
+    assert seen_workers == [0, 1, 2]
     assert sorted(seen_outer_pixs) == list(range(12))
     state = load_state(build_path)
     assert np.all(state["traversal_status"] == WORK_STATUS_DONE)
@@ -1543,8 +1581,7 @@ def test_run_build_uses_ao_sky_yaml_execution_defaults(
             (
                 "build:",
                 "  workers: 5",
-                "  worker_memory_limit_mb: 2048",
-                "  parent_memory_limit_mb: 12288",
+                "  memory_limit_mb: 12288",
             )
         )
         + "\n",
@@ -1569,7 +1606,6 @@ def test_run_build_uses_ao_sky_yaml_execution_defaults(
 
     execution_config = captured["execution_config"]
     assert execution_config.workers == 5
-    assert execution_config.worker_memory_limit_mb == 2048
     assert execution_config.parent_memory_limit_mb == 12288
 
 
@@ -1762,7 +1798,6 @@ def test_run_build_regional_cache_path_updates_parent_state(
             gaia_cache_entries=64,
             gaia_cache_mb=2048,
             region_level=0,
-            worker_memory_limit_mb=0,
             parent_memory_limit_mb=0,
         )
     ]
@@ -1773,37 +1808,6 @@ def test_run_build_regional_cache_path_updates_parent_state(
     assert summarize_build(build_path)["build_status"] == "completed"
 
 
-def test_regional_worker_memory_limit_message_fails_infrastructure(
-    tmp_path: Path,
-) -> None:
-    from ao_sky.build import runner as runner_module
-
-    definition = _write_build_definition(tmp_path / "build.yaml")
-    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
-    build_path = init_build(
-        definition_filename=definition,
-        gaia_root=tmp_path / "gaia",
-        build_root=tmp_path / "builds",
-        dust_root=tmp_path / "dust",
-        legacy_config_path=legacy,
-    )
-    state = load_state(build_path)
-
-    with pytest.raises(BuildError, match="worker peak RSS exceeded 4096 MiB"):
-        runner_module._handle_regional_worker_message(
-            build_path=build_path,
-            state=state,
-            message=runner_module.TraversalWorkerMessage(
-                worker_id=2,
-                kind="memory_limit",
-                error_message="worker peak RSS exceeded 4096 MiB",
-            ),
-        )
-
-    log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "worker=2 memory_limit: worker peak RSS exceeded 4096 MiB" in log_text
-
-
 def test_parent_memory_limit_uses_parent_plus_worker_current_rss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1812,6 +1816,8 @@ def test_parent_memory_limit_uses_parent_plus_worker_current_rss(
     class FakeProcess:
         pid = 123
 
+    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "cpu")
+    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
     monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 4096.0)
     monkeypatch.setattr(runner_module, "_process_current_rss_mb", lambda pid: 9000.0)
 
@@ -1825,6 +1831,158 @@ def test_parent_memory_limit_uses_parent_plus_worker_current_rss(
         TraversalExecutionConfig(parent_memory_limit_mb=14000),
         [FakeProcess()],
     )
+
+
+def test_parent_memory_limit_reserves_gpu_driver_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    class FakeProcess:
+        pid = 123
+
+    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "auto")
+    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
+    monkeypatch.setenv("AO_SKY_PARENT_GPU_DRIVER_RESERVE_MB", "1000")
+    monkeypatch.setattr(runner_module.predict_backend, "mps_is_available", lambda: True)
+    monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 4096.0)
+    monkeypatch.setattr(runner_module, "_process_current_rss_mb", lambda pid: 9000.0)
+
+    with pytest.raises(BuildError, match="current total RAM"):
+        runner_module._raise_if_parent_memory_limit_exceeded(
+            TraversalExecutionConfig(parent_memory_limit_mb=14000),
+            [FakeProcess()],
+        )
+
+
+def test_parent_memory_limit_does_not_reserve_gpu_when_mps_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    class FakeProcess:
+        pid = 123
+
+    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "auto")
+    monkeypatch.setenv("AO_SKY_PARENT_GPU_DRIVER_RESERVE_MB", "1000")
+    monkeypatch.setattr(runner_module.predict_backend, "mps_is_available", lambda: False)
+    monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 4096.0)
+    monkeypatch.setattr(runner_module, "_process_current_rss_mb", lambda pid: 9000.0)
+
+    runner_module._raise_if_parent_memory_limit_exceeded(
+        TraversalExecutionConfig(parent_memory_limit_mb=14000),
+        [FakeProcess()],
+    )
+
+
+def test_parent_memory_pressure_trims_heaviest_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def put(self, command: str) -> None:
+            self.commands.append(command)
+
+    worker_rss = {10: 1000.0, 11: 1500.0, 12: 5750.0}
+    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "cpu")
+    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
+    monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 500.0)
+    monkeypatch.setattr(
+        runner_module,
+        "_process_current_rss_mb",
+        lambda pid: worker_rss[int(pid)],
+    )
+    queues = {worker_id: FakeQueue() for worker_id in range(3)}
+    states = {
+        worker_id: runner_module.PARENT_MEMORY_PRESSURE_NORMAL
+        for worker_id in range(3)
+    }
+
+    pressure_state, targets = runner_module._update_parent_memory_pressure(
+        build_path=tmp_path,
+        execution_config=TraversalExecutionConfig(parent_memory_limit_mb=10000),
+        process_by_worker_id={
+            0: FakeProcess(10),
+            1: FakeProcess(11),
+            2: FakeProcess(12),
+        },
+        control_queues=queues,
+        active_worker_ids={0, 1, 2},
+        worker_pressure_states=states,
+        worker_pressure_command_times={},
+        previous_state=runner_module.PARENT_MEMORY_PRESSURE_NORMAL,
+        previous_targets=(),
+    )
+
+    assert pressure_state == runner_module.PARENT_MEMORY_PRESSURE_TRIM
+    assert targets == (2,)
+    assert queues[0].commands == []
+    assert queues[1].commands == []
+    assert queues[2].commands == [runner_module.PARENT_MEMORY_PRESSURE_TRIM]
+
+
+def test_parent_memory_pressure_pauses_heaviest_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def put(self, command: str) -> None:
+            self.commands.append(command)
+
+    worker_rss = {10: 4000.0, 11: 3000.0, 12: 2500.0}
+    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "cpu")
+    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
+    monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 250.0)
+    monkeypatch.setattr(
+        runner_module,
+        "_process_current_rss_mb",
+        lambda pid: worker_rss[int(pid)],
+    )
+    queues = {worker_id: FakeQueue() for worker_id in range(3)}
+    states = {
+        worker_id: runner_module.PARENT_MEMORY_PRESSURE_NORMAL
+        for worker_id in range(3)
+    }
+
+    pressure_state, targets = runner_module._update_parent_memory_pressure(
+        build_path=tmp_path,
+        execution_config=TraversalExecutionConfig(parent_memory_limit_mb=10000),
+        process_by_worker_id={
+            0: FakeProcess(10),
+            1: FakeProcess(11),
+            2: FakeProcess(12),
+        },
+        control_queues=queues,
+        active_worker_ids={0, 1, 2},
+        worker_pressure_states=states,
+        worker_pressure_command_times={},
+        previous_state=runner_module.PARENT_MEMORY_PRESSURE_NORMAL,
+        previous_targets=(),
+    )
+
+    assert pressure_state == runner_module.PARENT_MEMORY_PRESSURE_PAUSE
+    assert targets == (0, 1)
+    assert queues[0].commands == [runner_module.PARENT_MEMORY_PRESSURE_PAUSE]
+    assert queues[1].commands == [runner_module.PARENT_MEMORY_PRESSURE_PAUSE]
+    assert queues[2].commands == []
 
 
 def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path) -> None:
@@ -1862,14 +2020,28 @@ def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path
                     candidate_generation_seconds=0.2,
                     filtering_seconds=0.3,
                     bright_star_filter_seconds=0.01,
-                    overlap_quality_seconds=0.02,
-                    overlap_geometry_seconds=0.03,
                     inner_assignment_seconds=0.04,
                     local_selection_seconds=0.05,
                     inner_table_seconds=0.4,
                     context_seconds=0.5,
                     point_prediction_seconds=0.6,
+                    point_prediction_eligibility_seconds=0.06,
+                    point_prediction_eligibility_intersection_seconds=0.04,
+                    point_prediction_eligibility_extract_seconds=0.02,
+                    point_prediction_buffer_seconds=0.07,
+                    point_prediction_ngs_array_seconds=0.08,
+                    point_prediction_model_seconds=0.09,
+                    point_prediction_feature_seconds=0.11,
+                    point_prediction_backend_seconds=0.22,
+                    point_prediction_scatter_seconds=0.12,
+                    point_prediction_scatter_filter_seconds=0.021,
+                    point_prediction_scatter_merge_seconds=0.022,
+                    point_prediction_scatter_sort_seconds=0.033,
+                    point_prediction_scatter_write_seconds=0.044,
+                    point_prediction_cache_clear_seconds=0.13,
                     field_mean_prediction_seconds=0.7,
+                    field_mean_prediction_feature_seconds=0.33,
+                    field_mean_prediction_backend_seconds=0.44,
                     coverage_seconds=0.8,
                     dust_seconds=0.9,
                     persisted_asterisms_seconds=1.0,
@@ -1880,6 +2052,20 @@ def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path
                     close_pair_rows=13,
                     context_pair_rows=14,
                     winner_payload_rows=15,
+                    point_prediction_batches=3,
+                    point_prediction_rows=100,
+                    point_prediction_batch_rows_peak=40,
+                    point_feature_bytes_peak=2 * 1024 * 1024,
+                    point_mps_current_bytes_peak=5 * 1024 * 1024,
+                    point_mps_driver_bytes_peak=6 * 1024 * 1024,
+                    point_mps_recommended_bytes=7 * 1024 * 1024,
+                    field_mean_prediction_batches=4,
+                    field_mean_prediction_rows=50,
+                    field_mean_prediction_batch_rows_peak=20,
+                    field_mean_feature_bytes_peak=1024 * 1024,
+                    field_mean_mps_current_bytes_peak=8 * 1024 * 1024,
+                    field_mean_mps_driver_bytes_peak=9 * 1024 * 1024,
+                    field_mean_mps_recommended_bytes=10 * 1024 * 1024,
                     close_pair_rows_peak=16,
                     context_pair_rows_peak=17,
                     winner_payload_rows_peak=18,
@@ -1898,16 +2084,44 @@ def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path
     assert "traversal_profiled_s=5.550" in log_text
     assert "stage_star_selection_s=0.100" in log_text
     assert "stage_filtering_s=0.300" in log_text
-    assert "stage_overlap_quality_s=0.020" in log_text
-    assert "stage_overlap_geometry_s=0.030" in log_text
     assert "stage_local_selection_s=0.050" in log_text
     assert "stage_point_prediction_s=0.600" in log_text
+    assert "stage_point_prediction_eligibility_s=0.060" in log_text
+    assert "stage_point_prediction_eligibility_intersection_s=0.040" in log_text
+    assert "stage_point_prediction_eligibility_extract_s=0.020" in log_text
+    assert "stage_point_prediction_buffer_s=0.070" in log_text
+    assert "stage_point_prediction_ngs_array_s=0.080" in log_text
+    assert "stage_point_prediction_model_s=0.090" in log_text
+    assert "stage_point_prediction_feature_s=0.110" in log_text
+    assert "stage_point_prediction_backend_s=0.220" in log_text
+    assert "stage_point_prediction_scatter_s=0.120" in log_text
+    assert "stage_point_prediction_scatter_filter_s=0.021" in log_text
+    assert "stage_point_prediction_scatter_merge_s=0.022" in log_text
+    assert "stage_point_prediction_scatter_sort_s=0.033" in log_text
+    assert "stage_point_prediction_scatter_write_s=0.044" in log_text
+    assert "stage_point_prediction_cache_clear_s=0.130" in log_text
+    assert "stage_field_mean_prediction_feature_s=0.330" in log_text
+    assert "stage_field_mean_prediction_backend_s=0.440" in log_text
     assert "stage_dust_s=0.900" in log_text
     assert "artifact_write_s=0.500" in log_text
     assert "avg_artifact_write_s=0.250" in log_text
     assert "artifact_inner_input_mib=2.0" in log_text
     assert "artifact_asterism_structured_mib=4.0" in log_text
     assert "search_star_rows=11" in log_text
+    assert "point_prediction_batches=3" in log_text
+    assert "point_prediction_rows=100" in log_text
+    assert "point_prediction_batch_rows_peak=40" in log_text
+    assert "point_feature_mib_peak=2.000" in log_text
+    assert "point_mps_current_mib_peak=5.000" in log_text
+    assert "point_mps_driver_mib_peak=6.000" in log_text
+    assert "point_mps_recommended_mib=7.000" in log_text
+    assert "field_mean_prediction_batches=4" in log_text
+    assert "field_mean_prediction_rows=50" in log_text
+    assert "field_mean_prediction_batch_rows_peak=20" in log_text
+    assert "field_mean_feature_mib_peak=1.000" in log_text
+    assert "field_mean_mps_current_mib_peak=8.000" in log_text
+    assert "field_mean_mps_driver_mib_peak=9.000" in log_text
+    assert "field_mean_mps_recommended_mib=10.000" in log_text
     assert "close_pair_rows_peak=16" in log_text
     assert "context_pair_rows_peak=17" in log_text
     assert "winner_payload_rows_peak=18" in log_text
@@ -1942,7 +2156,16 @@ def test_detailed_traversal_telemetry_writes_memory_diagnostics(tmp_path: Path) 
                     rss_start_mb=100.0,
                     rss_after_context_mb=150.0,
                     context_pair_rows=123,
-                    winner_payload_rows=45,
+                        winner_payload_rows=45,
+                        point_prediction_batches=2,
+                        point_prediction_rows=77,
+                        point_prediction_batch_rows_peak=40,
+                        point_prediction_backend_rows=80,
+                        point_prediction_backend_batch_rows_peak=50,
+                        point_prediction_backend_bucket_counts="40:1;50:1",
+                        point_prediction_backend_bucket_rows="40:30;50:47",
+                        point_feature_mib_peak=3.5,
+                        point_mps_driver_mib_peak=4.5,
                 ),
             ),
             diagnostics_writer=writer,
@@ -1953,6 +2176,12 @@ def test_detailed_traversal_telemetry_writes_memory_diagnostics(tmp_path: Path) 
     assert "outer_pix,worker_id,success" in text
     assert "7,2,1" in text
     assert ",123,45," in text
+    assert "point_prediction_batches" in text
+    assert "point_prediction_batch_rows_peak" in text
+    assert "point_prediction_backend_bucket_counts" in text
+    assert "point_mps_driver_mib_peak" in text
+    assert "4.500" in text
+    assert ",2,77,40,80,50,40:1;50:1,40:30;50:47,3.500," in text
 
 
 def test_state_update_telemetry_retries_hdf5_lock_errors(
@@ -2189,7 +2418,7 @@ def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml")
-    legacy = _write_legacy_config(tmp_path / "legacy.yaml", min_galactic_latitude=90.0)
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
         definition_filename=definition,
         gaia_root=tmp_path / "gaia",
@@ -2202,7 +2431,7 @@ def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
         "ao_sky.build.runner.build_traversal_products",
         lambda store, runtime, outer_pix, **kwargs: (
             _make_asterisms(empty=True),
-            _make_inner(star_count=4, ngs_count=0, asterism_count=0),
+            _make_inner(star_count=4, ngs_count=0),
         ),
     )
     monkeypatch.setattr("ao_sky.build.runner.build_maps", lambda build_path: {})
@@ -2258,30 +2487,7 @@ def test_outer_artifact_uses_blosc_zstd_by_default(
         assert filter_values[4] == DEFAULT_ARTIFACT_BLOSC_LEVEL
         assert filter_values[5] == 1
 
-
-def test_coarse_density_skip_outer_pixs_uses_gaia_summary_density(
-    tmp_path: Path,
-) -> None:
-    definition = BuildDefinition(
-        lineage_name="test",
-        gaia_release="dr3",
-        outer_level=1,
-        inner_level=2,
-        max_data_level=2,
-    )
-    runtime = load_native_runtime(
-        definition,
-        legacy_config_path=_write_legacy_config(tmp_path / "legacy.yaml"),
-        model_root=tmp_path / "models",
-    )
-
-    star_counts = np.zeros(12 * (4 ** definition.outer_level), dtype=np.int64)
-    star_counts[3] = 10**9
-
-    assert coarse_density_skip_outer_pixs(runtime, star_counts) == frozenset({3})
-
-
-def test_run_build_passes_coarse_density_skip_to_traversal(
+def test_run_build_does_not_apply_density_skip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2312,10 +2518,8 @@ def test_run_build_passes_coarse_density_skip_to_traversal(
     for outer_pix in range(1, len(state)):
         update_state_row(build_path, outer_pix, traversal_status=WORK_STATUS_DONE)
 
-    seen_skip_reasons: list[str | None] = []
-
     def fake_build_traversal_products(store, runtime, outer_pix, **kwargs):
-        seen_skip_reasons.append(kwargs.get("asterism_skip_reason"))
+        assert "asterism_skip_reason" not in kwargs
         return _make_asterisms(empty=True), _make_inner()
 
     monkeypatch.setattr(
@@ -2326,9 +2530,8 @@ def test_run_build_passes_coarse_density_skip_to_traversal(
 
     run_build(build_path, gaia_cache_entries=0)
 
-    assert seen_skip_reasons == ["coarse_outer_density"]
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "coarse_density_skipped=1" in log_text
+    assert "density_skipped" not in log_text
 
 
 def test_restart_build_uses_latest_lineage_version(
@@ -2348,7 +2551,6 @@ def test_restart_build_uses_latest_lineage_version(
         workers: int | None = None,
         gaia_cache_entries: int | None = None,
         gaia_cache_mb: int | None = None,
-        worker_memory_limit_mb: int | None = None,
         parent_memory_limit_mb: int | None = None,
         telemetry: str | None = None,
         aosky_yaml: Path | None = None,
@@ -2356,7 +2558,6 @@ def test_restart_build_uses_latest_lineage_version(
         captured["workers"] = workers
         captured["gaia_cache_entries"] = gaia_cache_entries
         captured["gaia_cache_mb"] = gaia_cache_mb
-        captured["worker_memory_limit_mb"] = worker_memory_limit_mb
         captured["parent_memory_limit_mb"] = parent_memory_limit_mb
         captured["telemetry"] = telemetry
         captured["aosky_yaml"] = aosky_yaml
@@ -2375,7 +2576,6 @@ def test_restart_build_uses_latest_lineage_version(
         "workers": 3,
         "gaia_cache_entries": None,
         "gaia_cache_mb": None,
-        "worker_memory_limit_mb": None,
         "parent_memory_limit_mb": None,
         "telemetry": None,
         "aosky_yaml": None,
@@ -2514,7 +2714,6 @@ def test_run_build_auto_advances_to_aggregation_and_writes_maps(
             _make_inner(
                 star_count=outer_pix + 1,
                 ngs_count=outer_pix % 2,
-                asterism_count=outer_pix + 2,
                 best_ee=0.5,
                 best_sr=0.4,
                 best_fwhm=0.3,
@@ -2568,7 +2767,6 @@ def test_run_build_auto_advances_to_augmentation_when_overlays_exist(
             _make_inner(
                 star_count=outer_pix + 1,
                 ngs_count=outer_pix % 2,
-                asterism_count=outer_pix + 2,
                 best_ee=0.5,
                 best_sr=0.4,
                 best_fwhm=0.3,
@@ -2840,12 +3038,10 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Pat
             np.zeros(4, dtype=np.float64),
             np.array([1, 2, 3, 4], dtype=np.int64),
             np.array([0, 1, 0, 1], dtype=np.int64),
-            np.array([4, 5, 6, 7], dtype=np.int64),
             np.array([0.1, 0.2, np.nan, 0.4], dtype=np.float64),
             np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
             np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float64),
             np.full(4, -1, dtype=np.int64),
-            np.full(4, np.nan, dtype=np.float64),
             np.array([0.3, 0.4, 0.5, 0.6], dtype=np.float64),
             np.array([0.7, 0.8, 0.9, 1.0], dtype=np.float64),
             np.array([True, False, True, False], dtype=np.bool_),
@@ -2856,12 +3052,10 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Pat
             "gaia_A0",
             "star_count",
             "ngs_count",
-            "asterism_count",
             "best_ee",
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_distance_arcsec",
             "winner_ee_resolved",
             "winner_ee_averaged",
             "coverage_resolved",
@@ -2886,7 +3080,6 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Pat
     level0 = level_maps[0]
     assert int(level0["star_count"][0]) == 10
     assert int(level0["ngs_count"][0]) == 2
-    assert int(level0["asterism_count"][0]) == 22
     assert np.isnan(level0["gaia_A0"][0])
     assert np.isnan(level0["best_ee"][0])
     assert float(level0["best_sr"][0]) == pytest.approx(2.5)
@@ -2923,7 +3116,6 @@ def test_build_maps_writes_dense_maps_artifacts_with_expected_contract(tmp_path:
                 gaia_a0=-1.0,
                 star_count=1,
                 ngs_count=2,
-                asterism_count=3,
                 best_ee=0.5,
                 best_sr=0.4,
                 best_fwhm=0.3,
