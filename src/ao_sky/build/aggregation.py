@@ -8,10 +8,15 @@ from pathlib import Path
 import numpy as np
 
 from ..dust import sample_gaia_a0_for_outer_pixel
-from ._constants import MAPS_DTYPE, MAPS_MEAN_FIELDS, MAPS_SUM_FIELDS, OUTER_DATASET_INNER
+from ._constants import MAPS_DTYPE, MAPS_MEAN_FIELDS, MAPS_SUM_FIELDS
 from ._exceptions import BuildError
-from .artifacts import read_outer_dataset, write_maps_artifact
-from .control import load_build_definition, load_build_roots, maps_artifact_filename, outer_artifact_filename
+from .artifacts import read_outer_aggregation_products, write_maps_artifact
+from .control import (
+    load_build_definition,
+    load_build_roots,
+    maps_artifact_filename,
+    outer_artifact_filename,
+)
 
 
 def _create_maps_array(level: int) -> np.ndarray:
@@ -32,8 +37,51 @@ def _reduce_level(
     for field in MAPS_SUM_FIELDS:
         reduced_values[field] = values[field].reshape(-1, 4).sum(axis=1)
     for field in MAPS_MEAN_FIELDS:
-        reduced_values[field] = values[field].reshape(-1, 4).mean(axis=1)
+        # Legacy survey_tools used plain mean here, so one NaN child poisoned
+        # the coarser pixel. ao-sky intentionally averages finite children for
+        # mean fields so partial/missing winner values do not erase valid data.
+        grouped = values[field].reshape(-1, 4)
+        finite = np.isfinite(grouped)
+        counts = finite.sum(axis=1)
+        reduced = np.full(len(grouped), np.nan, dtype=np.float64)
+        populated = counts > 0
+        reduced[populated] = (
+            np.where(finite[populated], grouped[populated], 0.0).sum(axis=1)
+            / counts[populated]
+        )
+        reduced_values[field] = reduced
     return reduced_pix, reduced_values
+
+
+def _add_winner_asterism_counts(
+    level_maps: dict[int, np.ndarray],
+    *,
+    outer_level: int,
+    inner_level: int,
+    max_data_level: int,
+    asterism_pix: np.ndarray,
+) -> None:
+    """Populate center-owned retained-asterism counts for one outer artifact."""
+
+    if len(asterism_pix) == 0:
+        return
+
+    asterism_pix = np.asarray(asterism_pix, dtype=np.int64)
+    if int(max_data_level) > int(inner_level):
+        raise BuildError(
+            "winner_asterism_count cannot be projected above the retained "
+            "asterism center-pixel level"
+        )
+
+    for level in range(int(outer_level), int(max_data_level) + 1):
+        pixels = asterism_pix // 4 ** (int(inner_level) - int(level))
+        if np.any(pixels < 0) or np.any(pixels >= len(level_maps[level])):
+            raise BuildError(
+                "Retained asterism center pixel is outside the map domain "
+                f"at level {level}"
+            )
+        unique_pixels, counts = np.unique(pixels, return_counts=True)
+        level_maps[level]["winner_asterism_count"][unique_pixels] += counts
 
 
 def aggregate_maps(
@@ -60,7 +108,7 @@ def aggregate_maps(
         if not filename.is_file():
             raise BuildError(f"Outer artifact not found for aggregation: {filename}")
 
-        inner = read_outer_dataset(filename, OUTER_DATASET_INNER)
+        inner, asterism_pix = read_outer_aggregation_products(filename)
         dust = sample_gaia_a0_for_outer_pixel(
             dust_root=roots.dust_root,
             outer_level=definition.outer_level,
@@ -99,6 +147,14 @@ def aggregate_maps(
                     maps[field][current_pix] = values
             if level > definition.outer_level:
                 current_pix, current_values = _reduce_level(current_pix, current_values)
+
+        _add_winner_asterism_counts(
+            level_maps,
+            outer_level=definition.outer_level,
+            inner_level=definition.inner_level,
+            max_data_level=definition.max_data_level,
+            asterism_pix=asterism_pix,
+        )
 
     return level_maps
 

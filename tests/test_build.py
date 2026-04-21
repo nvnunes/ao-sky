@@ -24,6 +24,7 @@ from ao_sky.build import (
     run_build,
     show_build,
 )
+import ao_sky.build.aggregation as aggregation_module
 from ao_sky.build.augmentation import build_survey_extent_layers
 from ao_sky.build.aggregation import aggregate_maps, build_maps
 from ao_sky.build._constants import (
@@ -83,6 +84,7 @@ from ao_sky.build._models import (
 )
 from ao_sky.dust import gaia_tge_a0_cache_filename, prepare_gaia_tge_a0_cache
 from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
+from ao_sky.spatial import get_pixel_skycoord
 from ao_sky.predict import AOSystemRuntime, PredictRuntime
 
 
@@ -482,7 +484,12 @@ def _write_moc(path: Path, *, level: int, pixs: list[int]) -> Path:
     return path
 
 
-def _make_asterisms(*, empty: bool = False) -> Table:
+def _make_asterisms(
+    *,
+    empty: bool = False,
+    centers: list[tuple[float, float]] | None = None,
+    pixs: list[int] | None = None,
+) -> Table:
     if empty:
         return Table(
             [
@@ -525,25 +532,35 @@ def _make_asterisms(*, empty: bool = False) -> Table:
             ),
         )
 
+    if centers is None:
+        centers = [(10.0, 20.0)]
+    nrows = len(centers)
+    ra_values = np.asarray([ra for ra, _ in centers], dtype=np.float64)
+    dec_values = np.asarray([dec for _, dec in centers], dtype=np.float64)
+    pix_values = (
+        np.arange(nrows, dtype=np.int64)
+        if pixs is None
+        else np.asarray(pixs, dtype=np.int64)
+    )
     return Table(
         [
-            np.array([7], dtype=np.int64),
-            np.array([10.0], dtype=np.float64),
-            np.array([20.0], dtype=np.float64),
-            np.array([2], dtype=np.int64),
-            np.array([0], dtype=np.int64),
-            np.array([101], dtype=np.int64),
-            np.array([10.0], dtype=np.float64),
-            np.array([20.0], dtype=np.float64),
-            np.array([12.0], dtype=np.float64),
-            np.array([202], dtype=np.int64),
-            np.array([10.1], dtype=np.float64),
-            np.array([20.1], dtype=np.float64),
-            np.array([13.0], dtype=np.float64),
-            np.array([-1], dtype=np.int64),
-            np.array([-1.0], dtype=np.float64),
-            np.array([-1.0], dtype=np.float64),
-            np.array([-1.0], dtype=np.float64),
+            np.arange(7, 7 + nrows, dtype=np.int64),
+            ra_values,
+            dec_values,
+            np.full(nrows, 2, dtype=np.int64),
+            pix_values,
+            np.arange(101, 101 + nrows, dtype=np.int64),
+            ra_values,
+            dec_values,
+            np.full(nrows, 12.0, dtype=np.float64),
+            np.arange(202, 202 + nrows, dtype=np.int64),
+            ra_values + 0.1,
+            dec_values + 0.1,
+            np.full(nrows, 13.0, dtype=np.float64),
+            np.full(nrows, -1, dtype=np.int64),
+            np.full(nrows, -1.0, dtype=np.float64),
+            np.full(nrows, -1.0, dtype=np.float64),
+            np.full(nrows, -1.0, dtype=np.float64),
         ],
         names=(
             "asterism_id",
@@ -910,8 +927,6 @@ def test_regional_worker_plans_can_reserve_low_latitude_workers() -> None:
     assert {plan.worker_id for plan in plans} == {0, 1, 2}
     assert sorted(pix for plan in plans for pix in plan.outer_pixs) == list(range(64))
     assert sum(plan.estimated_star_count for plan in plans) == int(np.sum(star_counts))
-
-
 
 
 def test_dynamic_work_batches_classify_stress_and_compute_workers() -> None:
@@ -3061,7 +3076,10 @@ def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None
         update_state_row(build_path, 0, traversal_last_error_message="x" * 1025)
 
 
-def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Path) -> None:
+def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     definition = _write_build_definition(
         tmp_path / "build.yaml",
         outer_level=0,
@@ -3099,7 +3117,7 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Pat
             np.array([0.1, 0.2, np.nan, 0.4], dtype=np.float64),
             np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
             np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float64),
-            np.full(4, -1, dtype=np.int64),
+            np.full(4, 7, dtype=np.int64),
             np.array([0.3, 0.4, 0.5, 0.6], dtype=np.float64),
             np.array([0.7, 0.8, 0.9, 1.0], dtype=np.float64),
             np.array([True, False, True, False], dtype=np.bool_),
@@ -3123,29 +3141,79 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(tmp_path: Pat
     write_outer_artifact(
         outer_artifact_filename(build_path, load_build_definition(build_path), 0),
         inner=inner,
-        asterisms=_make_asterisms(empty=True),
+        asterisms=_make_asterisms(
+            centers=[
+                (
+                    float(get_pixel_skycoord(1, 0).ra.deg),
+                    float(get_pixel_skycoord(1, 0).dec.deg),
+                ),
+                (
+                    float(get_pixel_skycoord(1, 0).ra.deg),
+                    float(get_pixel_skycoord(1, 0).dec.deg),
+                ),
+                (
+                    float(get_pixel_skycoord(1, 1).ra.deg),
+                    float(get_pixel_skycoord(1, 1).dec.deg),
+                ),
+            ],
+            pixs=[0, 0, 1],
+        ),
+    )
+    read_product_filenames: list[Path] = []
+
+    def counting_read_outer_aggregation_products(filename: Path):
+        read_product_filenames.append(filename)
+        return real_read_outer_aggregation_products(filename)
+
+    real_read_outer_aggregation_products = aggregation_module.read_outer_aggregation_products
+    monkeypatch.setattr(
+        aggregation_module,
+        "read_outer_aggregation_products",
+        counting_read_outer_aggregation_products,
     )
 
     level_maps = aggregate_maps(build_path, outer_pixs=[0])
 
+    assert len(read_product_filenames) == 1
     assert sorted(level_maps) == [0, 1]
     level1 = level_maps[1]
     assert level1["gaia_A0"][:3].tolist() == [0.5, 1.5, 2.5]
     assert np.isnan(level1["gaia_A0"][3])
     assert level1["star_count"][:4].tolist() == [1, 2, 3, 4]
     assert level1["coverage_resolved"][:4].tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert level1["winner_asterism_count"][:4].tolist() == [2, 1, 0, 0]
 
     level0 = level_maps[0]
+    assert int(level0["winner_asterism_count"][0]) == 3
     assert int(level0["star_count"][0]) == 10
     assert int(level0["ngs_count"][0]) == 2
-    assert np.isnan(level0["gaia_A0"][0])
-    assert np.isnan(level0["best_ee"][0])
+    assert float(level0["gaia_A0"][0]) == pytest.approx(1.5)
+    assert float(level0["best_ee"][0]) == pytest.approx((0.1 + 0.2 + 0.4) / 3.0)
     assert float(level0["best_sr"][0]) == pytest.approx(2.5)
     assert float(level0["best_fwhm"][0]) == pytest.approx(25.0)
     assert float(level0["winner_ee_resolved"][0]) == pytest.approx(0.45)
     assert float(level0["winner_ee_averaged"][0]) == pytest.approx(0.85)
     assert float(level0["coverage_resolved"][0]) == pytest.approx(0.5)
     assert float(level0["coverage_averaged"][0]) == pytest.approx(0.5)
+
+
+def test_winner_asterism_count_accumulates_center_owner_pixels_globally() -> None:
+    level_maps = {
+        0: np.zeros(12, dtype=MAPS_DTYPE),
+        1: np.zeros(48, dtype=MAPS_DTYPE),
+    }
+
+    aggregation_module._add_winner_asterism_counts(
+        level_maps,
+        outer_level=0,
+        inner_level=1,
+        max_data_level=1,
+        asterism_pix=np.asarray([0, 4], dtype=np.int64),
+    )
+
+    assert level_maps[0]["winner_asterism_count"][:2].tolist() == [1, 1]
+    assert int(level_maps[1]["winner_asterism_count"][0]) == 1
+    assert int(level_maps[1]["winner_asterism_count"][4]) == 1
 
 
 def test_build_maps_writes_dense_maps_artifacts_with_expected_contract(tmp_path: Path) -> None:

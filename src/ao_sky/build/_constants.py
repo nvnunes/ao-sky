@@ -94,6 +94,7 @@ MAPS_DTYPE: Final[np.dtype] = np.dtype(
         ("gaia_A0", "<f8"),
         ("star_count", "<i8"),
         ("ngs_count", "<i8"),
+        ("winner_asterism_count", "<i8"),
         ("best_sr", "<f8"),
         ("best_ee", "<f8"),
         ("best_fwhm", "<f8"),

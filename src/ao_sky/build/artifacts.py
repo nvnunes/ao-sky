@@ -374,6 +374,18 @@ def read_outer_dataset(filename: Path, dataset_name: str) -> Table:
         return Table(handle[dataset_name][...])
 
 
+def read_outer_aggregation_products(filename: Path) -> tuple[Table, np.ndarray]:
+    """Read datasets needed by map aggregation from one outer artifact."""
+
+    _ensure_artifact_hdf5_filters()
+    with h5py.File(filename, "r") as handle:
+        inner = Table(handle[OUTER_DATASET_INNER][...])
+        asterism_pix = np.asarray(
+            handle[OUTER_DATASET_ASTERISMS].fields("pix")[...],
+            dtype=np.int64,
+        )
+    return inner, asterism_pix
+
 
 def read_outer_products(filename: Path) -> tuple[Table, Table]:
     """Read inner and retained-asterism datasets from one outer artifact."""

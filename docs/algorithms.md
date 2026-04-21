@@ -502,10 +502,17 @@ coverage_averaged
 gaia_A0
 ```
 
-Aggregation should drop the removed fields as well. The legacy-preserving
-Traversal artifact layout/schema is version 1. The replacement Traversal
-artifact layout/schema should be version 2 so old and new `outer.h5` products
-are not silently confused.
+Aggregated map artifacts should also include `winner_asterism_count`. This
+field is special: it is derived from retained `asterisms` rows, not from the
+inner-pixel table. It counts retained winner asterisms whose center lies inside
+the map pixel at every retained map level. It is not the number of distinct
+`winner_asterism_id` values used by inner pixels, and it is not simply the row
+count of each owning `outer.h5` artifact because retained asterism centers can
+fall outside the outer pixel whose inner pixels used them.
+
+The legacy-preserving Traversal artifact layout/schema is version 1. The
+replacement Traversal artifact layout/schema should be version 2 so old and new
+`outer.h5` products are not silently confused.
 
 ## Dense Fields
 

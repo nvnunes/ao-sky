@@ -245,6 +245,8 @@ Build execution is organized around restartable outer-pixel work.
   - explicit per-phase outer-pixel status for `gaia_loading` and `traversal`
   - per-phase attempt count and last error message
 - Aggregation is build-global rather than outer-pixel-local.
+- `winner_asterism_count` in aggregated maps is a center-owned
+  retained-catalog-derived count layer, not a normal inner-pixel reducer.
 - A normal build run may advance from `traversal` into `aggregation`
   automatically once all outer-pixel Traversal work is complete.
 - When survey overlays are configured, a normal build run may also advance from
