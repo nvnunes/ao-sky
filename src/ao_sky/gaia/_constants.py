@@ -43,19 +43,3 @@ GAIA_SUMMARY_DTYPE: Final[tuple[tuple[str, str], ...]] = (
 HDF5_COMPRESSION: Final[str] = "gzip"
 HDF5_COMPRESSION_OPTS: Final[int] = 9
 HDF5_SHUFFLE: Final[bool] = True
-
-HOUR_FOLDER_OVERRIDE_PIXELS: Final[frozenset[int]] = frozenset(
-    {
-        8960,
-        8972,
-        9023,
-        9152,
-        9200,
-        9203,
-        9215,
-        11264,
-        11312,
-        11327,
-        11468,
-    }
-)

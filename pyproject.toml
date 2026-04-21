@@ -28,11 +28,13 @@ dependencies = [
     "h5py>=3.0",
     "hdf5plugin>=6.0",
     "joblib>=1.5",
+    "matplotlib>=3.8",
     "mocpy>=0.18",
     "numpy>=1.26",
     "PyYAML>=6.0",
     "requests>=2.0",
     "scipy>=1.13",
+    "skyproj>=2.0",
 ]
 
 [project.urls]

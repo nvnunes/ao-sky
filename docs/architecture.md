@@ -116,6 +116,10 @@ The canonical package is split by ownership:
   - traversal
   - execution state
   - build runner orchestration
+- `ao_sky.artifacts`
+  - read-only facade for existing build artifacts
+  - dense map, outer-pixel, and pinned Gaia artifact loading
+  - no build execution or consumer-specific compatibility shaping
 - `ao_sky.survey`
   - survey-extent overlays
   - other all-sky augmentation layers

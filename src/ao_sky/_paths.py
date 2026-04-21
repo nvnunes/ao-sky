@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Final
 
 import numpy as np
 
-from .gaia._constants import HOUR_FOLDER_OVERRIDE_PIXELS
 from .spatial import get_pixel_skycoord
+
+
+HOUR_FOLDER_OVERRIDE_PIXELS: Final[frozenset[int]] = frozenset(
+    {
+        8960,
+        8972,
+        9023,
+        9152,
+        9200,
+        9203,
+        9215,
+        11264,
+        11312,
+        11327,
+        11468,
+    }
+)
 
 
 def get_outer_pixel_bucket_path(level: int, outer_pix: int) -> Path:

@@ -11,6 +11,7 @@ The supported public surface currently centers on:
 - `ao_sky.predict` for native prediction runtime records and array prediction helpers
 - `ao_sky.build` for persisted build roots, build state, and per-outer-pixel
   derived artifacts
+- `ao_sky.artifacts` for read-only access to existing build artifacts
 
 ## Current Public Surface
 
@@ -175,6 +176,18 @@ The current package-supported build API exposes:
 - `restart_build`
 - `run_build`
 - `show_build`
+
+### `ao_sky.artifacts`
+
+The current package-supported artifact-reader API exposes:
+
+- `AoSkyArtifactStore`
+- `MapData`
+
+`AoSkyArtifactStore` is a read-only facade over existing build artifacts. It
+loads build-local runtime configuration, dense map fields, per-outer `inner`
+and `asterisms` datasets, and pinned Gaia tables. It does not run build steps,
+materialize missing artifacts, or provide paper-specific compatibility columns.
 
 ## Core Read And Search Paths
 

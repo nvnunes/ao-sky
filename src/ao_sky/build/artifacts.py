@@ -374,6 +374,17 @@ def read_outer_dataset(filename: Path, dataset_name: str) -> Table:
         return Table(handle[dataset_name][...])
 
 
+
+def read_outer_products(filename: Path) -> tuple[Table, Table]:
+    """Read inner and retained-asterism datasets from one outer artifact."""
+
+    _ensure_artifact_hdf5_filters()
+    with h5py.File(filename, "r") as handle:
+        inner = Table(handle[OUTER_DATASET_INNER][...])
+        asterisms = Table(handle[OUTER_DATASET_ASTERISMS][...])
+    return inner, asterisms
+
+
 def read_maps_dataset(filename: Path, dataset_name: str = MAPS_DATASET) -> Table:
     """Read one dataset from a dense all-sky maps artifact."""
 
