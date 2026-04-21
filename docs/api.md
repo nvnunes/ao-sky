@@ -331,17 +331,21 @@ Behavior:
   `<build>/surveys/manifest.json`, and persist build-root-relative
   `surveys/<filename>` paths for augmentation
 
-### `run_build(build_path, *, workers=None, gaia_cache_entries=None, gaia_cache_mb=None, parent_memory_limit_mb=None, telemetry=None, aosky_yaml=None) -> Path`
+### `run_build(build_path, *, workers=None, scheduler=None, low_latitude_workers=None, gaia_cache_entries=None, gaia_cache_mb=None, parent_memory_limit_mb=None, telemetry=None, aosky_yaml=None) -> Path`
 
 Run one initialized build through its unfinished outer-pixel work and write
 `outer.h5` artifact containers.
 
 `workers` controls Traversal execution parallelism at execution time. When it
 is `None`, `ao-sky.yaml` may provide `build.workers`; otherwise the fallback is
-`1`. The single-worker fallback uses a long-lived in-process Traversal worker so
-runtime setup, model caches, and Gaia table caches are reused across outer
-pixels.
-Multi-worker runs use long-lived regional process workers. Cache-aware
+`1`. `scheduler` selects the multi-worker Traversal scheduler. `"static"` uses
+the legacy regional Galactic-latitude split and accepts `low_latitude_workers`.
+`"dynamic"` uses parent-owned RAM-aware batches and rejects
+`low_latitude_workers`; workers request batches at runtime while keeping model
+and Gaia caches warm. The single-worker fallback uses a long-lived in-process
+Traversal worker so runtime setup, model caches, and Gaia table caches are
+reused across outer pixels.
+Multi-worker runs use long-lived process workers. Cache-aware
 Traversal uses a worker-local runtime Gaia table cache controlled by
 `gaia_cache_entries` and `gaia_cache_mb`; set either to `0` only for cache-off
 benchmarks. Read prewarm and artifact write-behind were measured and rejected
@@ -376,7 +380,7 @@ Artifact writes are direct and worker-owned. SSD artifact staging was benchmarke
 and rejected as an active runtime option after Blosc Zstd made write latency
 negligible relative to Traversal compute.
 
-### `restart_build(..., workers=None, gaia_cache_entries=None, gaia_cache_mb=None, parent_memory_limit_mb=None, telemetry=None) -> Path`
+### `restart_build(..., workers=None, scheduler=None, low_latitude_workers=None, gaia_cache_entries=None, gaia_cache_mb=None, parent_memory_limit_mb=None, telemetry=None) -> Path`
 
 Resume the latest `v<N>` build under the lineage workspace, using the same
 execution-time worker-count contract as `run_build`.

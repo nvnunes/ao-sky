@@ -307,7 +307,7 @@ minimized.
 
 Seeing baseline is retained for continuous maps. If no AO candidate exists,
 persist the seeing baseline in `best_*`, leave `winner_asterism_id = -1`, and
-leave `winner_ee_resolved` and `winner_ee_averaged` as `NaN`.
+persist the seeing baseline in `winner_ee_resolved` and `winner_ee_averaged`.
 
 If an AO candidate exists but performs below seeing in EE, `best_*` may remain
 the seeing baseline while `winner_*` still records the selected AO asterism.

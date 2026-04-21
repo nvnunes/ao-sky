@@ -66,6 +66,7 @@ from ao_sky.build.model_snapshot import fetch_model_data
 from ao_sky.build.survey_snapshot import fetch_survey_data
 from ao_sky.build.scheduler import OuterPixelScheduler
 from ao_sky.build.regional import (
+    build_dynamic_work_batches,
     build_regional_worker_plans,
     order_region_outer_pixs,
 )
@@ -791,6 +792,8 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
             (
                 "build:",
                 "  workers: 5",
+                "  scheduler: static",
+                "  low_latitude_workers: 3",
                 "  memory_limit_mb: 12288",
                 "gaia_cache_entries: 128",
                 "gaia_cache_mb: 4096",
@@ -807,6 +810,8 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
 
     assert config == TraversalExecutionConfig(
         workers=5,
+        scheduler="static",
+        low_latitude_workers=3,
         gaia_cache_entries=128,
         gaia_cache_mb=4096,
         region_level=3,
@@ -820,6 +825,7 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
     override = resolve_traversal_execution_config(
         outer_level=6,
         workers=3,
+        low_latitude_workers=2,
         gaia_cache_entries=64,
         gaia_cache_mb=2048,
         parent_memory_limit_mb=8192,
@@ -827,6 +833,8 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
     )
     assert override == TraversalExecutionConfig(
         workers=3,
+        scheduler="static",
+        low_latitude_workers=2,
         gaia_cache_entries=64,
         gaia_cache_mb=2048,
         region_level=4,
@@ -847,6 +855,20 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
 def test_resolve_traversal_execution_config_validates_values(tmp_path: Path) -> None:
     with pytest.raises(BuildError, match="workers must be at least 1"):
         resolve_traversal_execution_config(outer_level=2, workers=0)
+    with pytest.raises(BuildError, match="low_latitude_workers"):
+        resolve_traversal_execution_config(
+            outer_level=2,
+            workers=3,
+            low_latitude_workers=4,
+        )
+    with pytest.raises(BuildError, match="scheduler must be either"):
+        resolve_traversal_execution_config(outer_level=2, scheduler="other")
+    with pytest.raises(BuildError, match="only supported by the static scheduler"):
+        resolve_traversal_execution_config(
+            outer_level=2,
+            scheduler="dynamic",
+            low_latitude_workers=1,
+        )
     with pytest.raises(BuildError, match="gaia_cache_entries must be non-negative"):
         resolve_traversal_execution_config(outer_level=2, gaia_cache_entries=-1)
     with pytest.raises(BuildError, match="memory_limit_mb must be non-negative"):
@@ -888,6 +910,33 @@ def test_regional_worker_plans_can_reserve_low_latitude_workers() -> None:
     assert {plan.worker_id for plan in plans} == {0, 1, 2}
     assert sorted(pix for plan in plans for pix in plan.outer_pixs) == list(range(64))
     assert sum(plan.estimated_star_count for plan in plans) == int(np.sum(star_counts))
+
+
+
+
+def test_dynamic_work_batches_classify_stress_and_compute_workers() -> None:
+    state = _make_scheduler_state([WORK_STATUS_PENDING] * 64)
+    star_counts = np.full(64, 1_000, dtype=np.int64)
+    star_counts[32:40] = 500_000
+
+    schedule = build_dynamic_work_batches(
+        state=state,
+        outer_level=2,
+        workers=4,
+        status_field="traversal_status",
+        star_counts=star_counts,
+        memory_limit_mb=8192,
+        trim_fraction=0.85,
+        worker_ram_overhead_mb=0.0,
+    )
+
+    assert schedule.stress_star_threshold > 0
+    assert schedule.stress_worker_count >= 1
+    assert any(batch.is_stress for batch in schedule.batches)
+    assert any(not batch.is_stress for batch in schedule.batches)
+    assert sorted(pix for batch in schedule.batches for pix in batch.outer_pixs) == list(range(64))
+    assert all(batch.region_level == 1 for batch in schedule.batches if batch.is_stress)
+    assert all(batch.region_level == 0 for batch in schedule.batches if not batch.is_stress)
 
 
 def test_order_region_outer_pixs_prefers_neighbours(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1689,7 +1738,8 @@ def test_run_build_parallel_workers_continue_after_failed_outer_pixel(
     summary = summarize_build(build_path)
     assert summary["build_status"] == "failed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "phase=traversal worker=0 outer_pix=0 failed: boom" in log_text
+    assert "phase=traversal worker=0 outer_pixel_failed outer_pix=0" in log_text
+    assert "error=boom" in log_text
     assert "run complete phase=traversal status=failed" in log_text
 
 
@@ -2549,6 +2599,8 @@ def test_restart_build_uses_latest_lineage_version(
         build_path: Path,
         *,
         workers: int | None = None,
+        scheduler: str | None = None,
+        low_latitude_workers: int | None = None,
         gaia_cache_entries: int | None = None,
         gaia_cache_mb: int | None = None,
         parent_memory_limit_mb: int | None = None,
@@ -2556,6 +2608,8 @@ def test_restart_build_uses_latest_lineage_version(
         aosky_yaml: Path | None = None,
     ) -> Path:
         captured["workers"] = workers
+        captured["scheduler"] = scheduler
+        captured["low_latitude_workers"] = low_latitude_workers
         captured["gaia_cache_entries"] = gaia_cache_entries
         captured["gaia_cache_mb"] = gaia_cache_mb
         captured["parent_memory_limit_mb"] = parent_memory_limit_mb
@@ -2569,11 +2623,14 @@ def test_restart_build_uses_latest_lineage_version(
         lineage_name="baseline",
         build_root=build_root,
         workers=3,
+        low_latitude_workers=2,
     )
 
     assert restarted == latest
     assert captured == {
         "workers": 3,
+        "scheduler": None,
+        "low_latitude_workers": 2,
         "gaia_cache_entries": None,
         "gaia_cache_mb": None,
         "parent_memory_limit_mb": None,
@@ -2685,7 +2742,8 @@ def test_run_build_continues_after_failure_and_marks_build_failed(
     summary = summarize_build(build_path)
     assert summary["build_status"] == "failed"
     log_text = (build_path / "build.log").read_text(encoding="utf-8")
-    assert "phase=traversal worker=0 outer_pix=0 failed: boom" in log_text
+    assert "phase=traversal worker=0 outer_pixel_failed outer_pix=0" in log_text
+    assert "error=boom" in log_text
     assert "run complete phase=traversal status=failed" in log_text
 
 

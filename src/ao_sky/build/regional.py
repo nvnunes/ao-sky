@@ -8,13 +8,21 @@ import numpy as np
 
 from ..spatial import get_parent_pixel, get_pixel_neighbours, get_pixel_skycoord
 from ._constants import WORK_STATUS_FAILED, WORK_STATUS_PENDING
-from ._models import TraversalWorkerPlan
+from ._models import (
+    DynamicTraversalSchedule,
+    TraversalWorkBatch,
+    TraversalWorkerPlan,
+)
 
 REGIONAL_SCHEDULE_SECONDS_COEFFICIENT = 6.8603409602539e-05
 REGIONAL_SCHEDULE_SECONDS_STAR_EXPONENT = 1.2184647278722778
 REGIONAL_SCHEDULE_SECONDS_DENSE_CAP = 18.58285714285714
 REGIONAL_SCHEDULE_THROUGHPUT_SCALE = 0.5
 GALACTIC_LATITUDE_LOW_BAND_DEG = 15.0
+DYNAMIC_WORKER_RSS_INTERCEPT_GIB = 0.914584
+DYNAMIC_WORKER_RSS_SLOPE_GIB_PER_STAR = 0.000004256378
+DYNAMIC_RUNTIME_TRANSITION_START_STARS = 20_000.0
+DYNAMIC_RUNTIME_TRANSITION_END_STARS = 33_000.0
 
 
 def build_regional_worker_plans(
@@ -172,6 +180,85 @@ def build_regional_worker_plans(
     return tuple(plans)
 
 
+def build_dynamic_work_batches(
+    *,
+    state: np.ndarray,
+    outer_level: int,
+    workers: int,
+    status_field: str,
+    star_counts: np.ndarray,
+    memory_limit_mb: float,
+    trim_fraction: float,
+    worker_ram_overhead_mb: float,
+) -> DynamicTraversalSchedule:
+    """Return parent-owned dynamic Traversal batches.
+
+    The dynamic schedule classifies RAM-stress pixels from Gaia star counts,
+    groups stress work into small spatial batches, groups normal work into
+    larger spatial batches, and computes the number of stress workers needed to
+    avoid turning stress work into the long tail.
+    """
+
+    eligible = [
+        int(row["outer_pix"])
+        for row in state
+        if int(row[status_field]) in (WORK_STATUS_PENDING, WORK_STATUS_FAILED)
+    ]
+    if not eligible:
+        return DynamicTraversalSchedule(
+            batches=(),
+            stress_star_threshold=float("inf"),
+            stress_worker_count=0,
+        )
+
+    stress_threshold = dynamic_stress_star_threshold(
+        memory_limit_mb=memory_limit_mb,
+        workers=workers,
+        trim_fraction=trim_fraction,
+        worker_ram_overhead_mb=worker_ram_overhead_mb,
+    )
+    stress_outer_pixs = sorted(
+        (
+            int(outer_pix)
+            for outer_pix in eligible
+            if int(star_counts[int(outer_pix)]) > stress_threshold
+        ),
+        key=lambda pix: (-int(star_counts[int(pix)]), int(pix)),
+    )
+    normal_outer_pixs = [
+        int(outer_pix)
+        for outer_pix in eligible
+        if int(star_counts[int(outer_pix)]) <= stress_threshold
+    ]
+    stress_batches = _build_dynamic_batches(
+        stress_outer_pixs,
+        outer_level=outer_level,
+        batch_level=max(0, int(outer_level) - 1),
+        is_stress=True,
+        descending=True,
+        star_counts=star_counts,
+        worker_ram_overhead_mb=worker_ram_overhead_mb,
+    )
+    normal_batches = _build_dynamic_batches(
+        normal_outer_pixs,
+        outer_level=outer_level,
+        batch_level=max(0, int(outer_level) - 3),
+        is_stress=False,
+        descending=False,
+        star_counts=star_counts,
+        worker_ram_overhead_mb=worker_ram_overhead_mb,
+    )
+    return DynamicTraversalSchedule(
+        batches=tuple(stress_batches + normal_batches),
+        stress_star_threshold=float(stress_threshold),
+        stress_worker_count=_choose_stress_worker_count(
+            stress_batches=stress_batches,
+            normal_batches=normal_batches,
+            workers=workers,
+        ),
+    )
+
+
 def order_region_outer_pixs(
     outer_pixs: list[int] | tuple[int, ...],
     *,
@@ -220,6 +307,153 @@ def _region_star_count(
     star_counts: np.ndarray,
 ) -> int:
     return sum(int(star_counts[int(pix)]) for pix in outer_pixs)
+
+
+def dynamic_stress_star_threshold(
+    *,
+    memory_limit_mb: float,
+    workers: int,
+    trim_fraction: float,
+    worker_ram_overhead_mb: float,
+) -> float:
+    """Return the star-count threshold used to classify RAM-stress pixels."""
+
+    if float(memory_limit_mb) <= 0.0:
+        return float("inf")
+    target_gib = (float(memory_limit_mb) / 1024.0) * float(trim_fraction)
+    per_worker_budget_gib = target_gib / max(int(workers), 1)
+    return max(
+        0.0,
+        (
+            per_worker_budget_gib
+            - float(worker_ram_overhead_mb) / 1024.0
+            - DYNAMIC_WORKER_RSS_INTERCEPT_GIB
+        )
+        / DYNAMIC_WORKER_RSS_SLOPE_GIB_PER_STAR,
+    )
+
+
+def dynamic_worker_ram_mb(
+    star_count: int,
+    *,
+    worker_ram_overhead_mb: float,
+) -> float:
+    """Return estimated worker RAM for dynamic scheduling."""
+
+    rss_gib = DYNAMIC_WORKER_RSS_INTERCEPT_GIB + (
+        DYNAMIC_WORKER_RSS_SLOPE_GIB_PER_STAR * max(float(star_count), 0.0)
+    )
+    return 1024.0 * rss_gib + float(worker_ram_overhead_mb)
+
+
+def dynamic_outer_pixel_seconds(star_count: int) -> float:
+    """Return the calibrated dynamic-scheduler runtime proxy."""
+
+    u = max(float(star_count), 0.0) / 1000.0
+    transition_start = DYNAMIC_RUNTIME_TRANSITION_START_STARS / 1000.0
+    transition_end = DYNAMIC_RUNTIME_TRANSITION_END_STARS / 1000.0
+    if u <= transition_start:
+        seconds = 0.571526 - 0.182845 * u + 0.0725123 * u * u
+    elif u <= transition_end:
+        v = u - transition_start
+        seconds = 25.9196 - 1.45735 * v + 0.0445096 * v * v
+    else:
+        v = u - transition_end
+        seconds = 14.4961 + 0.00559679 * v + 0.00000504397 * v * v
+    return max(float(seconds), 0.1)
+
+
+def _build_dynamic_batches(
+    outer_pixs: list[int],
+    *,
+    outer_level: int,
+    batch_level: int,
+    is_stress: bool,
+    descending: bool,
+    star_counts: np.ndarray,
+    worker_ram_overhead_mb: float,
+) -> list[TraversalWorkBatch]:
+    if not outer_pixs:
+        return []
+    outer_array = np.asarray(outer_pixs, dtype=np.int64)
+    region_array = get_parent_pixel(int(outer_level), outer_array, int(batch_level))
+    grouped: dict[int, list[int]] = defaultdict(list)
+    for outer_pix, region_pix in zip(outer_array, region_array, strict=True):
+        grouped[int(region_pix)].append(int(outer_pix))
+
+    region_pixs = np.asarray(sorted(grouped), dtype=np.int64)
+    region_coords = get_pixel_skycoord(int(batch_level), region_pixs)
+    region_vectors = np.asarray(region_coords.icrs.cartesian.xyz.value.T, dtype=float)
+    center_vectors = {
+        int(region_pix): tuple(float(value) for value in vector)
+        for region_pix, vector in zip(region_pixs, region_vectors, strict=True)
+    }
+
+    batches: list[TraversalWorkBatch] = []
+    for region_pix, members in grouped.items():
+        ordered_outer_pixs = tuple(
+            sorted(
+                (int(pix) for pix in members),
+                key=lambda pix: (
+                    -int(star_counts[int(pix)])
+                    if descending
+                    else int(star_counts[int(pix)]),
+                    int(pix),
+                ),
+            )
+        )
+        peak_stars = max(int(star_counts[int(pix)]) for pix in ordered_outer_pixs)
+        sort_star_count = (
+            peak_stars
+            if descending
+            else min(int(star_counts[int(pix)]) for pix in ordered_outer_pixs)
+        )
+        batches.append(
+            TraversalWorkBatch(
+                region_level=int(batch_level),
+                region_pix=int(region_pix),
+                outer_pixs=ordered_outer_pixs,
+                is_stress=bool(is_stress),
+                sort_star_count=int(sort_star_count),
+                estimated_seconds=sum(
+                    dynamic_outer_pixel_seconds(int(star_counts[int(pix)]))
+                    for pix in ordered_outer_pixs
+                ),
+                estimated_ram_mb=dynamic_worker_ram_mb(
+                    peak_stars,
+                    worker_ram_overhead_mb=worker_ram_overhead_mb,
+                ),
+                center_vector=center_vectors[int(region_pix)],
+            )
+        )
+    return sorted(
+        batches,
+        key=lambda batch: (
+            -int(batch.sort_star_count) if descending else int(batch.sort_star_count),
+            int(batch.region_pix),
+        ),
+    )
+
+
+def _choose_stress_worker_count(
+    *,
+    stress_batches: list[TraversalWorkBatch],
+    normal_batches: list[TraversalWorkBatch],
+    workers: int,
+) -> int:
+    if not stress_batches:
+        return 0
+    worker_count = max(int(workers), 1)
+    stress_seconds = sum(float(batch.estimated_seconds) for batch in stress_batches)
+    normal_seconds = sum(float(batch.estimated_seconds) for batch in normal_batches)
+    total_seconds = stress_seconds + normal_seconds
+    if total_seconds <= 0.0:
+        return 1
+    target_elapsed = total_seconds / float(worker_count)
+    needed = int(np.ceil(stress_seconds / target_elapsed))
+    if normal_batches:
+        return max(1, min(needed, worker_count - 1))
+    return max(1, min(needed, worker_count))
 
 
 def _region_peak_star_count(

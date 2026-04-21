@@ -443,6 +443,7 @@ repo-native correctness checks in `pytest`.
 The current full-build operating default on the local workstation is:
 
 - `build.workers: 9`
+- `build.scheduler: dynamic`
 - `build.memory_limit_mb: 26624`
 - `prediction.resolved_device: auto`
 - `prediction.averaged_device: auto`
@@ -464,6 +465,64 @@ cd /Volumes/Data/Galaxy/aosky/gnao-baseline
 ./ao-sky show v1
 ./ao-sky restart v1
 ```
+
+### Long-Running Build Supervision
+
+Use this procedure for overnight or unattended local full-sky builds. It is an
+operational monitoring loop, not a correctness test.
+
+Launch the build under `caffeinate` so the workstation does not sleep:
+
+```bash
+cd /Volumes/Data/Galaxy/aosky/gnao-baseline
+caffeinate -dimsu ./ao-sky restart v2
+```
+
+Every `10` minutes, check that the run is alive and progressing:
+
+```bash
+ps -axww | rg -i 'ao-sky restart v2|caffeinate -dimsu ./ao-sky restart v2'
+./ao-sky show v2
+```
+
+Then inspect `build.log` for:
+
+- completed outer-pixel count
+- failed outer-pixel count
+- pending/remaining outer-pixel count
+- recent throughput, usually over the last `10` minutes
+- overall throughput
+- ETA from recent throughput
+- memory-pressure state counts: normal, trim, and pause
+- latest total RAM
+- peak total RAM
+
+The monitor should continue the run when progress is steady, failures are zero,
+and memory pressure is not sustained. Stop and inspect when any of the following
+occur:
+
+- failed outer pixels appear
+- the build process exits unexpectedly
+- memory spends sustained time in pause
+- trim/pause dominates throughput
+- total RAM approaches the hard ceiling
+- throughput stalls for multiple check intervals
+
+If the process exits but the build is restartable, inspect `./ao-sky show`,
+review the recent `build.log` tail, and restart with `./ao-sky restart <build>`.
+The runner repairs stale `running` rows to `pending` at restart. If the run was
+manually interrupted, expect the persisted state to show a small number of stale
+`running` rows corresponding to in-flight worker pixels.
+
+When stopping a supervised run for analysis, record:
+
+- final process state
+- `./ao-sky show <build>` output
+- log-derived completed, failed, and remaining counts
+- last-10-minute, last-30-minute, and last-hour throughput
+- normal/trim/pause counts
+- latest and peak total RAM
+- archive location for `build.log`, `build.h5`, and `build.yaml`
 
 ## Developer Script Policy
 

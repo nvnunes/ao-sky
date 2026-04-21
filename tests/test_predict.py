@@ -1491,6 +1491,21 @@ def test_build_base_inner_table_ignores_invalid_runtime_gaia_rows(tmp_path: Path
     assert int(np.sum(inner["ngs_count"])) == 1
 
 
+def test_build_base_inner_table_initializes_winners_to_seeing_baseline(tmp_path: Path) -> None:
+    runtime = replace(
+        _make_predict_runtime(model_root=tmp_path / "models", fov=30.0 * u.deg),
+        seeing_reference_ee=0.02,
+    )
+
+    inner = build_base_inner_table(_FakeStore(), runtime, 0)
+    baseline = predict_service.get_seeing_baseline_performance(runtime)
+
+    assert np.allclose(inner["best_ee"], baseline.ee)
+    assert np.allclose(inner["winner_ee_resolved"], baseline.ee)
+    assert np.allclose(inner["winner_ee_averaged"], baseline.ee)
+    assert np.all(np.asarray(inner["winner_asterism_id"], dtype=np.int64) == -1)
+
+
 def test_build_base_inner_table_uses_runtime_gaia_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

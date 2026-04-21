@@ -2181,7 +2181,7 @@ cover fewer eligible inner pixels.
 
 ### RAM Estimate
 
-![Traversal worker RAM versus Gaia star count](assets/regional-for-worker-ram-trend.png)
+![Traversal worker RAM versus Gaia star count](assets/benchmarking/0.1.0/regional-for-worker-ram-trend.png)
 
 A sublinear power-law fit gives a useful rough worker-RAM trend for scheduling:
 
@@ -2215,7 +2215,7 @@ observed worker RSS remain the authority for machine-specific limits.
 
 ### Runtime Estimate
 
-![Traversal outer-pixel runtime versus Gaia star count](assets/regional-schedule-time-fit.png)
+![Traversal outer-pixel runtime versus Gaia star count](assets/benchmarking/0.1.0/regional-schedule-time-fit.png)
 
 Outer-pixel runtime is estimated with a piecewise fit. A power law is fit to
 the pre-saturation points below `25,000` total stars, and the estimate is then
@@ -2308,11 +2308,11 @@ GPU results:
 | `8` | `127.13 s` | `0.059` | `14.8 GiB` | `8.4 GiB` | `23.2 GiB` | `78.0 s` | `2.5 s` |
 | `9` | `124.61 s` | `0.054` | `14.8 GiB` | `9.4 GiB` | `24.2 GiB` | `79.1 s` | `2.7 s` |
 
-![Worker trade wall time](assets/phase14-worker-trade-wall-time.png)
+![Worker trade wall time](assets/benchmarking/0.1.0/phase14-worker-trade-wall-time.png)
 
-![Worker trade total RAM](assets/phase14-worker-trade-total-ram.png)
+![Worker trade total RAM](assets/benchmarking/0.1.0/phase14-worker-trade-total-ram.png)
 
-![Worker trade throughput](assets/phase14-worker-trade-throughput.png)
+![Worker trade throughput](assets/benchmarking/0.1.0/phase14-worker-trade-throughput.png)
 
 Linear per-worker throughput fits over this sample:
 
@@ -2360,7 +2360,7 @@ pixel. The aim is to stay below the configured high-water limit even when
 Python or Torch memory retention prevents the real curve from following the
 simulation exactly.
 
-### Simulation
+### Original Simulation
 
 A runtime simulation is available in `scripts/simulate_regional_schedule_memory.py`.
 The script treats each outer pixel as holding its estimated peak worker RAM for
@@ -2378,7 +2378,7 @@ overhead_needed = real_total_ram - simulated_active_ram
 simulated_active_ram = simulated_worker_ram + simulated_gpu_ram
 ```
 
-![Regional schedule RAM overhead fit](assets/regional-schedule-ram-overhead-fit.png)
+![Regional schedule RAM overhead fit](assets/benchmarking/0.1.0/regional-schedule-ram-overhead-fit.png)
 
 Current linear overhead fit:
 
@@ -2422,10 +2422,10 @@ benchmarks:
   --workers 3 \
   --throughput-device gpu \
   --per-worker-gpu-overhead-gib 1.05 \
-  --plot-output docs/assets/regional-schedule-ram-simulation-288.png
+  --plot-output docs/assets/benchmarking/0.1.0/regional-schedule-ram-simulation-288.png
 ```
 
-![Simulated 288-pixel regional Traversal RAM over time](assets/regional-schedule-ram-simulation-288.png)
+![Simulated 288-pixel regional Traversal RAM over time](assets/benchmarking/0.1.0/regional-schedule-ram-simulation-288.png)
 
 Comparison to the real dense-ladder GPU run on the same sample:
 
@@ -2490,12 +2490,27 @@ The selected full-sky simulation is the fastest split under the configured total
   --schedule-full-sky \
   --workers 9 \
   --galactic-low-latitude-workers 6 \
+  --scheduler static \
   --throughput-device gpu \
   --per-worker-gpu-overhead-gib 1.05 \
-  --plot-output docs/assets/regional-schedule-ram-simulation-full-sky.png
+  --memory-limit-mb 26624 \
+  --trim-fraction 0.80 \
+  --pause-fraction 0.90 \
+  --plot-output docs/assets/benchmarking/0.1.0/regional-schedule-ram-simulation-full-sky.png \
+  --throughput-plot-output docs/assets/benchmarking/0.1.0/regional-schedule-throughput-simulation-full-sky.png
 ```
 
-![Simulated full-sky regional Traversal RAM over time](assets/regional-schedule-ram-simulation-full-sky.png)
+![Simulated full-sky regional Traversal RAM over time](assets/benchmarking/0.1.0/regional-schedule-ram-simulation-full-sky.png)
+
+The black dashed line marks `build.memory_limit_mb = 26624`; the orange and
+red dashed lines mark the overnight trim and pause entry thresholds.
+
+The matching cumulative completion plot shows simulated pixel throughput over
+time. The slope of the dark cumulative curve is the instantaneous simulated
+throughput; the dashed black line connects `(0, 0)` to the final simulated
+completion point, and its annotated slope is the end-to-end average throughput.
+
+![Simulated full-sky regional Traversal throughput over time](assets/benchmarking/0.1.0/regional-schedule-throughput-simulation-full-sky.png)
 
 Interpretation:
 
@@ -2524,3 +2539,587 @@ Interpretation:
   dense inference shapes, and no routine cache clear all appeared in telemetry.
 - The smoke completed without memory-pressure failure and stayed far below the
   `26 GiB` guard on this small sample.
+
+## 2026-04-19 Phase 14B First Full-Sky Runtime Evidence
+
+The first production `v1` full-sky attempt was started with the retained Phase
+14 policy: GPU prediction, dense inference-shape control, `9` workers, and a
+`26624 MiB` parent total-RAM ceiling. The run was stopped deliberately before
+Phase 15 discussion; no outer pixels had failed, and stale `running` rows are
+repaired to `pending` on restart.
+
+### v1 Run 1: Workers `9`/`6`
+
+Measured state at stop:
+
+| Policy | Window Elapsed | Completed | Throughput | Normal | Trim | Pause | Peak Total RAM | Remaining ETA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `9/6` | `6.84 h` | `19,781` | `0.80 pix/s` | `2` | `1,331` | `1,088` | `25.48 GiB` | `10.2 h` |
+
+Measured RAM and throughput plots use the `9`/`6` run window in `build.log`:
+
+```bash
+./.conda/bin/python scripts/plot_build_memory_timeline.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1/build.log \
+  --since 2026-04-19T04:49:25.703372+00:00 \
+  --until 2026-04-19T18:59:50.087984+00:00 \
+  --output docs/assets/benchmarking/0.1.0/phase14b-9w6-measured-ram.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/phase14b-9w6-measured-throughput.png
+```
+
+![Measured 9/6 RAM timeline](assets/benchmarking/0.1.0/phase14b-9w6-measured-ram.png)
+
+![Measured 9/6 throughput timeline](assets/benchmarking/0.1.0/phase14b-9w6-measured-throughput.png)
+
+The `9`/`6` throughput plot is reconstructed from periodic progress/profile
+samples because this first run log predates per-pixel `outer_pixel_done`
+records.
+
+Interpretation:
+
+- The `9`/`6` policy was too aggressive for the configured memory ceiling: only
+  `2` memory samples were normal, while `1,331` were in trim and `1,088` were
+  in pause.
+- Sustained trim/pause made the hard memory ceiling the operating point, which
+  is not desirable because trim is expensive and pause is more expensive.
+- Conclusion: the next run should reduce memory pressure by testing `8`
+  workers with `5` low-latitude workers, while raising the guard bands to
+  trim at `85%`/release at `80%` and pause at `95%`/release at `90%` so trim is
+  no longer the normal operating state.
+
+### v1 Run 2: Workers `8`/`5`
+
+Measured state at stop:
+
+| Policy | Window Elapsed | Completed | Throughput | Normal | Trim | Pause | Peak Total RAM | Remaining ETA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `8/5` | `2.66 h` | `8,372` | `0.87 pix/s` | `160` | `5` | `0` | `22.3 GiB` | `6.7 h` |
+
+Measured RAM and throughput plots use the `8`/`5` run window in `build.log`:
+
+```bash
+./.conda/bin/python scripts/plot_build_memory_timeline.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1/build.log \
+  --since 2026-04-19T18:59:50.087984+00:00 \
+  --until 2026-04-19T21:39:37+00:00 \
+  --output docs/assets/benchmarking/0.1.0/phase14b-8w5-measured-ram.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/phase14b-8w5-measured-throughput.png
+```
+
+![Measured 8/5 RAM timeline](assets/benchmarking/0.1.0/phase14b-8w5-measured-ram.png)
+
+![Measured 8/5 throughput timeline](assets/benchmarking/0.1.0/phase14b-8w5-measured-throughput.png)
+
+Interpretation:
+
+- The `8`/`5` run stayed mostly below the trim threshold: `160` samples were
+  normal, `5` were in trim, and none were in pause.
+- Throughput improved to `0.87 pix/s` despite using one fewer worker than the
+  `9`/`6` run, confirming that reduced memory pressure can beat nominal
+  parallelism.
+- Conclusion: `8`/`5` is the current best measured policy, but the next
+  matched-duration check should test `7` workers with `4` low-latitude workers.
+  The better of `8`/`5` and `7`/`4` should be retained for continuing the full
+  build.
+
+### v1 Run 3: Workers `8`/`2`
+
+Measured state at completion:
+
+| Policy | Window Elapsed | Completed | Throughput | Normal | Trim | Pause | Peak Total RAM | Remaining ETA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `8/2` | `3.75 h` | `21,029` | `1.56 pix/s` | `224` | `0` | `0` | `20.67 GiB` | `0 h` |
+
+Measured RAM and throughput plots use the final `8`/`2` run window in
+`build.log`:
+
+```bash
+./.conda/bin/python scripts/plot_build_memory_timeline.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1/build.log \
+  --since 2026-04-20T05:16:25.554548+00:00 \
+  --until 2026-04-20T09:01:38.859890+00:00 \
+  --output docs/assets/benchmarking/0.1.0/phase14b-8w2-measured-ram.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/phase14b-8w2-measured-throughput.png
+```
+
+![Measured 8/2 RAM timeline](assets/benchmarking/0.1.0/phase14b-8w2-measured-ram.png)
+
+![Measured 8/2 throughput timeline](assets/benchmarking/0.1.0/phase14b-8w2-measured-throughput.png)
+
+Interpretation:
+
+- The `8`/`2` restart completed the remaining `21,029` outer pixels and
+  finished traversal with `failed=0`.
+- Memory stayed entirely below the trim threshold: all `224` memory samples
+  were normal, with no trim or pause commands.
+- Throughput increased to `1.56 pix/s`, but this window was mostly the
+  remaining high-latitude and lower-density work, so it should not be compared
+  directly against the earlier mixed-density windows as a full-sky policy
+  estimate.
+- Conclusion: for the remainder left after the first two runs, reducing the
+  low-latitude worker allocation to `2` gave enough memory headroom to finish
+  without pressure while keeping all active work moving quickly.
+
+### Real-Run Comparison
+
+The direct measured comparison uses elapsed time from the start of each run
+window. The `9`/`6` window is the first full-sky attempt; the `8`/`5` window is
+the lower-pressure restart; the `8`/`2` window is the final completion run.
+These plots compare live behavior without invoking the simulator.
+
+```bash
+./.conda/bin/python scripts/plot_build_run_comparison.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1/build.log \
+  --run "9/6,2026-04-19T04:49:25.703372+00:00,2026-04-19T18:59:50.087984+00:00" \
+  --run "8/5,2026-04-19T18:59:50.087984+00:00,2026-04-19T21:39:37+00:00" \
+  --run "8/2,2026-04-20T05:16:25.554548+00:00,2026-04-20T09:01:38.859890+00:00" \
+  --ram-output docs/assets/benchmarking/0.1.0/phase14b-real-run-ram-comparison.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/phase14b-real-run-throughput-comparison.png
+```
+
+![Measured total-RAM comparison](assets/benchmarking/0.1.0/phase14b-real-run-ram-comparison.png)
+
+![Measured throughput comparison](assets/benchmarking/0.1.0/phase14b-real-run-throughput-comparison.png)
+
+Interpretation:
+
+- The `9`/`6` run reached and sustained higher total RAM, including a long
+  period near the trim/pause region.
+- The `8`/`5` run stayed substantially lower in RAM and completed pixels at a
+  steeper live rate over the measured window.
+- The `8`/`2` run had the lowest RAM pressure and highest measured throughput,
+  but it processed the final remaining work rather than a representative
+  full-sky mix.
+- The static scheduler evidence is sufficient for the completed `v1` build,
+  but the windows also motivate the Phase 14C dynamic scheduler work: the best
+  worker split depends strongly on the density mix left in the queue.
+
+### Updated Simulation (Based on Run 2: 8/5)
+
+The following script regenerates the plots in this section using the
+information from the measured `8`/`5` window, including the runtime model,
+stochastic runtime realization, RAM cloud, high-water plateau fit, and leaky
+current-RSS and total-RAM models.
+
+```bash
+./.conda/bin/python scripts/plot_build_outer_pixel_runtime_ram.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1/build.log \
+  --since 2026-04-19T18:59:50.087984+00:00 \
+  --until 2026-04-19T21:39:37+00:00 \
+  --output-dir docs/assets/benchmarking/0.1.0 \
+  --prefix phase14b-8w5
+```
+
+#### Runtime
+
+The `8`/`5` window includes per-pixel `outer_pixel_start` and
+`outer_pixel_done` records, so outer-pixel runtime can be compared directly
+against the loaded Gaia star count.
+
+![8/5 measured outer-pixel runtime versus star count](assets/benchmarking/0.1.0/phase14b-8w5-runtime-model.png)
+
+Interpretation: runtime appears to move from a sparse regime into a transition
+region where some of the outer pixel is routed through regional FOR-optimized
+NGS selection, then flattens once the selector dominates and caps the dense
+field candidate work. The retained scheduling runtime model is fit to
+log-spaced binned medians from the `8`/`5` run using fixed breakpoints at
+`20k` and `33k` Gaia stars, with quadratic branches in all three regimes and
+continuity forced at both joins. This may be worker-count dependent, so use it
+as an `8`-worker model while developing the next scheduler.
+
+With `u = total_gaia_stars / 1000`, the model is:
+
+```text
+t = 0.572 - 0.183 u + 0.0725 u^2,                         u <= 20
+t = 25.920 - 1.457 (u - 20) + 0.0445 (u - 20)^2,      20 < u <= 33
+t = 14.496 + 0.00560 (u - 33) + 0.00000504 (u - 33)^2,      u > 33
+```
+
+The stochastic runtime layer is also tied to the same three intervals. It uses
+additive Student-t residuals with `7` degrees of freedom, smooth fitted
+scatter in the sparse and dense intervals, one scatter value in the transition
+interval, and a `28 s` cap applied only to sparse and transition realized
+runtimes:
+
+```text
+t_realized = max(0.1, t_model + noise)
+t_realized = min(28.0, t_realized) for sparse and transition pixels only
+
+sparse:      noise ~ t_7(mu=-0.007, sigma=sigma_sparse(u))
+transition:  noise ~ t_7(mu=-0.250, sigma=3.001)
+dense:       noise ~ t_7(mu= 0.002, sigma=sigma_dense(u))
+
+log sigma_sparse(u) = -5.044 (u / 20)^2 + 10.876 (u / 20) - 4.401
+log sigma_dense(u)  =  0.0914 log(u / 33)^2 - 0.328 log(u / 33) + 0.209
+```
+
+![8/5 measured versus stochastic runtime realization](assets/benchmarking/0.1.0/phase14b-8w5-runtime-stochastic.png)
+
+| Dataset | Mean | P50 | P90 | P95 | P99 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Measured `8`/`5` | `9.09 s` | `8.87 s` | `18.51 s` | `21.86 s` | `26.23 s` | `30.12 s` |
+| Synthetic realization | `8.99 s` | `8.95 s` | `17.98 s` | `21.43 s` | `26.34 s` | `28.00 s` |
+
+#### RAM
+
+The same `8`/`5` log window records `peak_rss_mb` when each outer pixel
+finishes. This is a worker-process high-water value, not the isolated memory
+cost of the individual pixel, so the RAM cloud shows plateaus after each
+worker has seen a memory-heavy pixel.
+
+![8/5 worker peak RSS versus star count](assets/benchmarking/0.1.0/phase14b-8w5-peak-rss-vs-stars.png)
+
+The plateau structure can be made more useful by reconstructing each worker's
+completed-pixel sequence over time. For each worker, the largest Gaia star
+count seen so far was tracked, and a new point was retained only when that
+worker's reported `peak_rss_mb` high-water changed. This converts the previous
+RAM cloud into high-water plateau points and fits worker RSS against the
+largest pixel that worker has processed. This produced `148` RSS high-water
+plateau points. The fit is worker RSS only; it does not include GPU/MPS
+reserve, parent process memory, or system overhead.
+
+![8/5 worker peak RSS plateau fit](assets/benchmarking/0.1.0/phase14b-8w5-rss-plateau-vs-max-stars.png)
+
+The retained worker-RSS high-water fit is linear in the maximum star count
+seen by that worker. This is the deterministic RAM model used for static
+scheduling because it estimates the retained high-water memory pressure from
+cheap per-pixel star-count metadata:
+
+```text
+worker_peak_rss_gib = 0.915 + 4.256e-6 * max_star_count_seen_by_worker
+```
+
+The fit has `RMSE = 0.226 GiB` and `R2 = 0.958` over the `8`/`5` plateau
+points. Total build RAM must add GPU reserve and parent/system overhead on top
+of the summed worker-RSS estimate.
+
+For the real-system simulation, current RSS is modeled by adding memory
+release behavior to the deterministic plateau fit. The plateau fit is used as
+an instantaneous memory demand from the current pixel's star count, and each
+worker carries a leaky RAM state that decays toward a worker-class floor unless
+a larger current-pixel demand raises it:
+
+```text
+demand_gib = 0.915 + 4.256e-6 * current_pixel_star_count
+state(t) = floor_class + (state_previous - floor_class) * exp(-dt / tau_class)
+state(t) = max(state(t), demand_gib)
+```
+
+The `8`/`5` scheduler has two useful worker classes. Workers `W0-W4` are the
+intended low-latitude workers and follow denser star-count trajectories, so
+they need a higher floor and slower decay. Workers `W5-W7` are the intended
+high-latitude workers and mostly process sparse or moderate pixels, so they
+relax faster toward a lower floor.
+
+| Class | Workers | Floor | Tau | RMSE | Bias |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Low-latitude | `W0-W4` | `1.29 GiB` | `2.5 min` | `0.332 GiB` | `+0.004 GiB` |
+| High-latitude | `W5-W7` | `0.93 GiB` | `0.5 min` | `0.173 GiB` | `+0.001 GiB` |
+
+Against current worker-RSS snapshots from the `8`/`5` run, the two-class model
+gives `RMSE = 0.283 GiB`, `bias = +0.003 GiB`, and `corr = 0.886`. This is
+still worker RSS only.
+
+For dynamic-scheduler simulations, the same two fitted classes are interpreted
+as stress-pixel and normal-pixel behavior rather than low-latitude and
+high-latitude worker identity. A worker starts at the normal floor, switches to
+the stress floor/decay after a stress batch, and switches back to the normal
+floor/decay after a normal batch.
+
+![8/5 worker current RSS leaky model](assets/benchmarking/0.1.0/phase14b-8w5-worker-rss-decay-model.png)
+
+The predicted total-RAM model sums the worker current-RSS model and GPU
+reserve:
+
+```text
+predicted_total_ram_gib =
+    sum(modeled_worker_rss_gib)
+    + gpu_reserve_gib
+```
+
+For this `8`/`5` run, GPU reserve is `8.40 GiB`, or about `1.05 GiB` per
+worker. The total-RAM model reproduces the high-water well but remains only an
+approximation to short-timescale memory-release behavior: `RMSE = 1.27 GiB`,
+`bias = -0.07 GiB`, and `corr = 0.45`; the measured and predicted peaks are
+`22.3 GiB` and `22.4 GiB`.
+
+![8/5 predicted total RAM](assets/benchmarking/0.1.0/phase14b-8w5-predicted-total-ram.png)
+
+#### Validation
+
+As a first validation check, the stochastic model was used to simulate the full
+sky with the production static `9`/`6` scheduler and then compared against the
+measured first full-sky run window. The measured run is not a complete full-sky
+trajectory, but it is an independent scheduler/run configuration relative to
+the `8`/`5` window used to fit the model.
+
+```bash
+./.conda/bin/python scripts/simulate_regional_schedule_memory.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/v1 \
+  --schedule-full-sky \
+  --workers 9 \
+  --galactic-low-latitude-workers 6 \
+  --scheduler static \
+  --stochastic \
+  --random-seed 23 \
+  --throughput-device gpu \
+  --per-worker-gpu-overhead-gib 1.05 \
+  --memory-limit-mb 26624 \
+  --trim-fraction 0.85 \
+  --pause-fraction 0.95 \
+  --series-output docs/assets/benchmarking/0.1.0/scheduler-comparison/static-9w6low-seed23.npz
+
+./.conda/bin/python scripts/plot_schedule_simulation_comparison.py \
+  --series static=docs/assets/benchmarking/0.1.0/scheduler-comparison/static-9w6low-seed23.npz \
+  --measured-run "run #1,2026-04-19T04:49:25.703372+00:00,2026-04-19T18:59:50.087984+00:00" \
+  --build-log /Volumes/Data/Galaxy/aosky/gnao-baseline/v1/build.log \
+  --ram-output docs/assets/benchmarking/0.1.0/scheduler-comparison/stochastic-9w6low-static-vs-run1-ram.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/scheduler-comparison/stochastic-9w6low-static-vs-run1-throughput.png \
+  --title-prefix "Stochastic 9/6 Static Simulation vs Run #1"
+```
+
+![9/6 static stochastic RAM validation](assets/benchmarking/0.1.0/scheduler-comparison/stochastic-9w6low-static-vs-run1-ram.png)
+
+![9/6 static stochastic throughput validation](assets/benchmarking/0.1.0/scheduler-comparison/stochastic-9w6low-static-vs-run1-throughput.png)
+
+Interpretation:
+
+- The stochastic model gets the `9`/`6` RAM level roughly right: median total
+  RAM is `20.8 GiB` simulated versus `21.5 GiB` measured.
+- The throughput comparison is also plausible after removing worker-count
+  throughput scaling from the calibrated stochastic model: the full-sky
+  simulated average is `0.83 pix/s`, while the measured run-window average is
+  `0.79 pix/s`.
+- This supports using the stochastic model for scheduler comparison, while
+  still treating exact wall-clock predictions as approximate.
+
+#### Dynamic Scheduler
+
+The static Galactic-latitude scheduler preassigns full regions to fixed
+low-latitude and high-latitude worker pools. This gives good neighbor-cache
+locality and a predictable memory profile, but the split is fixed even if the
+actual stochastic runtime leaves one pool as the long tail.
+
+The dynamic scheduler now uses Gaia star count directly instead of Galactic
+latitude. It converts the trim threshold and worker count into a RAM-stress
+star-count threshold using the deterministic per-worker total RAM model:
+
+```text
+per_worker_total_gib =
+    per_worker_gpu_overhead_gib
+    + 0.914584
+    + 4.256378e-6 * star_count
+```
+
+The GPU term is included in worker RAM for scheduling and plotting; it is not
+handled as a separate global reserve in this simulation.
+
+The overall goal is to preserve cache locality and memory continuity when
+possible, while spreading workers across the sky when affinity is unavailable.
+The scheduler simulator reuses the production dynamic batch planner for stress
+classification, batch construction, and stress-worker count; the simulator only
+adds the stochastic runtime and current-RSS realization layer used for policy
+comparison.
+The dynamic scheduler works as follows:
+
+1. **Prep Phase**
+   - Estimate Pixel Cost:
+     - For every pending outer pixel, estimate:
+       - runtime from Gaia star count;
+       - worker RAM from Gaia star count.
+     - Use the trim-level memory budget to define a RAM-stress threshold.
+   - Classify Work:
+     - Mark pixels above the threshold as **stress pixels**.
+     - Mark all others as **normal pixels**.
+   - Determine Stress Concurrency:
+     - Sum the estimated runtime in the stress and normal queues.
+     - Choose the number of stress workers needed for the stress queue to finish
+       on roughly the same wall-clock scale as the full build.
+     - Keep at least one normal worker unless no normal work remains.
+   - Create Batches:
+     - Group stress pixels into smaller spatial batches, currently level-5 HEALPix batches, up to `4` outer pixels.
+     - Group normal pixels into larger spatial batches, currently level-3 HEALPix batches, up to `64` outer pixels.
+
+2. **Stress Phase**
+   - Applies while stress pixels remain.
+   - Uses an `n`-heavy-worker / many-light-workers mix, where `n` is computed
+     in the prep phase from the relative stress and normal runtime budgets.
+   - Initial RAM Binning:
+     - Bin all batches into `num_workers` bins by estimated RAM.
+     - Stress pixels naturally fall into the upper bins.
+     - Light normal work falls into the lower bins.
+   - Select Bin:
+     - Assign up to `n` workers from the highest RAM bin that still contains stress work.
+     - Assign the remaining workers from the lowest non-empty RAM bin.
+     - Up to `n - 1` active stress assignments may bypass the projected-RAM
+       guard; additional stress and normal assignments remain subject to it.
+     - If a stress-affine worker cannot safely take its preferred guarded
+       stress batch, let it search all remaining bins for any RAM-safe batch
+       before idling.
+
+3. **Post-Stress Phase**
+   - Applies once stress pixels are complete.
+   - Uses runtime-balanced assignment over the remaining normal work.
+   - Runtime Rebinning:
+     - Bin all remaining normal batches into `num_workers` bins by estimated runtime, not RAM.
+   - Select Bin:
+     - Assign from runtime bins in proportion to remaining runtime.
+     - Drain faster bins more often so the build avoids a long tail.
+
+4. **Shared Assignment Rules**
+   - Batch Selection:
+     - If the worker has connected regional affinity, assign the connected batch with the most similar star count to the worker's previous batch.
+     - Otherwise assign the batch farthest from currently active workers.
+   - Throttling:
+     - Before assigning guarded work to a worker:
+       - Project modeled total RAM with the candidate batch included.
+       - If it exceeds the trim threshold, try smaller compatible batches from the same scheduling phase.
+       - If no compatible batch fits, leave the worker idle but ask it to trim/free memory.
+       - Retry scheduling when another worker asks for work (i.e. FIFO queue).
+     - Do not idle a worker with stress affinity when it is taking one of the
+       allowed unthrottled stress assignments.
+
+The simulator models scheduler-level throttling by first trying a lower-RAM
+compatible batch when the preferred assignment would exceed the trim threshold.
+Only if no compatible batch fits is the worker left idle. That simulated worker
+is trimmed to its current decay floor, then remains in the FIFO queue until the
+next scheduling event. Production trim/pause commands remain the runtime safety
+layer.
+
+The production implementation follows the same batch classification, stress
+concurrency, affinity, and `n - 1` stress-bypass rules. It deliberately keeps
+the live RAM model simpler than the simulator: the scheduler projects active
+assigned batches only, while the parent process remains responsible for live
+total-RAM trim/pause/fail behavior from measured RSS plus GPU reserve.
+
+This simulation does not model prepared Gaia cache hits, filesystem locality,
+or parent-worker dispatch overhead. One-pixel dispatch is therefore likely
+over-favored in simulated throughput. The level-5 stress and level-3 normal
+batching policy is intentionally more production-like: it should improve cache
+hit probability and reduce scheduler chatter even though the model only sees
+the coarser load-balance cost.
+
+The following comparison uses the same full-sky stochastic realization
+(`--random-seed 23`) for all policies:
+
+```bash
+./.conda/bin/python scripts/plot_schedule_simulation_comparison.py \
+  --series static-9/6=docs/assets/benchmarking/0.1.0/scheduler-comparison/static-9w6low-seed23.npz \
+  --series static-8/5=docs/assets/benchmarking/0.1.0/scheduler-comparison/static-8w5low-seed23.npz \
+  --series static-7/4=docs/assets/benchmarking/0.1.0/scheduler-comparison/static-7w4low-seed23.npz \
+  --series dynamic-9=docs/assets/benchmarking/0.1.0/scheduler-comparison/dynamic-9-ram-bin-seed23.npz \
+  --series dynamic-8=docs/assets/benchmarking/0.1.0/scheduler-comparison/dynamic-8-ram-bin-seed23.npz \
+  --ram-output docs/assets/benchmarking/0.1.0/scheduler-comparison/stochastic-selected-scheduler-ram-comparison.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/scheduler-comparison/stochastic-selected-scheduler-throughput-comparison.png \
+  --title-prefix "Stochastic Scheduler Policy Simulation"
+```
+
+![Selected stochastic scheduler RAM comparison](assets/benchmarking/0.1.0/scheduler-comparison/stochastic-selected-scheduler-ram-comparison.png)
+
+![Selected stochastic scheduler throughput comparison](assets/benchmarking/0.1.0/scheduler-comparison/stochastic-selected-scheduler-throughput-comparison.png)
+
+| Policy | Simulated Throughput | Median RAM | Peak RAM |
+| --- | ---: | ---: | ---: |
+| Static `9/6` | `0.83 pix/s` | `19.3 GiB` | `24.9 GiB` |
+| Static `8/5` | `0.83 pix/s` | `17.4 GiB` | `22.1 GiB` |
+| Static `7/4` | `0.83 pix/s` | `15.3 GiB` | `20.7 GiB` |
+| Dynamic `9` | `1.11 pix/s` | `20.7 GiB` | `23.0 GiB` |
+| Dynamic `8` | `1.03 pix/s` | `18.2 GiB` | `20.8 GiB` |
+
+Interpretation:
+
+- The static splits trade RAM for little simulated speed change: `9/6`, `8/5`,
+  and `7/4` all run at about `0.83 pix/s`, while median RAM drops from
+  `19.3 GiB` to `15.3 GiB`.
+- Dynamic scheduling improves throughput by keeping RAM-stress work moving
+  without leaving the rest of the workers tied to a fixed latitude lane.
+  Dynamic `9` reaches `1.11 pix/s`, about `34%` faster than the static cases;
+  dynamic `8` reaches `1.03 pix/s`, about `24%` faster.
+- Dynamic `9` is the strongest simulated policy under the `26 GiB` ceiling:
+  it has higher median RAM than dynamic `8` (`20.7 GiB` versus `18.2 GiB`),
+  but its peak remains lower than static `9/6` (`23.0 GiB` versus `24.9 GiB`).
+- Dynamic `8` remains the lower-pressure fallback. It gives up roughly `7%`
+  throughput relative to dynamic `9`, but keeps the simulated peak near
+  `20.8 GiB`.
+- The result should be checked against measured runtime, but the simulation
+  supports dynamic `9` as the preferred policy and dynamic `8` as the
+  conservative alternative.
+
+## 2026-04-21 v2 Dynamic Scheduler Runtime Evidence
+
+The first `v2` full-sky attempt used the dynamic scheduler with `9` workers,
+GPU prediction, dense inference-shape control, and a `26624 MiB` total-RAM
+ceiling. The run was stopped deliberately to inspect the partial products; no
+outer pixels had failed, and stale `running` rows are repaired to `pending` on
+restart. The run was supervised with the long-running build monitoring
+procedure documented in [`testing.md`](testing.md).
+
+### v2 Run 1: Dynamic `9`
+
+Measured state at stop:
+
+| Policy | Window Elapsed | Completed | Throughput | Normal | Trim | Pause | Peak Total RAM | Remaining ETA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dynamic `9` | `8.43 h` | `41,184` | `1.36 pix/s` | `505` | `3` | `0` | `22.18 GiB` | `4.1 h` |
+
+The remaining ETA uses the final hour of measured throughput (`0.53 pix/s`)
+rather than the full-window average because the stopped run was in a slower
+dense-tail portion of the queue.
+
+Measured RAM and throughput plots use the latest run window in `build.log`:
+
+```bash
+./.conda/bin/python scripts/plot_build_memory_timeline.py \
+  /Volumes/Data/Galaxy/aosky/gnao-baseline/phase14-dynamic/build.log \
+  --latest-run \
+  --output docs/assets/benchmarking/0.1.0/phase14c-v2-run1-measured-ram.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/phase14c-v2-run1-measured-throughput.png \
+  --title "Measured v2 Run 1 RAM" \
+  --throughput-title "Measured v2 Run 1 Throughput"
+```
+
+![Measured v2 run 1 RAM timeline](assets/benchmarking/0.1.0/phase14c-v2-run1-measured-ram.png)
+
+![Measured v2 run 1 throughput timeline](assets/benchmarking/0.1.0/phase14c-v2-run1-measured-throughput.png)
+
+The same run window can be compared directly against the dynamic `9`
+stochastic full-sky simulation:
+
+```bash
+./.conda/bin/python scripts/plot_schedule_simulation_comparison.py \
+  --series dynamic-9=docs/assets/benchmarking/0.1.0/scheduler-comparison/dynamic-9-ram-bin-seed23.npz \
+  --measured-run "v2 run 1,2026-04-21T03:26:18.689803+00:00,2026-04-21T11:52:14.245808+00:00" \
+  --build-log /Volumes/Data/Galaxy/aosky/gnao-baseline/phase14-dynamic/build.log \
+  --limit-to-measured-run \
+  --ram-output docs/assets/benchmarking/0.1.0/scheduler-comparison/stochastic-dynamic9-vs-v2-run1-ram.png \
+  --throughput-output docs/assets/benchmarking/0.1.0/scheduler-comparison/stochastic-dynamic9-vs-v2-run1-throughput.png \
+  --title-prefix "Stochastic Dynamic 9 Simulation vs v2 Run 1"
+```
+
+![Dynamic 9 stochastic RAM validation](assets/benchmarking/0.1.0/scheduler-comparison/stochastic-dynamic9-vs-v2-run1-ram.png)
+
+![Dynamic 9 stochastic throughput validation](assets/benchmarking/0.1.0/scheduler-comparison/stochastic-dynamic9-vs-v2-run1-throughput.png)
+
+Interpretation:
+
+- Dynamic `9` processed `41,184` outer pixels before the manual stop, leaving
+  `7,968` remaining and `0` failed.
+- Memory behavior was substantially better than static `9/6`: only `3` samples
+  reached trim, none reached pause, and peak total RAM stayed at `22.18 GiB`.
+- The cropped dynamic `9` simulation matches the measured throughput closely:
+  `1.36 pix/s` simulated versus `1.36 pix/s` measured over the same elapsed
+  window. This is a strong validation of the stochastic runtime model.
+- The RAM simulation is conservative for this run. Measured RAM stayed below
+  the simulated curve for much of the window, leaving enough headroom for more
+  workers to remain active than the simulation expected.
+- The extra measured memory headroom did not translate into higher throughput,
+  which is plausible because workers were already nearly saturated and the
+  dense-tail cost appears compute/cache/GPU limited rather than memory-guard
+  limited.
+- The close measured/simulated agreement makes the full-run dynamic `9`
+  estimate credible: `1.11 pix/s` versus `0.83 pix/s` for the static scheduler,
+  or about `34%` higher throughput and a `25%` shorter expected traversal.
+- Conclusion: the dynamic scheduler is behaving as intended from a memory
+  perspective, and the runtime simulation is good enough for scheduler-policy
+  comparison. The RAM model should be treated as conservative rather than as an
+  exact live-memory predictor.

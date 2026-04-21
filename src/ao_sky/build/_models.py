@@ -54,6 +54,8 @@ class TraversalExecutionConfig:
     """Runtime-only Traversal execution settings."""
 
     workers: int = 1
+    scheduler: str = "static"
+    low_latitude_workers: int | None = None
     gaia_cache_entries: int = 64
     gaia_cache_mb: int = 2048
     region_level: int = 0
@@ -71,6 +73,29 @@ class TraversalWorkerPlan:
     region_pixs: tuple[int, ...]
     outer_pixs: tuple[int, ...]
     estimated_star_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalWorkBatch:
+    """One dynamic Traversal work assignment."""
+
+    region_level: int
+    region_pix: int
+    outer_pixs: tuple[int, ...]
+    is_stress: bool
+    sort_star_count: int
+    estimated_seconds: float
+    estimated_ram_mb: float
+    center_vector: tuple[float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicTraversalSchedule:
+    """Parent-owned dynamic Traversal work queue and policy metadata."""
+
+    batches: tuple[TraversalWorkBatch, ...]
+    stress_star_threshold: float
+    stress_worker_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +327,8 @@ class TraversalWorkerMessage:
     worker_id: int
     kind: str
     outer_pix: int | None = None
+    pixel_seconds: float = 0.0
+    peak_rss_mb: float = 0.0
     result: TraversalTaskResult | None = None
     cache_stats: TraversalCacheStats | None = None
     worker_stats: TraversalWorkerStats | None = None

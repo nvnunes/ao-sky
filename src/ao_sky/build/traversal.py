@@ -931,8 +931,8 @@ def build_base_inner_table(
             np.full((size,), np.nan if baseline.sr is None else baseline.sr, dtype=np.float64),
             np.full((size,), np.nan if baseline.fwhm is None else baseline.fwhm, dtype=np.float64),
             np.full((size,), -1, dtype=np.int64),
-            np.full((size,), np.nan, dtype=np.float64),
-            np.full((size,), np.nan, dtype=np.float64),
+            np.full((size,), np.nan if baseline.ee is None else baseline.ee, dtype=np.float64),
+            np.full((size,), np.nan if baseline.ee is None else baseline.ee, dtype=np.float64),
             np.zeros((size,), dtype=np.bool_),
             np.zeros((size,), dtype=np.bool_),
         ],
@@ -2329,7 +2329,7 @@ def _fill_regularized_winner_fields(
         for index, candidate_id in enumerate(np.asarray(retained_candidate_ids, dtype=np.int64))
     }
     winner_ids = np.full((len(inner),), -1, dtype=np.int64)
-    winner_ee_resolved = np.full((len(inner),), np.nan, dtype=np.float64)
+    winner_ee_resolved = np.asarray(inner["winner_ee_resolved"], dtype=np.float64).copy()
     label_array = np.asarray(labels, dtype=np.int64)
     retained = np.asarray(retained_candidate_ids, dtype=np.int64)
     if len(retained) > 0:

@@ -497,96 +497,129 @@ Measured optimization decisions retained from Phase 13:
 
 ### Phase 14: Replace Winner Selection And Dense-Field Candidate Control
 
-Status: complete. The core algorithm, benchmark-driven performance policy,
-retained runtime defaults, closeout documentation, and smoke benchmark have
-been completed. Phase 15 is the next active validation phase.
+Status: complete. The traversal algorithm, dense-field NGS control, prediction
+policy, memory guard, dynamic scheduler, benchmark evidence, and documentation
+are complete. Phase 15 is the next active validation phase.
 
-- Replace the legacy-style overlap-plus-winner heuristic with the
-  winner-map-first algorithm described in [`algorithms.md`](algorithms.md).
-- Merge the earlier higher-density handling work into this phase rather than
-  treating it as a separate later phase.
-- Replaced the earlier candidate-budget/adaptive-`max_mag` idea with regional
-  FOR-optimized NGS selection. Use all configured NGS in regions whose exact
-  candidate graph keeps regional combination work under the internal
-  tractability threshold, subdivide dense regions, and apply FOR-optimized NGS
-  selection only where local combinatorics remain too expensive. Derive
-  `max_regional_combination_work` from the number of inner pixels per outer
-  pixel rather than exposing a new user-facing knob.
-- Support exact 1-, 2-, and 3-star candidate sets according to
+Implemented algorithm:
+
+- Replaced the legacy overlap-pruned selection path with the winner-map-first
+  traversal algorithm described in [`algorithms.md`](algorithms.md).
+- Replaced adaptive `max_mag` candidate control with regional FOR-optimized NGS
+  selection. The selector uses exact regional candidate graphs where tractable,
+  subdivides dense regions, and applies FOR-optimized NGS selection only where
+  local combinatorics remain too expensive.
+- Derived `max_regional_combination_work` internally from the number of inner
+  pixels per outer pixel rather than exposing a new user-facing candidate knob.
+- Supported exact 1-, 2-, and 3-star candidate sets according to
   `ao_system.min_wfs..ao_system.max_wfs`; schema-version-2 examples use
-  `min_wfs=1` and `max_wfs=3` so all enabled star counts compete directly.
-- Precompute star-to-inner-pixel field-of-regard bitsets and stream eligible
-  candidate-pixel rows into model inference without materializing the full
-  candidate-pair table.
-- Apply bright-star masking before FOR-optimized NGS selection and model
+  `min_wfs=1` and `max_wfs=3`.
+- Precomputed star-to-inner-pixel field-of-regard bitsets and streamed
+  eligible candidate-pixel rows into prediction without materializing the full
+  candidate-pixel space.
+- Applied bright-star masking before FOR-optimized NGS selection and model
   evaluation. `gaia.max_bright_star_exclusion_arcsec` defaults to twice the
   AO-system field of view when the bright-star magnitude threshold is enabled.
-- Drop the Galactic latitude Traversal cut and remove `gaia.max_star_density`.
-  Regional FOR-optimized NGS selection now handles dense fields without coarse
-  sky or density skips.
-- Use predicted EE as the only optimization metric. Update `best_ee`,
-  `best_sr`, and `best_fwhm` together from the EE-best candidate, with seeing
-  baseline retained for continuous maps.
-- Add configurable `asterism.winner_ee_epsilon`; keep top-K size and
-  regularization pass count internal until benchmark evidence justifies
-  exposing them.
-- Regularize winners with local inner-pixel neighbor agreement inside the
-  current outer pixel, and retain only unique regularized winning asterisms.
-- Remove the inner fields `asterism_count` and `winner_distance_arcsec`.
-- Treat the current legacy-preserving Traversal artifact layout/schema as
-  version 1 and bump the replacement Traversal artifact layout/schema to
-  version 2.
-- Validate the new path with repo-native algorithm tests and benchmarks.
-  Legacy comparison tooling may remain useful as a diagnostic, but it is no
-  longer the acceptance authority for this phase.
-- Retained Phase 14 algorithmic optimizations:
-  - vectorized local winner regularization
-  - vectorized prediction feature construction
-  - reusable static prediction-feature templates and feature buffers
-  - magnitude-ordered NGS slots without inner-pixel-dependent `zd`/`az`
-    tie-breaking
-  - NumPy row buffering for prediction streams
-  - `np.unpackbits` bitset extraction
-  - direct top-K writeback into per-inner-pixel state
-- Retained Phase 14 prediction policy from the benchmark evidence:
-  - keep the internal row-buffer cap at `25,000` rows
-  - use dense inference-shape ladders from `1000` to `25000` rows in
-    `1000`-row steps for both resolved and averaged prediction when running on
-    GPU
-  - avoid routine `torch.mps.empty_cache()` calls; use cache clearing only as a
-    memory-pressure tool
-  - use GPU prediction by default, while keeping CPU prediction as the
-    lower-memory fallback
-- Retained Phase 14 scheduling and memory policy:
-  - use the Galactic-latitude-aware regional scheduler as the only regional
-    pre-planning path
-  - use Gaia summary `star_count` as the cheap proxy for worker RAM
-  - stagger high-memory low-latitude work while preserving regional/neighbour
-    ordering for Gaia-cache locality
-  - keep the parent total-RAM guard as the machine-specific authority; workers
-    respond to parent memory-pressure commands by trimming caches and pausing at
-    safe checkpoints
-  - remove per-worker memory guards from the normal policy
-  - use `scripts/simulate_regional_schedule_memory.py` as planning evidence,
-    not as the runtime authority
-- Retained local operating guidance from the worker trade study:
-  - use a `26 GiB` parent total-RAM ceiling on the current machine
-  - use GPU prediction with `9` workers and `6` low-latitude workers when the
-    machine is otherwise quiet
-  - use fewer GPU workers only when the available RAM budget is lower
-  - account for measured per-worker throughput loss when estimating runtime;
-    do not assume linear worker scaling
-- Completed Phase 14 closeout:
-  - encoded the retained GPU prediction policy into `ao-sky.yaml` with
-    `prediction.resolved_device: auto` and `prediction.averaged_device: auto`
-  - renamed the YAML total-RAM guard to `build.memory_limit_mb`
-  - updated the retained local baseline to `build.workers: 9` and
-    `build.memory_limit_mb: 26624`
-  - documented that the parent total-RAM guard includes a GPU-driver reserve
-    when GPU prediction is enabled
-  - ran a short retained-policy real-data smoke benchmark with GPU prediction,
-    dense inference shapes, no routine cache clearing, `9` workers, and a
-    `26624 MiB` total-RAM guard
+- Dropped the Galactic latitude Traversal cut and removed
+  `gaia.max_star_density`; regional FOR-optimized NGS selection now handles
+  dense fields without coarse sky or density skips.
+- Used predicted EE as the only optimization metric. `best_ee`, `best_sr`, and
+  `best_fwhm` are updated from the EE-best candidate, with seeing baseline
+  retained for continuous maps.
+- Added configurable `asterism.winner_ee_epsilon`; top-K size and
+  regularization pass count remain internal.
+- Regularized winners with local inner-pixel neighbor agreement inside the
+  current outer pixel and retained only unique regularized winning asterisms.
+- Removed obsolete output fields including `asterism_count` and
+  `winner_distance_arcsec`.
+- Treated the legacy-preserving Traversal artifact layout/schema as version 1
+  and the replacement Traversal artifact layout/schema as version 2.
+
+Retained implementation optimizations:
+
+- Vectorized local winner regularization.
+- Vectorized prediction feature construction.
+- Reusable static prediction-feature templates and feature buffers.
+- Magnitude-ordered NGS slots without inner-pixel-dependent `zd`/`az`
+  tie-breaking.
+- NumPy row buffering for prediction streams.
+- `np.unpackbits` bitset extraction.
+- Direct top-K writeback into per-inner-pixel state.
+
+Retained prediction policy:
+
+- Keep the internal row-buffer cap at `25,000` rows.
+- Use dense inference-shape ladders from `1000` to `25000` rows in `1000`-row
+  steps for both resolved and averaged prediction when running on GPU.
+- Avoid routine `torch.mps.empty_cache()` calls; use cache clearing only as a
+  memory-pressure tool.
+- Use GPU prediction by default, while keeping CPU prediction as the lower-RAM
+  fallback.
+- Encode the retained GPU prediction policy in `ao-sky.yaml` with
+  `prediction.resolved_device: auto` and `prediction.averaged_device: auto`.
+
+Retained memory policy:
+
+- Use a parent total-RAM guard as the machine-specific authority.
+- Include a GPU-driver reserve in the parent total-RAM guard when GPU
+  prediction is enabled.
+- Rename the YAML total-RAM guard to `build.memory_limit_mb`.
+- Retain the local ceiling `build.memory_limit_mb: 26624`.
+- Use trim start `0.85`, trim release `0.80`, pause start `0.95`, and pause
+  release `0.90`.
+- Remove per-worker memory guards from the normal policy.
+- Workers respond to parent memory-pressure commands by trimming caches and
+  pausing at safe checkpoints.
+
+Retained scheduler policy:
+
+- Replaced static Galactic-latitude worker splits with a dynamic
+  memory-aware regional scheduler.
+- Use Gaia summary `star_count` as the cheap proxy for runtime and worker RAM.
+- Production owns regional batch construction with estimated runtime and RAM
+  cost; `scripts/simulate_regional_schedule_memory.py` reuses those batches and
+  adds only the execution model.
+- Workers request one batch at a time and are interchangeable; there is no
+  fixed low/high-latitude worker ownership.
+- Stress-pixel batches are smaller than normal batches.
+- Stress-worker count is computed from the relative stress/normal runtime
+  budget.
+- Up to `n - 1` stress assignments bypass the projected-RAM guard; guarded
+  stress workers can fall back to any RAM-safe batch.
+- The parent memory-pressure guard remains the runtime safety authority.
+- Retain `build.workers: 9` as the local default for dynamic GPU scheduling.
+
+Benchmark and validation evidence:
+
+- Short retained-policy real-data smoke completed with GPU prediction, dense
+  inference shapes, no routine cache clearing, `9` workers, and a
+  `26624 MiB` total-RAM guard.
+- Static `v1` full-sky windows showed that `9/6` static scheduling spent too
+  much time in trim/pause under the `26 GiB` ceiling.
+- Static `8/5` and `8/2` windows confirmed that reducing memory pressure can
+  improve measured throughput even with fewer nominal workers.
+- Static split evidence showed that fixed low-latitude lanes can drain one work
+  class too early, motivating dynamic scheduling.
+- Dynamic scheduler simulations using the same stochastic realization favored
+  dynamic `9`: about `1.11 pix/s`, `20.7 GiB` median RAM, and `23.0 GiB` peak
+  RAM under a `26 GiB` ceiling.
+- The `v2` dynamic `9` run processed `41,184` outer pixels before manual stop,
+  with `0` failed, `3` trim samples, `0` pause samples, and `22.18 GiB` peak
+  total RAM.
+- Cropped `v2` measured-vs-simulated comparison matched throughput closely:
+  about `1.36 pix/s` simulated and measured over the same elapsed window.
+- The dynamic `9` full-run estimate remains about `1.11 pix/s` versus
+  `0.83 pix/s` for static scheduling, or about `34%` higher throughput and
+  `25%` shorter expected traversal.
+
+Notes for Phase 15:
+
+- Completing or resuming `v2` is validation support, not Phase 14 blocking
+  work.
+- Treat `scripts/simulate_regional_schedule_memory.py` as scheduler planning
+  evidence, not runtime authority.
+- Treat the RAM model as conservative and machine-specific; use the parent
+  guard as the live safety mechanism.
 
 ### Phase 15: Validate Physical Behavior And Tune Winner-Algorithm Policy
 

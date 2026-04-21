@@ -43,6 +43,21 @@ def _add_traversal_execution_arguments(parser: argparse.ArgumentParser) -> None:
         help="Number of Traversal worker processes to use.",
     )
     parser.add_argument(
+        "--scheduler",
+        choices=("static", "dynamic"),
+        default=None,
+        help="Traversal scheduler policy; defaults to build.scheduler.",
+    )
+    parser.add_argument(
+        "--low-latitude-workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of Traversal workers reserved for low-Galactic-latitude "
+            "regions; defaults to the scheduler policy."
+        ),
+    )
+    parser.add_argument(
         "--gaia-cache-entries",
         type=int,
         default=None,
@@ -209,6 +224,8 @@ def _handle_run(args: argparse.Namespace) -> int:
         run_build(
             args.build,
             workers=args.workers,
+            scheduler=args.scheduler,
+            low_latitude_workers=args.low_latitude_workers,
             gaia_cache_entries=args.gaia_cache_entries,
             gaia_cache_mb=args.gaia_cache_mb,
             parent_memory_limit_mb=args.parent_memory_limit_mb,
@@ -228,6 +245,8 @@ def _handle_restart(args: argparse.Namespace) -> int:
             build_root=args.build_root,
             aosky_yaml=args.aosky_yaml,
             workers=args.workers,
+            scheduler=args.scheduler,
+            low_latitude_workers=args.low_latitude_workers,
             gaia_cache_entries=args.gaia_cache_entries,
             gaia_cache_mb=args.gaia_cache_mb,
             parent_memory_limit_mb=args.parent_memory_limit_mb,

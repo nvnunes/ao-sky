@@ -109,6 +109,7 @@ Example build config:
 schema_version: 2
 build:
   workers: 9
+  scheduler: dynamic
   memory_limit_mb: 26624
   roots:
     gaia: /data/gaia

@@ -23,6 +23,7 @@ from ..dust import prepare_gaia_tge_a0_cache
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore
 from ..predict import PredictRuntime, backend as predict_backend
 from ..predict import configure_inference_threads, warm_model_cache
+from ..spatial import get_parent_pixel
 from .augmentation import build_survey_extent_layers
 from .aggregation import build_maps
 from ._constants import (
@@ -81,12 +82,13 @@ from ._models import (
     TraversalStructureStats,
     TraversalTaskContext,
     TraversalTaskResult,
+    TraversalWorkBatch,
     TraversalWorkerMessage,
     TraversalWorkerMemorySample,
     TraversalWorkerPlan,
     TraversalWorkerStats,
 )
-from .regional import build_regional_worker_plans
+from .regional import build_dynamic_work_batches, build_regional_worker_plans
 from .runtime_gaia import RuntimeGaiaHealpixStore
 from .traversal import (
     TraversalGeometry,
@@ -102,15 +104,16 @@ STATE_UPDATE_RETRY_ATTEMPTS = 20
 STATE_UPDATE_RETRY_DELAY_SECONDS = 0.05
 STATE_UPDATE_FLUSH_INTERVAL = 100
 PARENT_MEMORY_CHECK_INTERVAL_SECONDS = 1.0
-PARENT_MEMORY_SOFT_FRACTION = 0.80
-PARENT_MEMORY_SOFT_RELEASE_FRACTION = 0.70
-PARENT_MEMORY_HARD_FRACTION = 0.90
-PARENT_MEMORY_HARD_RELEASE_FRACTION = 0.80
+PARENT_MEMORY_SOFT_FRACTION = 0.85
+PARENT_MEMORY_SOFT_RELEASE_FRACTION = 0.80
+PARENT_MEMORY_HARD_FRACTION = 0.95
+PARENT_MEMORY_HARD_RELEASE_FRACTION = 0.90
 PARENT_MEMORY_PRESSURE_NORMAL = "normal"
 PARENT_MEMORY_PRESSURE_TRIM = "trim"
 PARENT_MEMORY_PRESSURE_PAUSE = "pause"
 PARENT_MEMORY_PRESSURE_RESUME = "resume"
 PARENT_MEMORY_PRESSURE_COMMAND_INTERVAL_SECONDS = 5.0
+PARENT_MEMORY_SNAPSHOT_INTERVAL_SECONDS = 60.0
 WORKER_MEMORY_PRESSURE_SLEEP_SECONDS = 0.25
 WORKER_MEMORY_PRESSURE_MAX_PAUSE_SECONDS = 30.0
 PREDICT_DEVICE_ENV_VAR = "AO_SKY_PREDICT_DEVICE"
@@ -1521,6 +1524,26 @@ def _run_regional_traversal_worker(
         result_queue.put(message)
 
 
+def _run_dynamic_traversal_worker(
+    context: TraversalTaskContext,
+    worker_id: int,
+    execution_config: TraversalExecutionConfig,
+    result_queue,
+    work_queue,
+    control_queue=None,
+) -> None:
+    """Worker entrypoint for parent-dispatched dynamic Traversal batches."""
+
+    for message in _iter_dynamic_traversal_worker_messages(
+        context,
+        worker_id,
+        execution_config,
+        work_queue=work_queue,
+        control_queue=control_queue,
+    ):
+        result_queue.put(message)
+
+
 def _peak_rss_mb() -> float:
     usage = resource.getrusage(resource.RUSAGE_SELF)
     if sys.platform == "darwin":
@@ -1841,6 +1864,7 @@ def _update_parent_memory_pressure(
     worker_pressure_command_times: dict[int, float],
     previous_state: str,
     previous_targets: tuple[int, ...],
+    force_snapshot: bool = False,
 ) -> tuple[str, tuple[int, ...]]:
     """Monitor total RAM and ask the heaviest workers to back off when needed."""
 
@@ -1880,19 +1904,25 @@ def _update_parent_memory_pressure(
         targets=targets,
         now=now,
     )
-    if pressure_state != previous_state or targets != previous_targets:
+    pressure_changed = pressure_state != previous_state or targets != previous_targets
+    if pressure_changed or force_snapshot:
         target_text = ",".join(str(worker_id) for worker_id in targets) or "none"
         rss_text = ",".join(
             f"{worker_id}:{active_worker_rss_mb[worker_id]:.1f}"
             for worker_id in sorted(active_worker_rss_mb)
         )
+        event = "memory_pressure" if pressure_changed else "memory_snapshot"
         append_build_log(
             build_path,
             "phase=traversal "
-            f"memory_pressure state={pressure_state} "
+            f"{event} state={pressure_state} "
             f"total_mb={total_mb:.1f} "
             f"gpu_reserve_mb={gpu_reserve_mb:.1f} "
             f"limit_mb={limit} "
+            f"trim_fraction={PARENT_MEMORY_SOFT_FRACTION:.2f} "
+            f"trim_release_fraction={PARENT_MEMORY_SOFT_RELEASE_FRACTION:.2f} "
+            f"pause_fraction={PARENT_MEMORY_HARD_FRACTION:.2f} "
+            f"pause_release_fraction={PARENT_MEMORY_HARD_RELEASE_FRACTION:.2f} "
             f"targets={target_text} "
             f"worker_rss_mb={rss_text}",
         )
@@ -2364,7 +2394,8 @@ def _iter_long_lived_traversal_worker_messages(
             stage_telemetry.add(stage_stats)
             structure_telemetry.add(structure_stats)
         except Exception as exc:
-            pixel_seconds += time.perf_counter() - pixel_started
+            elapsed = time.perf_counter() - pixel_started
+            pixel_seconds += elapsed
             failed += 1
             gc.collect()
             if memory_profile is not None:
@@ -2390,6 +2421,8 @@ def _iter_long_lived_traversal_worker_messages(
                 worker_id=plan.worker_id,
                 kind="failed",
                 outer_pix=int(outer_pix),
+                pixel_seconds=elapsed,
+                peak_rss_mb=_peak_rss_mb(),
                 result=TraversalTaskResult(
                     outer_pix=int(outer_pix),
                     success=False,
@@ -2417,7 +2450,8 @@ def _iter_long_lived_traversal_worker_messages(
                 allow_pause=True,
             )
             continue
-        pixel_seconds += time.perf_counter() - pixel_started
+        elapsed = time.perf_counter() - pixel_started
+        pixel_seconds += elapsed
         completed += 1
         gc.collect()
         if memory_profile is not None:
@@ -2442,6 +2476,8 @@ def _iter_long_lived_traversal_worker_messages(
             worker_id=plan.worker_id,
             kind="completed",
             outer_pix=int(outer_pix),
+            pixel_seconds=elapsed,
+            peak_rss_mb=_peak_rss_mb(),
             result=TraversalTaskResult(
                 outer_pix=int(outer_pix),
                 success=True,
@@ -2489,11 +2525,300 @@ def _iter_long_lived_traversal_worker_messages(
     yield TraversalWorkerMessage(worker_id=plan.worker_id, kind="done")
 
 
+def _iter_dynamic_traversal_worker_messages(
+    context: TraversalTaskContext,
+    worker_id: int,
+    execution_config: TraversalExecutionConfig,
+    *,
+    work_queue,
+    control_queue=None,
+) -> Iterator[TraversalWorkerMessage]:
+    """Yield Traversal messages from one dynamically dispatched worker."""
+
+    run_started = time.perf_counter()
+    detailed = execution_config.telemetry == "detailed"
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="worker_start",
+            run_started=run_started,
+        )
+    configure_inference_threads(1)
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="after_inference_thread_config",
+            run_started=run_started,
+        )
+    runtime = load_runtime_config(
+        context.runtime_config_path,
+        model_root=context.roots.model_root,
+    )
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="after_runtime_config",
+            run_started=run_started,
+        )
+    warm_model_cache(runtime)
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="after_model_warmup",
+            run_started=run_started,
+        )
+    base_store = GaiaHealpixStore(
+        GaiaStoreConfig(
+            root=context.roots.gaia_root,
+            release=context.definition.gaia_release,
+            healpix_level=context.definition.outer_level,
+        )
+    )
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="after_base_store",
+            run_started=run_started,
+        )
+    store = RuntimeGaiaHealpixStore(
+        base_store,
+        runtime,
+        max_entries=execution_config.gaia_cache_entries,
+        max_bytes=execution_config.gaia_cache_mb * 1024 * 1024,
+    )
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="after_runtime_gaia_store",
+            run_started=run_started,
+        )
+    geometry = TraversalGeometry.from_runtime(runtime)
+    if detailed:
+        yield _worker_memory_sample(
+            worker_id=worker_id,
+            event="after_geometry",
+            run_started=run_started,
+        )
+    yield from _apply_worker_memory_pressure_command(
+        control_queue=control_queue,
+        store=store,
+        worker_id=worker_id,
+        run_started=run_started,
+        detailed=detailed,
+        allow_pause=True,
+    )
+    completed = 0
+    failed = 0
+    pixel_seconds = 0.0
+    artifact_write_telemetry = _ArtifactWriteTelemetry()
+    stage_telemetry = _TraversalStageTelemetry()
+    structure_telemetry = _TraversalStructureTelemetry()
+
+    while True:
+        yield TraversalWorkerMessage(worker_id=worker_id, kind="ready")
+        batch = work_queue.get()
+        while batch == PARENT_MEMORY_PRESSURE_TRIM:
+            _trim_worker_runtime_memory(store)
+            if detailed:
+                yield _worker_memory_sample(
+                    worker_id=worker_id,
+                    event="after_dynamic_idle_trim",
+                    run_started=run_started,
+                )
+            batch = work_queue.get()
+        if batch is None:
+            break
+
+        for outer_pix in batch.outer_pixs:
+            yield from _apply_worker_memory_pressure_command(
+                control_queue=control_queue,
+                store=store,
+                worker_id=worker_id,
+                run_started=run_started,
+                detailed=detailed,
+                allow_pause=True,
+            )
+            yield TraversalWorkerMessage(
+                worker_id=worker_id,
+                kind="started",
+                outer_pix=int(outer_pix),
+            )
+            pixel_started = time.perf_counter()
+            memory_profile = None
+            artifact_memory_profile = None
+            if execution_config.telemetry == "detailed":
+                memory_profile = TraversalMemoryProfile(
+                    rss_start_mb=_current_rss_mb(),
+                    peak_rss_start_mb=_peak_rss_mb(),
+                )
+                artifact_memory_profile = ArtifactMemoryProfile()
+            pressure_messages: list[TraversalWorkerMessage] = []
+
+            def poll_memory_pressure() -> None:
+                pressure_messages.extend(
+                    _apply_worker_memory_pressure_command(
+                        control_queue=control_queue,
+                        store=store,
+                        worker_id=worker_id,
+                        run_started=run_started,
+                        detailed=detailed,
+                        allow_pause=True,
+                    )
+                )
+
+            try:
+                write_profile, stage_stats, structure_stats = _materialize_outer_pixel_products(
+                    context,
+                    int(outer_pix),
+                    runtime=runtime,
+                    store=store,
+                    geometry=geometry,
+                    memory_profile=memory_profile,
+                    artifact_memory_profile=artifact_memory_profile,
+                    memory_pressure_callback=poll_memory_pressure,
+                )
+                artifact_write_telemetry.add(write_profile)
+                stage_telemetry.add(stage_stats)
+                structure_telemetry.add(structure_stats)
+            except Exception as exc:
+                elapsed = time.perf_counter() - pixel_started
+                pixel_seconds += elapsed
+                failed += 1
+                gc.collect()
+                if memory_profile is not None:
+                    memory_profile.rss_after_gc_mb = _current_rss_mb()
+                    memory_profile.peak_rss_after_gc_mb = _peak_rss_mb()
+                    yield TraversalWorkerMessage(
+                        worker_id=worker_id,
+                        kind="memory_sample",
+                        memory_sample=_build_memory_sample(
+                            outer_pix=int(outer_pix),
+                            worker_id=worker_id,
+                            success=False,
+                            pixel_seconds=time.perf_counter() - pixel_started,
+                            artifact_write_profile=None,
+                            artifact_memory_profile=artifact_memory_profile,
+                            structure_stats=None,
+                            memory_profile=memory_profile,
+                            error_message=str(exc),
+                        ),
+                    )
+                yield from pressure_messages
+                yield TraversalWorkerMessage(
+                    worker_id=worker_id,
+                    kind="failed",
+                    outer_pix=int(outer_pix),
+                    pixel_seconds=elapsed,
+                    peak_rss_mb=_peak_rss_mb(),
+                    result=TraversalTaskResult(
+                        outer_pix=int(outer_pix),
+                        success=False,
+                        error_message=str(exc),
+                    ),
+                )
+                if (completed + failed) % TRAVERSAL_PROGRESS_LOG_INTERVAL == 0:
+                    yield _traversal_worker_stats_message(
+                        worker_id=worker_id,
+                        completed=completed,
+                        failed=failed,
+                        run_started=run_started,
+                        pixel_seconds=pixel_seconds,
+                        artifact_write_telemetry=artifact_write_telemetry,
+                        stage_telemetry=stage_telemetry,
+                        structure_telemetry=structure_telemetry,
+                        store=store,
+                    )
+                yield from _apply_worker_memory_pressure_command(
+                    control_queue=control_queue,
+                    store=store,
+                    worker_id=worker_id,
+                    run_started=run_started,
+                    detailed=detailed,
+                    allow_pause=True,
+                )
+                continue
+
+            elapsed = time.perf_counter() - pixel_started
+            pixel_seconds += elapsed
+            completed += 1
+            gc.collect()
+            if memory_profile is not None:
+                memory_profile.rss_after_gc_mb = _current_rss_mb()
+                memory_profile.peak_rss_after_gc_mb = _peak_rss_mb()
+                yield TraversalWorkerMessage(
+                    worker_id=worker_id,
+                    kind="memory_sample",
+                    memory_sample=_build_memory_sample(
+                        outer_pix=int(outer_pix),
+                        worker_id=worker_id,
+                        success=True,
+                        pixel_seconds=time.perf_counter() - pixel_started,
+                        artifact_write_profile=write_profile,
+                        artifact_memory_profile=artifact_memory_profile,
+                        structure_stats=structure_stats,
+                        memory_profile=memory_profile,
+                    ),
+                )
+            yield from pressure_messages
+            yield TraversalWorkerMessage(
+                worker_id=worker_id,
+                kind="completed",
+                outer_pix=int(outer_pix),
+                pixel_seconds=elapsed,
+                peak_rss_mb=_peak_rss_mb(),
+                result=TraversalTaskResult(
+                    outer_pix=int(outer_pix),
+                    success=True,
+                ),
+            )
+            if (completed + failed) % TRAVERSAL_PROGRESS_LOG_INTERVAL == 0:
+                yield _traversal_worker_stats_message(
+                    worker_id=worker_id,
+                    completed=completed,
+                    failed=failed,
+                    run_started=run_started,
+                    pixel_seconds=pixel_seconds,
+                    artifact_write_telemetry=artifact_write_telemetry,
+                    stage_telemetry=stage_telemetry,
+                    structure_telemetry=structure_telemetry,
+                    store=store,
+                )
+            yield from _apply_worker_memory_pressure_command(
+                control_queue=control_queue,
+                store=store,
+                worker_id=worker_id,
+                run_started=run_started,
+                detailed=detailed,
+                allow_pause=True,
+            )
+
+    yield _traversal_worker_stats_message(
+        worker_id=worker_id,
+        completed=completed,
+        failed=failed,
+        run_started=run_started,
+        pixel_seconds=pixel_seconds,
+        artifact_write_telemetry=artifact_write_telemetry,
+        stage_telemetry=stage_telemetry,
+        structure_telemetry=structure_telemetry,
+        store=store,
+    )
+
+    if isinstance(store, RuntimeGaiaHealpixStore) and store.enabled:
+        yield TraversalWorkerMessage(
+            worker_id=worker_id,
+            kind="cache_stats",
+            cache_stats=_traversal_cache_stats(store),
+        )
+    yield TraversalWorkerMessage(worker_id=worker_id, kind="done")
+
+
 def _handle_regional_worker_message(
     *,
     build_path: Path,
     state: np.ndarray,
     message: TraversalWorkerMessage,
+    star_counts: np.ndarray | None = None,
     progress: dict[int, dict[str, int]] | None = None,
     progress_interval: int = TRAVERSAL_PROGRESS_LOG_INTERVAL,
     telemetry: _StateUpdateTelemetry | None = None,
@@ -2519,6 +2844,19 @@ def _handle_regional_worker_message(
             telemetry,
             state_writer=state_writer,
         )
+        star_count = (
+            int(star_counts[int(message.outer_pix)])
+            if star_counts is not None
+            else -1
+        )
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={message.worker_id} "
+            "outer_pixel_start "
+            f"outer_pix={message.outer_pix} "
+            f"star_count={star_count}",
+        )
         return False
 
     if message.kind in ("completed", "failed"):
@@ -2532,6 +2870,15 @@ def _handle_regional_worker_message(
             state_writer=state_writer,
         )
         if message.result.success:
+            append_build_log(
+                build_path,
+                "phase=traversal "
+                f"worker={message.worker_id} "
+                "outer_pixel_done "
+                f"outer_pix={message.result.outer_pix} "
+                f"elapsed_s={message.pixel_seconds:.3f} "
+                f"peak_rss_mb={message.peak_rss_mb:.1f}",
+            )
             if worker_progress is not None:
                 worker_progress["completed"] += 1
                 if (
@@ -2557,7 +2904,13 @@ def _handle_regional_worker_message(
             state_writer.flush()
         append_build_log(
             build_path,
-            f"phase=traversal worker={message.worker_id} outer_pix={message.result.outer_pix} failed: {message.result.error_message}",
+            "phase=traversal "
+            f"worker={message.worker_id} "
+            "outer_pixel_failed "
+            f"outer_pix={message.result.outer_pix} "
+            f"elapsed_s={message.pixel_seconds:.3f} "
+            f"peak_rss_mb={message.peak_rss_mb:.1f} "
+            f"error={message.result.error_message}",
         )
         if telemetry is not None:
             _append_state_update_telemetry(build_path, telemetry)
@@ -2821,6 +3174,7 @@ def _run_regional_traversal_workers(
     state: np.ndarray,
     plans: tuple[TraversalWorkerPlan, ...],
     execution_config: TraversalExecutionConfig,
+    star_counts: np.ndarray | None = None,
     telemetry: _StateUpdateTelemetry | None = None,
     state_writer: _BufferedStateWriter | None = None,
     diagnostics_writer: _TraversalDiagnosticsWriter | None = None,
@@ -2851,6 +3205,7 @@ def _run_regional_traversal_workers(
     }
     failed = False
     last_parent_memory_check = 0.0
+    last_parent_memory_snapshot = 0.0
 
     with _prediction_device_environment(execution_config):
         for plan in plans:
@@ -2880,6 +3235,10 @@ def _run_regional_traversal_workers(
         while active_worker_ids:
             now = time.perf_counter()
             if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                force_snapshot = (
+                    now - last_parent_memory_snapshot
+                    >= PARENT_MEMORY_SNAPSHOT_INTERVAL_SECONDS
+                )
                 memory_pressure_state, memory_pressure_targets = (
                     _update_parent_memory_pressure(
                         build_path=build_path,
@@ -2891,8 +3250,11 @@ def _run_regional_traversal_workers(
                         worker_pressure_command_times=worker_pressure_command_times,
                         previous_state=memory_pressure_state,
                         previous_targets=memory_pressure_targets,
+                        force_snapshot=force_snapshot,
                     )
                 )
+                if force_snapshot:
+                    last_parent_memory_snapshot = now
                 _raise_if_parent_memory_limit_exceeded(execution_config, processes)
                 last_parent_memory_check = now
             try:
@@ -2911,6 +3273,7 @@ def _run_regional_traversal_workers(
                 build_path=build_path,
                 state=state,
                 message=message,
+                star_counts=star_counts,
                 progress=progress,
                 telemetry=telemetry,
                 state_writer=state_writer,
@@ -2918,6 +3281,10 @@ def _run_regional_traversal_workers(
             ) or failed
             now = time.perf_counter()
             if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                force_snapshot = (
+                    now - last_parent_memory_snapshot
+                    >= PARENT_MEMORY_SNAPSHOT_INTERVAL_SECONDS
+                )
                 memory_pressure_state, memory_pressure_targets = (
                     _update_parent_memory_pressure(
                         build_path=build_path,
@@ -2929,8 +3296,11 @@ def _run_regional_traversal_workers(
                         worker_pressure_command_times=worker_pressure_command_times,
                         previous_state=memory_pressure_state,
                         previous_targets=memory_pressure_targets,
+                        force_snapshot=force_snapshot,
                     )
                 )
+                if force_snapshot:
+                    last_parent_memory_snapshot = now
                 _raise_if_parent_memory_limit_exceeded(execution_config, processes)
                 last_parent_memory_check = now
             if message.kind == "done":
@@ -2957,6 +3327,578 @@ def _run_regional_traversal_workers(
     return failed
 
 
+def _run_dynamic_traversal_workers(
+    *,
+    build_path: Path,
+    context: TraversalTaskContext,
+    state: np.ndarray,
+    schedule,
+    execution_config: TraversalExecutionConfig,
+    star_counts: np.ndarray | None = None,
+    telemetry: _StateUpdateTelemetry | None = None,
+    state_writer: _BufferedStateWriter | None = None,
+    diagnostics_writer: _TraversalDiagnosticsWriter | None = None,
+) -> bool:
+    """Run parent-dispatched dynamic Traversal workers."""
+
+    if not schedule.batches:
+        return False
+
+    worker_count = int(execution_config.workers)
+    process_context = _create_regional_process_context()
+    result_queue = process_context.Queue()
+    control_queues = {worker_id: process_context.Queue() for worker_id in range(worker_count)}
+    work_queues = {worker_id: process_context.Queue() for worker_id in range(worker_count)}
+    processes = []
+    process_by_worker_id: dict[int, object] = {}
+    active_worker_ids = set(range(worker_count))
+    worker_pressure_states = {
+        worker_id: PARENT_MEMORY_PRESSURE_NORMAL for worker_id in range(worker_count)
+    }
+    worker_pressure_command_times: dict[int, float] = {}
+    memory_pressure_state = PARENT_MEMORY_PRESSURE_NORMAL
+    memory_pressure_targets: tuple[int, ...] = ()
+    progress: dict[int, dict[str, int]] = {
+        worker_id: {"completed": 0, "failed": 0} for worker_id in range(worker_count)
+    }
+    ram_bins = _split_dynamic_ram_bins(list(schedule.batches), bin_count=worker_count)
+    post_stress_bins: list[list[TraversalWorkBatch]] | None = None
+    post_stress_assignments: np.ndarray | None = None
+    idle_worker_ids: list[int] = []
+    active_batches: dict[int, TraversalWorkBatch] = {}
+    active_batch_vectors: dict[int, tuple[float, float, float]] = {}
+    active_stress_workers: set[int] = set()
+    last_affinity_by_worker: dict[tuple[int, int], tuple[int, int]] = {}
+    failed = False
+    last_parent_memory_check = 0.0
+    last_parent_memory_snapshot = 0.0
+
+    def projected_total_ram_mb(worker_id: int, batch: TraversalWorkBatch) -> float:
+        active_ram = 0.0
+        for active_worker_id, active_batch in active_batches.items():
+            if int(active_worker_id) == int(worker_id):
+                continue
+            active_ram += float(active_batch.estimated_ram_mb)
+        return active_ram + float(batch.estimated_ram_mb)
+
+    def exceeds_trim_threshold(worker_id: int, batch: TraversalWorkBatch) -> bool:
+        limit = int(execution_config.parent_memory_limit_mb)
+        if limit <= 0 or not active_batches:
+            return False
+        return projected_total_ram_mb(worker_id, batch) > (
+            float(limit) * PARENT_MEMORY_SOFT_FRACTION
+        )
+
+    def can_assign(
+        worker_id: int,
+        batch: TraversalWorkBatch,
+        *,
+        must_run: bool,
+    ) -> bool:
+        return bool(must_run) or not exceeds_trim_threshold(worker_id, batch)
+
+    def take_batch_from_bins(
+        bins: list[list[TraversalWorkBatch]],
+        bin_indexes: list[int],
+        *,
+        worker_id: int,
+        preferred_affinity: tuple[int, int] | None,
+        require_stress: bool | None,
+        must_run_stress: bool,
+    ) -> tuple[TraversalWorkBatch | None, int, bool, bool]:
+        denied_for_memory = False
+        for bin_index in bin_indexes:
+            if bin_index < 0 or bin_index >= len(bins):
+                continue
+            queue = bins[bin_index]
+            for batch_index in _ordered_dynamic_batch_indexes(
+                queue,
+                preferred_affinity=preferred_affinity,
+                active_vectors=active_batch_vectors,
+                require_stress=require_stress,
+            ):
+                candidate = queue[batch_index]
+                must_run = bool(candidate.is_stress) and bool(must_run_stress)
+                if can_assign(worker_id, candidate, must_run=must_run):
+                    return (
+                        queue.pop(batch_index),
+                        int(bin_index),
+                        bool(candidate.is_stress),
+                        denied_for_memory,
+                    )
+                denied_for_memory = True
+        return None, -1, False, denied_for_memory
+
+    def assign_next(worker_id: int) -> bool:
+        nonlocal post_stress_bins, post_stress_assignments
+        batch: TraversalWorkBatch | None = None
+        is_stress = False
+        denied_for_memory = False
+        stress_remaining = _dynamic_bins_have_stress(ram_bins)
+        non_stress_remaining = _dynamic_bins_have_non_stress(ram_bins)
+        stress_limit = int(schedule.stress_worker_count)
+        stress_affinity_idle_workers = [
+            int(idle_worker_id)
+            for idle_worker_id in idle_worker_ids
+            if _worker_has_dynamic_stress_affinity(
+                last_affinity_by_worker,
+                worker_id=int(idle_worker_id),
+                region_level=max(0, context.definition.outer_level - 1),
+                stress_star_threshold=float(schedule.stress_star_threshold),
+            )
+        ]
+        if stress_remaining and len(active_stress_workers) < stress_limit:
+            if not stress_affinity_idle_workers or int(worker_id) in stress_affinity_idle_workers:
+                stress_bin_index = _highest_dynamic_stress_bin_index(ram_bins)
+                unthrottled_stress_slots = max(stress_limit - 1, 0)
+                batch, _, is_stress, denied_for_memory = take_batch_from_bins(
+                    ram_bins,
+                    [stress_bin_index],
+                    worker_id=int(worker_id),
+                    preferred_affinity=_last_dynamic_affinity_for_level(
+                        last_affinity_by_worker,
+                        worker_id=int(worker_id),
+                        region_level=max(0, context.definition.outer_level - 1),
+                    ),
+                    require_stress=True,
+                    must_run_stress=(
+                        len(active_stress_workers) < unthrottled_stress_slots
+                    ),
+                )
+                if batch is None and denied_for_memory:
+                    batch, _, is_stress, fallback_denied = take_batch_from_bins(
+                        ram_bins,
+                        list(range(len(ram_bins))),
+                        worker_id=int(worker_id),
+                        preferred_affinity=None,
+                        require_stress=None,
+                        must_run_stress=False,
+                    )
+                    denied_for_memory = bool(denied_for_memory or fallback_denied)
+            elif not non_stress_remaining:
+                return False
+
+        if batch is None:
+            stress_phase_active = _dynamic_bins_have_stress(ram_bins) or bool(
+                active_stress_workers
+            )
+            if stress_phase_active:
+                normal_bin_indexes = [
+                    bin_index
+                    for bin_index, bin_rows in enumerate(ram_bins)
+                    if any(not candidate.is_stress for candidate in bin_rows)
+                ]
+                batch, _, is_stress, denied_for_memory = take_batch_from_bins(
+                    ram_bins,
+                    normal_bin_indexes,
+                    worker_id=int(worker_id),
+                    preferred_affinity=_last_dynamic_affinity_for_level(
+                        last_affinity_by_worker,
+                        worker_id=int(worker_id),
+                        region_level=max(0, context.definition.outer_level - 3),
+                    ),
+                    require_stress=False,
+                    must_run_stress=False,
+                )
+            else:
+                if post_stress_bins is None:
+                    remaining = [
+                        queued_batch
+                        for bin_rows in ram_bins
+                        for queued_batch in bin_rows
+                    ]
+                    post_stress_bins = _split_dynamic_runtime_bins(
+                        remaining,
+                        bin_count=worker_count,
+                    )
+                    post_stress_assignments = np.zeros(
+                        len(post_stress_bins),
+                        dtype=np.int64,
+                    )
+                    for bin_rows in ram_bins:
+                        bin_rows.clear()
+                bin_indexes = _ordered_dynamic_runtime_bin_indexes(
+                    post_stress_bins,
+                    assignments=post_stress_assignments,
+                )
+                batch, bin_index, is_stress, denied_for_memory = take_batch_from_bins(
+                    post_stress_bins,
+                    bin_indexes,
+                    worker_id=int(worker_id),
+                    preferred_affinity=_last_dynamic_affinity_for_level(
+                        last_affinity_by_worker,
+                        worker_id=int(worker_id),
+                        region_level=max(0, context.definition.outer_level - 3),
+                    ),
+                    require_stress=None,
+                    must_run_stress=False,
+                )
+                if batch is not None and bin_index >= 0:
+                    post_stress_assignments[bin_index] += 1
+
+        if batch is None:
+            if denied_for_memory:
+                work_queues[int(worker_id)].put(PARENT_MEMORY_PRESSURE_TRIM)
+            return False
+
+        work_queues[int(worker_id)].put(batch)
+        active_batches[int(worker_id)] = batch
+        active_batch_vectors[int(worker_id)] = batch.center_vector
+        last_affinity_by_worker[(int(worker_id), int(batch.region_level))] = (
+            _dynamic_affinity_parent(
+                region_level=int(batch.region_level),
+                region_pix=int(batch.region_pix),
+            ),
+            int(batch.sort_star_count),
+        )
+        if bool(is_stress):
+            active_stress_workers.add(int(worker_id))
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={worker_id} "
+            f"dynamic_batch region_level={batch.region_level} "
+            f"region={batch.region_pix} "
+            f"outer_pixels={len(batch.outer_pixs)} "
+            f"stress={int(batch.is_stress)} "
+            f"estimated_ram_mb={batch.estimated_ram_mb:.1f} "
+            f"estimated_seconds={batch.estimated_seconds:.2f}",
+        )
+        return True
+
+    def assign_idle_workers() -> None:
+        index = 0
+        while index < len(idle_worker_ids):
+            worker_id = idle_worker_ids.pop(index)
+            if assign_next(worker_id):
+                continue
+            idle_worker_ids.insert(index, worker_id)
+            index += 1
+
+    with _prediction_device_environment(execution_config):
+        for worker_id in range(worker_count):
+            append_build_log(
+                build_path,
+                "phase=traversal "
+                f"worker={worker_id} dynamic started",
+            )
+            process = process_context.Process(
+                target=_run_dynamic_traversal_worker,
+                args=(
+                    context,
+                    worker_id,
+                    execution_config,
+                    result_queue,
+                    work_queues[worker_id],
+                    control_queues[worker_id],
+                ),
+            )
+            process.start()
+            processes.append(process)
+            process_by_worker_id[worker_id] = process
+
+    try:
+        while active_worker_ids:
+            now = time.perf_counter()
+            if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                force_snapshot = (
+                    now - last_parent_memory_snapshot
+                    >= PARENT_MEMORY_SNAPSHOT_INTERVAL_SECONDS
+                )
+                memory_pressure_state, memory_pressure_targets = (
+                    _update_parent_memory_pressure(
+                        build_path=build_path,
+                        execution_config=execution_config,
+                        process_by_worker_id=process_by_worker_id,
+                        control_queues=control_queues,
+                        active_worker_ids=active_worker_ids,
+                        worker_pressure_states=worker_pressure_states,
+                        worker_pressure_command_times=worker_pressure_command_times,
+                        previous_state=memory_pressure_state,
+                        previous_targets=memory_pressure_targets,
+                        force_snapshot=force_snapshot,
+                    )
+                )
+                if force_snapshot:
+                    last_parent_memory_snapshot = now
+                _raise_if_parent_memory_limit_exceeded(execution_config, processes)
+                last_parent_memory_check = now
+            try:
+                message = result_queue.get(timeout=0.1)
+            except Empty:
+                for process, worker_id in zip(processes, range(worker_count), strict=True):
+                    if worker_id not in active_worker_ids:
+                        continue
+                    if process.exitcode not in (None, 0):
+                        raise RuntimeError(
+                            f"dynamic worker {worker_id} exited with code {process.exitcode}"
+                        )
+                continue
+
+            if message.kind == "ready":
+                previous = active_batches.pop(int(message.worker_id), None)
+                active_batch_vectors.pop(int(message.worker_id), None)
+                if previous is not None and previous.is_stress:
+                    active_stress_workers.discard(int(message.worker_id))
+                if int(message.worker_id) not in idle_worker_ids:
+                    idle_worker_ids.append(int(message.worker_id))
+                assign_idle_workers()
+                if not _dynamic_batches_remaining(ram_bins, post_stress_bins):
+                    if int(message.worker_id) in idle_worker_ids:
+                        idle_worker_ids.remove(int(message.worker_id))
+                    work_queues[int(message.worker_id)].put(None)
+                continue
+
+            failed = _handle_regional_worker_message(
+                build_path=build_path,
+                state=state,
+                message=message,
+                star_counts=star_counts,
+                progress=progress,
+                telemetry=telemetry,
+                state_writer=state_writer,
+                diagnostics_writer=diagnostics_writer,
+            ) or failed
+            now = time.perf_counter()
+            if now - last_parent_memory_check >= PARENT_MEMORY_CHECK_INTERVAL_SECONDS:
+                force_snapshot = (
+                    now - last_parent_memory_snapshot
+                    >= PARENT_MEMORY_SNAPSHOT_INTERVAL_SECONDS
+                )
+                memory_pressure_state, memory_pressure_targets = (
+                    _update_parent_memory_pressure(
+                        build_path=build_path,
+                        execution_config=execution_config,
+                        process_by_worker_id=process_by_worker_id,
+                        control_queues=control_queues,
+                        active_worker_ids=active_worker_ids,
+                        worker_pressure_states=worker_pressure_states,
+                        worker_pressure_command_times=worker_pressure_command_times,
+                        previous_state=memory_pressure_state,
+                        previous_targets=memory_pressure_targets,
+                        force_snapshot=force_snapshot,
+                    )
+                )
+                if force_snapshot:
+                    last_parent_memory_snapshot = now
+                _raise_if_parent_memory_limit_exceeded(execution_config, processes)
+                last_parent_memory_check = now
+            if message.kind == "done":
+                active_worker_ids.discard(message.worker_id)
+                worker_pressure_states[message.worker_id] = (
+                    PARENT_MEMORY_PRESSURE_NORMAL
+                )
+                worker_progress = progress[message.worker_id]
+                append_build_log(
+                    build_path,
+                    "phase=traversal "
+                    f"worker={message.worker_id} "
+                    f"done completed={worker_progress['completed']} "
+                    f"failed={worker_progress['failed']}",
+                )
+    except Exception:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        raise
+    finally:
+        for queue in work_queues.values():
+            try:
+                queue.put(None)
+            except Exception:
+                pass
+        for process in processes:
+            process.join()
+    return failed
+
+
+def _dynamic_batches_remaining(
+    ram_bins: list[list[TraversalWorkBatch]],
+    post_stress_bins: list[list[TraversalWorkBatch]] | None,
+) -> bool:
+    return any(ram_bins) or (
+        post_stress_bins is not None and any(post_stress_bins)
+    )
+
+
+def _split_dynamic_ram_bins(
+    batches: list[TraversalWorkBatch],
+    *,
+    bin_count: int,
+) -> list[list[TraversalWorkBatch]]:
+    safe_bin_count = max(1, int(bin_count))
+    if not batches:
+        return [[] for _ in range(safe_bin_count)]
+    ordered = sorted(
+        batches,
+        key=lambda batch: (int(batch.sort_star_count), int(batch.region_pix)),
+    )
+    return [
+        [batch for batch in split_rows.tolist()]
+        for split_rows in np.array_split(np.asarray(ordered, dtype=object), safe_bin_count)
+    ]
+
+
+def _split_dynamic_runtime_bins(
+    batches: list[TraversalWorkBatch],
+    *,
+    bin_count: int,
+) -> list[list[TraversalWorkBatch]]:
+    safe_bin_count = max(1, int(bin_count))
+    if not batches:
+        return [[] for _ in range(safe_bin_count)]
+    ordered = sorted(
+        batches,
+        key=lambda batch: (int(batch.sort_star_count), int(batch.region_pix)),
+    )
+    if safe_bin_count == 1:
+        return [ordered]
+
+    runtimes = np.asarray(
+        [batch.estimated_seconds for batch in ordered],
+        dtype=np.float64,
+    )
+    cumulative = np.cumsum(runtimes)
+    total = float(cumulative[-1]) if len(cumulative) else 0.0
+    bins: list[list[TraversalWorkBatch]] = []
+    start = 0
+    for bin_index in range(safe_bin_count - 1):
+        target = total * float(bin_index + 1) / float(safe_bin_count)
+        end = int(np.searchsorted(cumulative, target, side="left")) + 1
+        min_remaining = safe_bin_count - bin_index - 1
+        end = max(end, start + 1)
+        end = min(end, len(ordered) - min_remaining)
+        bins.append(ordered[start:end])
+        start = end
+    bins.append(ordered[start:])
+    return bins
+
+
+def _ordered_dynamic_runtime_bin_indexes(
+    bins: list[list[TraversalWorkBatch]],
+    *,
+    assignments: np.ndarray,
+) -> list[int]:
+    if not bins:
+        return []
+    remaining = np.asarray([len(bin_rows) for bin_rows in bins], dtype=np.float64)
+    total_remaining = float(np.sum(remaining))
+    if total_remaining <= 0.0:
+        return []
+    total_assignments = float(np.sum(assignments))
+    target_assignments = (total_assignments + 1.0) * remaining / total_remaining
+    deficits = target_assignments - np.asarray(assignments, dtype=np.float64)
+    deficits[remaining <= 0.0] = -np.inf
+    return [
+        int(index)
+        for index in np.argsort(-deficits)
+        if np.isfinite(deficits[int(index)])
+    ]
+
+
+def _dynamic_bins_have_stress(bins: list[list[TraversalWorkBatch]]) -> bool:
+    return any(batch.is_stress for bin_rows in bins for batch in bin_rows)
+
+
+def _dynamic_bins_have_non_stress(bins: list[list[TraversalWorkBatch]]) -> bool:
+    return any(not batch.is_stress for bin_rows in bins for batch in bin_rows)
+
+
+def _highest_dynamic_stress_bin_index(bins: list[list[TraversalWorkBatch]]) -> int:
+    for bin_index in range(len(bins) - 1, -1, -1):
+        if any(batch.is_stress for batch in bins[bin_index]):
+            return bin_index
+    return -1
+
+
+def _dynamic_affinity_parent(*, region_level: int, region_pix: int) -> int:
+    if int(region_level) <= 0:
+        return int(region_pix)
+    return int(
+        get_parent_pixel(
+            int(region_level),
+            np.asarray([int(region_pix)], dtype=np.int64),
+            int(region_level) - 1,
+        )[0]
+    )
+
+
+def _last_dynamic_affinity_for_level(
+    last_affinity_by_worker: dict[tuple[int, int], tuple[int, int]],
+    *,
+    worker_id: int,
+    region_level: int,
+) -> tuple[int, int] | None:
+    return last_affinity_by_worker.get((int(worker_id), int(region_level)))
+
+
+def _worker_has_dynamic_stress_affinity(
+    last_affinity_by_worker: dict[tuple[int, int], tuple[int, int]],
+    *,
+    worker_id: int,
+    region_level: int,
+    stress_star_threshold: float,
+) -> bool:
+    affinity = _last_dynamic_affinity_for_level(
+        last_affinity_by_worker,
+        worker_id=int(worker_id),
+        region_level=int(region_level),
+    )
+    if affinity is None:
+        return False
+    _, star_count = affinity
+    return float(star_count) > float(stress_star_threshold)
+
+
+def _ordered_dynamic_batch_indexes(
+    queue: list[TraversalWorkBatch],
+    *,
+    preferred_affinity: tuple[int, int] | None,
+    active_vectors: dict[int, tuple[float, float, float]],
+    require_stress: bool | None,
+) -> list[int]:
+    candidate_indexes = [
+        index
+        for index, batch in enumerate(queue)
+        if require_stress is None or bool(batch.is_stress) == bool(require_stress)
+    ]
+    if not candidate_indexes:
+        return []
+    if preferred_affinity is not None:
+        preferred_parent, preferred_star_count = preferred_affinity
+        affinity_indexes = [
+            index
+            for index in candidate_indexes
+            if _dynamic_affinity_parent(
+                region_level=int(queue[index].region_level),
+                region_pix=int(queue[index].region_pix),
+            )
+            == int(preferred_parent)
+        ]
+        if affinity_indexes:
+            preferred = sorted(
+                affinity_indexes,
+                key=lambda index: (
+                    abs(int(queue[index].sort_star_count) - int(preferred_star_count)),
+                    int(queue[index].region_pix),
+                ),
+            )
+            preferred_set = set(preferred)
+            return preferred + [
+                index for index in candidate_indexes if index not in preferred_set
+            ]
+    if not active_vectors:
+        return candidate_indexes
+    active = np.asarray(list(active_vectors.values()), dtype=np.float64)
+    ranked: list[tuple[float, int]] = []
+    for index in candidate_indexes:
+        vector = np.asarray(queue[index].center_vector, dtype=np.float64)
+        distances = np.sum((active - vector) ** 2, axis=1)
+        ranked.append((float(np.min(distances)), index))
+    ranked.sort(key=lambda item: (-item[0], int(queue[item[1]].region_pix)))
+    return [index for _, index in ranked]
+
+
 def _run_in_process_traversal_worker(
     *,
     build_path: Path,
@@ -2964,6 +3906,7 @@ def _run_in_process_traversal_worker(
     state: np.ndarray,
     plan: TraversalWorkerPlan,
     execution_config: TraversalExecutionConfig,
+    star_counts: np.ndarray | None = None,
     telemetry: _StateUpdateTelemetry | None = None,
     state_writer: _BufferedStateWriter | None = None,
     diagnostics_writer: _TraversalDiagnosticsWriter | None = None,
@@ -2993,6 +3936,7 @@ def _run_in_process_traversal_worker(
                 build_path=build_path,
                 state=state,
                 message=message,
+                star_counts=star_counts,
                 progress=progress,
                 telemetry=telemetry,
                 state_writer=state_writer,
@@ -3061,6 +4005,8 @@ def _run_traversal_phase(
         f"phase={current_phase} "
         f"repaired_stale_running={repaired} "
         f"workers={execution_config.workers} "
+        f"scheduler={execution_config.scheduler} "
+        f"low_latitude_workers={execution_config.low_latitude_workers or 'auto'} "
         f"derived_region_level={execution_config.region_level} "
         f"gaia_cache_entries={execution_config.gaia_cache_entries} "
         f"gaia_cache_mb={execution_config.gaia_cache_mb} "
@@ -3083,6 +4029,7 @@ def _run_traversal_phase(
                 workers=1,
                 status_field=status_field,
                 star_counts=star_counts,
+                low_latitude_workers=execution_config.low_latitude_workers,
             )
             if plans:
                 failed = _run_in_process_traversal_worker(
@@ -3091,6 +4038,7 @@ def _run_traversal_phase(
                     state=state,
                     plan=plans[0],
                     execution_config=execution_config,
+                    star_counts=star_counts,
                     telemetry=state_telemetry,
                     state_writer=state_writer,
                     diagnostics_writer=diagnostics_writer,
@@ -3120,24 +4068,60 @@ def _run_traversal_phase(
             raise
     else:
         try:
-            plans = build_regional_worker_plans(
-                state=state,
-                outer_level=definition.outer_level,
-                region_level=int(execution_config.region_level),
-                workers=execution_config.workers,
-                status_field=status_field,
-                star_counts=star_counts,
-            )
-            failed = _run_regional_traversal_workers(
-                build_path=build_path,
-                context=context,
-                state=state,
-                plans=plans,
-                execution_config=execution_config,
-                telemetry=state_telemetry,
-                state_writer=state_writer,
-                diagnostics_writer=diagnostics_writer,
-            ) or failed
+            if execution_config.scheduler == "dynamic":
+                schedule = build_dynamic_work_batches(
+                    state=state,
+                    outer_level=definition.outer_level,
+                    workers=execution_config.workers,
+                    status_field=status_field,
+                    star_counts=star_counts,
+                    memory_limit_mb=float(execution_config.parent_memory_limit_mb),
+                    trim_fraction=PARENT_MEMORY_SOFT_FRACTION,
+                    worker_ram_overhead_mb=_parent_gpu_driver_reserve_mb(
+                        1,
+                        execution_config,
+                    ),
+                )
+                append_build_log(
+                    build_path,
+                    "phase=traversal "
+                    "dynamic_schedule "
+                    f"batches={len(schedule.batches)} "
+                    f"stress_workers={schedule.stress_worker_count} "
+                    f"stress_star_threshold={schedule.stress_star_threshold:.0f}",
+                )
+                failed = _run_dynamic_traversal_workers(
+                    build_path=build_path,
+                    context=context,
+                    state=state,
+                    schedule=schedule,
+                    execution_config=execution_config,
+                    star_counts=star_counts,
+                    telemetry=state_telemetry,
+                    state_writer=state_writer,
+                    diagnostics_writer=diagnostics_writer,
+                ) or failed
+            else:
+                plans = build_regional_worker_plans(
+                    state=state,
+                    outer_level=definition.outer_level,
+                    region_level=int(execution_config.region_level),
+                    workers=execution_config.workers,
+                    status_field=status_field,
+                    star_counts=star_counts,
+                    low_latitude_workers=execution_config.low_latitude_workers,
+                )
+                failed = _run_regional_traversal_workers(
+                    build_path=build_path,
+                    context=context,
+                    state=state,
+                    plans=plans,
+                    execution_config=execution_config,
+                    star_counts=star_counts,
+                    telemetry=state_telemetry,
+                    state_writer=state_writer,
+                    diagnostics_writer=diagnostics_writer,
+                ) or failed
         except Exception as exc:
             if diagnostics_writer is not None:
                 diagnostics_writer.close()
@@ -3247,6 +4231,8 @@ def run_build(
     build_path: Path,
     *,
     workers: int | None = None,
+    scheduler: str | None = None,
+    low_latitude_workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
     parent_memory_limit_mb: int | None = None,
@@ -3277,6 +4263,8 @@ def run_build(
         execution_config = resolve_traversal_execution_config(
             outer_level=definition.outer_level,
             workers=workers,
+            scheduler=scheduler,
+            low_latitude_workers=low_latitude_workers,
             gaia_cache_entries=gaia_cache_entries,
             gaia_cache_mb=gaia_cache_mb,
             parent_memory_limit_mb=parent_memory_limit_mb,
@@ -3309,6 +4297,8 @@ def restart_build(
     build_root: Path | None,
     aosky_yaml: Path | None = None,
     workers: int | None = None,
+    scheduler: str | None = None,
+    low_latitude_workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
     parent_memory_limit_mb: int | None = None,
@@ -3327,6 +4317,8 @@ def restart_build(
     return run_build(
         build_path,
         workers=workers,
+        scheduler=scheduler,
+        low_latitude_workers=low_latitude_workers,
         gaia_cache_entries=gaia_cache_entries,
         gaia_cache_mb=gaia_cache_mb,
         parent_memory_limit_mb=parent_memory_limit_mb,

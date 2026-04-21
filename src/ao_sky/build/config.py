@@ -287,6 +287,8 @@ def resolve_traversal_execution_config(
     *,
     outer_level: int,
     workers: int | None = None,
+    scheduler: str | None = None,
+    low_latitude_workers: int | None = None,
     gaia_cache_entries: int | None = None,
     gaia_cache_mb: int | None = None,
     parent_memory_limit_mb: int | None = None,
@@ -305,6 +307,14 @@ def resolve_traversal_execution_config(
         default=1,
         name="workers",
     )
+    resolved_low_latitude_workers = _resolve_optional_int_setting(
+        low_latitude_workers,
+        build_data.get("low_latitude_workers"),
+        name="low_latitude_workers",
+    )
+    resolved_scheduler = str(
+        scheduler if scheduler is not None else build_data.get("scheduler", "static")
+    ).strip().lower()
     resolved_cache_entries = _resolve_int_setting(
         gaia_cache_entries,
         conf_data.get("gaia_cache_entries"),
@@ -331,6 +341,21 @@ def resolve_traversal_execution_config(
 
     if resolved_workers < 1:
         raise BuildError(f"workers must be at least 1, got {resolved_workers}")
+    if resolved_scheduler not in {"static", "dynamic"}:
+        raise BuildError(
+            "scheduler must be either 'static' or 'dynamic', "
+            f"got {resolved_scheduler!r}"
+        )
+    if resolved_scheduler == "dynamic" and resolved_low_latitude_workers is not None:
+        raise BuildError("low_latitude_workers is only supported by the static scheduler")
+    if resolved_low_latitude_workers is not None and (
+        resolved_low_latitude_workers < 1
+        or resolved_low_latitude_workers > resolved_workers
+    ):
+        raise BuildError(
+            "low_latitude_workers must be between 1 and workers "
+            f"({resolved_workers}), got {resolved_low_latitude_workers}"
+        )
     if resolved_cache_entries < 0:
         raise BuildError(
             f"gaia_cache_entries must be non-negative, got {resolved_cache_entries}"
@@ -350,6 +375,8 @@ def resolve_traversal_execution_config(
 
     return TraversalExecutionConfig(
         workers=resolved_workers,
+        scheduler=resolved_scheduler,
+        low_latitude_workers=resolved_low_latitude_workers,
         gaia_cache_entries=resolved_cache_entries,
         gaia_cache_mb=resolved_cache_mb,
         region_level=derive_traversal_region_level(
@@ -421,6 +448,21 @@ def _resolve_int_setting(
     value = explicit if explicit is not None else configured
     if value is None:
         return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise BuildError(f"{name} must be an integer") from exc
+
+
+def _resolve_optional_int_setting(
+    explicit: int | None,
+    configured: object,
+    *,
+    name: str,
+) -> int | None:
+    value = explicit if explicit is not None else configured
+    if value is None:
+        return None
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
