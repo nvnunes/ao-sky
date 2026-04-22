@@ -13,7 +13,7 @@ configuration is not part of the algorithm.
 
 Use [`architecture.md`](architecture.md) for package boundaries and persisted
 artifact ownership, [`plan.md`](plan.md) for migration phase context, and
-[`benchmarking.md`](benchmarking.md) for measured runtime and memory evidence.
+`docs/benchmarking.md` for measured runtime and memory evidence.
 
 ## Legacy Compatible Algorithm
 

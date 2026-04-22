@@ -5,3 +5,5 @@ __pycache__/
 /build/
 dist/
 site/
+docs/benchmarking/
+docs/validation/

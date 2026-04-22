@@ -2,6 +2,11 @@ site_name: ao-sky
 site_description: Gaia-backed AO-sky mapping and asterism search
 repo_name: ao-sky
 docs_dir: docs
+exclude_docs: |
+  benchmarking.md
+  benchmarking/**
+  validation.md
+  validation/**
 strict: true
 
 theme:
@@ -28,7 +33,6 @@ nav:
       - Algorithms: algorithms.md
       - Development: development.md
       - Testing: testing.md
-      - Benchmarking: benchmarking.md
       - Plan: plan.md
   - Reference:
       - Gaia API: reference/gaia/api.md

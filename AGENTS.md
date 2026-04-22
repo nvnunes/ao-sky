@@ -17,6 +17,9 @@
 - Follow `docs/benchmarking.md` for benchmark evidence that informs storage, scheduling, and cache decisions.
 - Follow `docs/testing.md` for verification expectations.
 
+## Research Logs
+- For capture, summary update, summary check, concept maintenance, or source-document upgrade work in `benchmarking` (`docs/benchmarking.md`, `docs/benchmarking/`) or `validation` (`docs/validation.md`, `docs/validation/`), use `astro-agents/research-log/AGENTS.md`.
+
 ## Shared Guidance
 - Use `astro-agents/guidance/agent-surface.md` for shared agent-surface guidance.
 - Use `astro-agents/guidance/public-python-projects.md` for shared public Python repo guidance.

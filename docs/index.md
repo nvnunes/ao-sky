@@ -28,6 +28,4 @@ The current repo surface establishes:
   installs, and daily commands
 - [`testing.md`](testing.md): canonical verification commands and completion
   expectations
-- [`benchmarking.md`](benchmarking.md): retained storage and scheduling
-  benchmark evidence
 - [`plan.md`](plan.md): migration sequencing and immediate next steps
