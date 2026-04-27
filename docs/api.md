@@ -32,9 +32,9 @@ The current package-supported Gaia API exposes:
 - `GAIA_SUMMARY_DTYPE`
 - `GAIA_SUMMARY_FILENAME`
 - `GaiaTableCacheStats`
-- `HDF5_COMPRESSION`
-- `HDF5_COMPRESSION_OPTS`
-- `HDF5_SHUFFLE`
+- `HDF5_COMPRESSION` (`"blosc-zstd"`)
+- `HDF5_COMPRESSION_OPTS` (`5`)
+- `HDF5_SHUFFLE` (`True`)
 
 The canonical raw Gaia schema is:
 
@@ -61,15 +61,17 @@ The shared Gaia summary path contract is:
 The canonical stored dataset is:
 
 - HDF5 dataset name: `gaia`
-- compression: `gzip`
-- compression options: `9`
-- shuffle: `True`
+- codec: Blosc Zstd
+- Blosc compression level: `5`
+- Blosc shuffle: enabled
+- Python dependency: `hdf5plugin`
 
 The shared Gaia summary dataset is:
 
 - HDF5 dataset name: `summary`
 - one dense row per outer pixel
 - fields: `outer_pix`, `star_count`, `loaded`
+- stored with the same Blosc Zstd level 5 HDF5 codec as per-pixel Gaia files
 
 ### `ao_sky.dust`
 
@@ -95,22 +97,22 @@ Traversal and aggregation sample this cache with `numpy.load(...,
 mmap_mode="r")`, using the same `max_data_level` coarse-sampling rule as the
 legacy pipeline.
 
-### Derived Build Artifact Compression
+### Repo-Owned HDF5 Compression
 
-Derived build artifacts are HDF5 files written by `ao_sky.build`, including
-per-outer-pixel `outer.h5` files, all-sky `maps-hpx<level>.h5` files, and
-augmentation datasets inside map files.
+Repo-owned HDF5 files use one compression contract for new writes:
 
-The default derived-artifact compression contract is:
-
-- codec: Blosc Zstd
+- codec: Blosc Zstd through `hdf5plugin`
 - Blosc compression level: `5`
 - Blosc shuffle: enabled
 - Python dependency: `hdf5plugin`
 
-Code that reads these artifacts through `ao_sky.build` readers gets the HDF5
-plugin registration automatically. Code that opens the files directly with
-`h5py` should import `hdf5plugin` before reading plugin-compressed datasets.
+This applies to canonical Gaia `gaia.h5` files, Gaia `summary.h5` files, and
+derived build artifacts such as per-outer-pixel `outer.h5`,
+`maps-hpx<level>.h5`, and augmentation datasets inside map files. Existing
+legacy `gzip=9` Gaia files remain readable. Code that reads HDF5 files through
+`ao_sky` readers gets HDF5 plugin registration automatically. Code that opens
+repo-owned HDF5 files directly with `h5py` should import `hdf5plugin` before
+reading plugin-compressed datasets.
 
 ### `ao_sky.spatial`
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Final
 
+from .._hdf5 import HDF5_BLOSC_LEVEL, HDF5_CODEC_NAME, HDF5_SHUFFLE_ENABLED
+
 GAIA_SCHEMA_COLUMNS: Final[tuple[str, ...]] = (
     "source_id",
     "ra",
@@ -40,6 +42,6 @@ GAIA_SUMMARY_DTYPE: Final[tuple[tuple[str, str], ...]] = (
     ("star_count", "<i8"),
     ("loaded", "?"),
 )
-HDF5_COMPRESSION: Final[str] = "gzip"
-HDF5_COMPRESSION_OPTS: Final[int] = 9
-HDF5_SHUFFLE: Final[bool] = True
+HDF5_COMPRESSION: Final[str] = HDF5_CODEC_NAME
+HDF5_COMPRESSION_OPTS: Final[int] = HDF5_BLOSC_LEVEL
+HDF5_SHUFFLE: Final[bool] = HDF5_SHUFFLE_ENABLED

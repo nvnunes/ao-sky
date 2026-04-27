@@ -18,24 +18,22 @@ import h5py
 import numpy as np
 from astropy.table import Table
 
+from .._hdf5 import ensure_hdf5_filters, hdf5_dataset_options
+from .._paths import get_outer_pixel_bucket_path
 from ._constants import (
     GAIA_SUMMARY_DATASET_NAME,
     GAIA_SUMMARY_DTYPE,
     GAIA_SUMMARY_FILENAME,
     GAIA_SCHEMA_COLUMNS,
-    HDF5_COMPRESSION,
-    HDF5_COMPRESSION_OPTS,
     HDF5_DATASET_NAME,
-    HDF5_SHUFFLE,
 )
 from ._exceptions import GaiaError
+from ._query import query_healpix_table
 from ._schema import (
     coerce_table_to_canonical_gaia_schema,
     structured_array_to_table,
     table_to_structured_array,
 )
-from ._query import query_healpix_table
-from .._paths import get_outer_pixel_bucket_path
 
 
 def _gaia_root_prefix(root: Path, release: str, healpix_level: int) -> Path:
@@ -208,6 +206,7 @@ class GaiaHealpixStore:
         )
 
     def _read_healpix_file(self, filename: Path) -> Table:
+        ensure_hdf5_filters()
         with h5py.File(filename, "r") as handle:
             if HDF5_DATASET_NAME not in handle:
                 raise GaiaError(
@@ -230,9 +229,7 @@ class GaiaHealpixStore:
                 handle.create_dataset(
                     HDF5_DATASET_NAME,
                     data=data,
-                    compression=HDF5_COMPRESSION,
-                    compression_opts=HDF5_COMPRESSION_OPTS,
-                    shuffle=HDF5_SHUFFLE,
+                    **hdf5_dataset_options(),
                 )
             tmp_path.replace(filename)
         finally:
@@ -267,6 +264,7 @@ class GaiaSummaryStore:
         filename = self.summary_filename()
         if not filename.is_file():
             raise GaiaError(f"Missing Gaia summary file: {filename}")
+        ensure_hdf5_filters()
         with h5py.File(filename, "r") as handle:
             array = self._require_summary_dataset(handle)[...]
         return Table(array)
@@ -287,9 +285,7 @@ class GaiaSummaryStore:
                 handle.create_dataset(
                     GAIA_SUMMARY_DATASET_NAME,
                     data=data,
-                    compression=HDF5_COMPRESSION,
-                    compression_opts=HDF5_COMPRESSION_OPTS,
-                    shuffle=HDF5_SHUFFLE,
+                    **hdf5_dataset_options(),
                 )
             tmp_path.replace(filename)
         finally:
@@ -302,6 +298,7 @@ class GaiaSummaryStore:
 
         filename = self.summary_filename()
         if filename.is_file():
+            ensure_hdf5_filters()
             with h5py.File(filename, "r") as handle:
                 self._require_summary_dataset(handle, expected_num_pixels=num_pixels)
             return filename
@@ -311,6 +308,7 @@ class GaiaSummaryStore:
         """Open the shared summary file for in-place row updates."""
 
         filename = self.initialize_summary(num_pixels)
+        ensure_hdf5_filters()
         handle = h5py.File(filename, "r+")
         try:
             dataset = self._require_summary_dataset(

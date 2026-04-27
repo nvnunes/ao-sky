@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import time
 
 import h5py
-import hdf5plugin
 import numpy as np
 from astropy.table import Table
 
-from ..gaia._constants import HDF5_SHUFFLE
+from .._hdf5 import ensure_hdf5_filters, hdf5_dataset_options
 from ._constants import (
     ASTERISMS_DTYPE,
     INNER_DTYPE,
@@ -21,11 +19,6 @@ from ._constants import (
     OUTER_DATASET_ASTERISMS,
     OUTER_DATASET_INNER,
 )
-
-ARTIFACT_COMPRESSION_ENV = "AO_SKY_ARTIFACT_COMPRESSION"
-DEFAULT_ARTIFACT_COMPRESSION = "blosc-zstd"
-DEFAULT_ARTIFACT_BLOSC_LEVEL = 5
-HDF5_BLOSC_FILTER_ID = 32001
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,63 +94,6 @@ def _table_to_structured_array(table: Table, dtype: np.dtype) -> np.ndarray:
     return data
 
 
-def _artifact_hdf5_dataset_options() -> dict[str, object]:
-    """Return HDF5 dataset options for derived build artifacts."""
-
-    mode = os.environ.get(ARTIFACT_COMPRESSION_ENV, "").lower().strip()
-    if mode in {"", "default", DEFAULT_ARTIFACT_COMPRESSION, "blosc_zstd"}:
-        return _blosc_zstd_dataset_options()
-    if mode in {"gzip9", "gzip-9"}:
-        return {"compression": "gzip", "compression_opts": 9, "shuffle": HDF5_SHUFFLE}
-    if mode in {"0", "false", "none", "off", "uncompressed"}:
-        return {}
-    if mode in {"gzip1", "gzip-1"}:
-        return {"compression": "gzip", "compression_opts": 1, "shuffle": HDF5_SHUFFLE}
-    if mode in {"gzip4", "gzip-4"}:
-        return {"compression": "gzip", "compression_opts": 4, "shuffle": HDF5_SHUFFLE}
-    if mode == "lzf":
-        return {"compression": "lzf", "shuffle": HDF5_SHUFFLE}
-    if mode in {"blosc-lz4", "blosc_lz4"}:
-        return dict(
-            _load_hdf5plugin().Blosc(
-                cname="lz4",
-                clevel=DEFAULT_ARTIFACT_BLOSC_LEVEL,
-                shuffle=1,
-            )
-        )
-    if mode in {"bitshuffle-lz4", "bitshuffle_lz4"}:
-        return dict(
-            _load_hdf5plugin().Bitshuffle(
-                cname="lz4",
-                clevel=DEFAULT_ARTIFACT_BLOSC_LEVEL,
-            )
-        )
-    raise ValueError(
-        f"Unsupported {ARTIFACT_COMPRESSION_ENV}={mode!r}; expected one of "
-        "gzip9, gzip1, gzip4, lzf, blosc-lz4, blosc-zstd, bitshuffle-lz4, none"
-    )
-
-
-def _blosc_zstd_dataset_options() -> dict[str, object]:
-    return dict(
-        _load_hdf5plugin().Blosc(
-            cname="zstd",
-            clevel=DEFAULT_ARTIFACT_BLOSC_LEVEL,
-            shuffle=1,
-        )
-    )
-
-
-def _load_hdf5plugin():
-    """Return the imported hdf5plugin module for derived artifact filters."""
-
-    return hdf5plugin
-
-
-def _ensure_artifact_hdf5_filters() -> None:
-    _load_hdf5plugin()
-
-
 def write_outer_artifact(
     filename: Path,
     *,
@@ -229,7 +165,7 @@ def write_outer_artifact_profiled(
     hdf5_inner_seconds = 0.0
     hdf5_asterisms_seconds = 0.0
     hdf5_close_seconds = 0.0
-    dataset_options = _artifact_hdf5_dataset_options()
+    dataset_options = hdf5_dataset_options()
     open_started = time.perf_counter()
     handle = h5py.File(tmp_filename, "w")
     hdf5_open_seconds = time.perf_counter() - open_started
@@ -325,7 +261,7 @@ def write_maps_artifact(
     if tmp_filename.exists():
         tmp_filename.unlink()
 
-    dataset_options = _artifact_hdf5_dataset_options()
+    dataset_options = hdf5_dataset_options()
     with h5py.File(tmp_filename, "w") as handle:
         handle.create_dataset(
             MAPS_DATASET,
@@ -351,7 +287,7 @@ def write_maps_family_dataset(
     if tmp_filename.exists():
         tmp_filename.unlink()
 
-    dataset_options = _artifact_hdf5_dataset_options()
+    dataset_options = hdf5_dataset_options()
     with h5py.File(filename, "r") as source, h5py.File(tmp_filename, "w") as target:
         for name in source.keys():
             if name == dataset_name:
@@ -369,7 +305,7 @@ def write_maps_family_dataset(
 def read_outer_dataset(filename: Path, dataset_name: str) -> Table:
     """Read one dataset from a persisted outer artifact."""
 
-    _ensure_artifact_hdf5_filters()
+    ensure_hdf5_filters()
     with h5py.File(filename, "r") as handle:
         return Table(handle[dataset_name][...])
 
@@ -377,7 +313,7 @@ def read_outer_dataset(filename: Path, dataset_name: str) -> Table:
 def read_outer_aggregation_products(filename: Path) -> tuple[Table, np.ndarray]:
     """Read datasets needed by map aggregation from one outer artifact."""
 
-    _ensure_artifact_hdf5_filters()
+    ensure_hdf5_filters()
     with h5py.File(filename, "r") as handle:
         inner = Table(handle[OUTER_DATASET_INNER][...])
         asterism_pix = np.asarray(
@@ -390,7 +326,7 @@ def read_outer_aggregation_products(filename: Path) -> tuple[Table, np.ndarray]:
 def read_outer_products(filename: Path) -> tuple[Table, Table]:
     """Read inner and retained-asterism datasets from one outer artifact."""
 
-    _ensure_artifact_hdf5_filters()
+    ensure_hdf5_filters()
     with h5py.File(filename, "r") as handle:
         inner = Table(handle[OUTER_DATASET_INNER][...])
         asterisms = Table(handle[OUTER_DATASET_ASTERISMS][...])
@@ -400,6 +336,6 @@ def read_outer_products(filename: Path) -> tuple[Table, Table]:
 def read_maps_dataset(filename: Path, dataset_name: str = MAPS_DATASET) -> Table:
     """Read one dataset from a dense all-sky maps artifact."""
 
-    _ensure_artifact_hdf5_filters()
+    ensure_hdf5_filters()
     with h5py.File(filename, "r") as handle:
         return Table(handle[dataset_name][...])

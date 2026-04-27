@@ -192,7 +192,8 @@ The current full-build operating default on the local workstation is:
 - `prediction.averaged_device: auto`
 - `build.roots.gaia: /Users/nelsonnunes/ao-sky-cache/gaia`
 - artifact writes go directly to the build tree on `/Volumes/Data/Galaxy/aosky`
-- derived build artifacts use Blosc Zstd compression
+- repo-owned HDF5 writes use Blosc Zstd level 5 compression, including
+  canonical Gaia files and derived build artifacts
 - speculative Gaia prewarm, write-behind artifact writes, and SSD artifact
   staging are documented in `docs/benchmarking.md` but are not retained in the
   active implementation

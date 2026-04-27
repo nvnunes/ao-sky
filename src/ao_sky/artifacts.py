@@ -9,6 +9,7 @@ from astropy.table import Table
 import h5py
 import numpy as np
 
+from ._hdf5 import ensure_hdf5_filters
 from ._paths import get_outer_pixel_bucket_path
 from .build._constants import (
     MAPS_DATASET,
@@ -177,6 +178,7 @@ class AoSkyArtifactStore:
     def gaia(self, outer_pix: int, *, outer_level: int) -> Table:
         """Read one raw Gaia table from the artifact tree."""
 
+        ensure_hdf5_filters()
         with h5py.File(self.gaia_path(outer_pix, outer_level=outer_level), "r") as handle:
             return Table(handle[HDF5_DATASET_NAME][...])
 

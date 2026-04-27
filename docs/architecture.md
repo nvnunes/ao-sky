@@ -139,7 +139,8 @@ The architecture uses distinct data layers with explicit ownership.
 - Stored without derived working bands.
 - Loaded through explicit schema-aware readers.
 - Stored at `<root>/gaia-<release>-hpx<healpix_level>/<hour>h/<sign><deg>/<outer_pix>/gaia.h5`.
-- Stored as one HDF5 dataset named `gaia` using `gzip=9` and `shuffle=True`.
+- Stored as one HDF5 dataset named `gaia` using Blosc Zstd level 5
+  compression through `hdf5plugin`.
 - The shared summary is stored at `<root>/gaia-<release>-hpx<healpix_level>/summary.h5`.
 
 ### Derived Build Artifacts
@@ -148,9 +149,9 @@ The architecture uses distinct data layers with explicit ownership.
 - Asterism catalogs.
 - Aggregate map products.
 - Survey-extent overlays and other derived summaries.
-- Stored as HDF5 datasets using Blosc Zstd compression through
-  `hdf5plugin`; readers that bypass `ao_sky.build` and use `h5py` directly
-  must import `hdf5plugin` before reading these artifacts.
+- Stored as HDF5 datasets using Blosc Zstd level 5 compression through
+  `hdf5plugin`; readers that bypass `ao_sky` and use `h5py` directly must
+  import `hdf5plugin` before reading repo-owned HDF5 datasets.
 - Versioned by build metadata and output layout version, not by ad hoc folder
   naming.
 

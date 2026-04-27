@@ -16,6 +16,7 @@ import yaml
 from astropy.table import Table
 from mocpy import MOC
 
+from ao_sky._hdf5 import HDF5_BLOSC_FILTER_ID, HDF5_BLOSC_LEVEL
 from ao_sky.build import (
     check_runtime_roots,
     fetch_gaia_data,
@@ -72,8 +73,6 @@ from ao_sky.build.regional import (
     order_region_outer_pixs,
 )
 from ao_sky.build.artifacts import (
-    DEFAULT_ARTIFACT_BLOSC_LEVEL,
-    HDF5_BLOSC_FILTER_ID,
     write_outer_artifact,
     write_outer_artifact_profiled,
 )
@@ -2513,30 +2512,7 @@ def test_processed_empty_pixels_still_write_empty_asterisms_dataset(
         assert len(handle[OUTER_DATASET_ASTERISMS]) == 0
 
 
-def test_outer_artifact_compression_can_be_disabled_for_benchmarks(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AO_SKY_ARTIFACT_COMPRESSION", "none")
-
-    profile = write_outer_artifact_profiled(
-        tmp_path / "outer.h5",
-        inner=_make_inner(),
-        asterisms=_make_asterisms(empty=True),
-    )
-
-    assert profile.output_bytes > 0
-    with h5py.File(tmp_path / "outer.h5", "r") as handle:
-        assert handle[OUTER_DATASET_INNER].compression is None
-        assert handle[OUTER_DATASET_ASTERISMS].compression is None
-
-
-def test_outer_artifact_uses_blosc_zstd_by_default(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("AO_SKY_ARTIFACT_COMPRESSION", raising=False)
-
+def test_outer_artifact_uses_blosc_zstd(tmp_path: Path) -> None:
     write_outer_artifact_profiled(
         tmp_path / "outer.h5",
         inner=_make_inner(),
@@ -2545,12 +2521,15 @@ def test_outer_artifact_uses_blosc_zstd_by_default(
 
     with h5py.File(tmp_path / "outer.h5", "r") as handle:
         dataset = handle[OUTER_DATASET_INNER]
-        filter_id, _, filter_values, filter_name = dataset.id.get_create_plist().get_filter(0)
+        filter_id, _, filter_values, filter_name = dataset.id.get_create_plist().get_filter(
+            0
+        )
         assert dataset.compression == "unknown"
         assert filter_id == HDF5_BLOSC_FILTER_ID
         assert filter_name == b"blosc"
-        assert filter_values[4] == DEFAULT_ARTIFACT_BLOSC_LEVEL
+        assert filter_values[4] == HDF5_BLOSC_LEVEL
         assert filter_values[5] == 1
+
 
 def test_run_build_does_not_apply_density_skip(
     tmp_path: Path,

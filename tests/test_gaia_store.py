@@ -10,13 +10,15 @@ import numpy as np
 import pytest
 from astropy.table import MaskedColumn, Table
 
+from ao_sky._hdf5 import (
+    HDF5_BLOSC_FILTER_ID,
+    HDF5_BLOSC_LEVEL,
+    hdf5_dataset_options,
+)
 from ao_sky.gaia import (
     GAIA_SUMMARY_DATASET_NAME,
     GAIA_SCHEMA_COLUMNS,
-    HDF5_COMPRESSION,
-    HDF5_COMPRESSION_OPTS,
     HDF5_DATASET_NAME,
-    HDF5_SHUFFLE,
     GaiaError,
     GaiaHealpixStore,
     GaiaStoreConfig,
@@ -55,10 +57,31 @@ def _write_hdf5(filename: Path, table: Table) -> None:
         handle.create_dataset(
             HDF5_DATASET_NAME,
             data=table.as_array(),
-            compression=HDF5_COMPRESSION,
-            compression_opts=HDF5_COMPRESSION_OPTS,
-            shuffle=HDF5_SHUFFLE,
+            **hdf5_dataset_options(),
         )
+
+
+def _write_legacy_gzip_hdf5(filename: Path, table: Table) -> None:
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(filename, "w") as handle:
+        handle.create_dataset(
+            HDF5_DATASET_NAME,
+            data=table.as_array(),
+            compression="gzip",
+            compression_opts=9,
+            shuffle=True,
+        )
+
+
+def _assert_blosc_zstd_dataset(dataset: h5py.Dataset) -> None:
+    filter_id, _, filter_values, filter_name = dataset.id.get_create_plist().get_filter(
+        0
+    )
+    assert dataset.compression == "unknown"
+    assert filter_id == HDF5_BLOSC_FILTER_ID
+    assert filter_name == b"blosc"
+    assert filter_values[4] == HDF5_BLOSC_LEVEL
+    assert filter_values[5] == 1
 
 
 def test_healpix_path_uses_release_level_and_legacy_hour_override(tmp_path: Path) -> None:
@@ -93,6 +116,21 @@ def test_load_healpix_reads_existing_canonical_file(tmp_path: Path) -> None:
     expected = _make_table()
     filename = store.healpix_filename(0)
     _write_hdf5(filename, expected)
+
+    loaded = store.load_healpix(0)
+
+    assert loaded.colnames == list(GAIA_SCHEMA_COLUMNS)
+    assert np.array_equal(loaded["source_id"], expected["source_id"])
+    assert np.allclose(loaded["ra"], expected["ra"])
+
+
+def test_load_healpix_reads_legacy_gzip_canonical_file(tmp_path: Path) -> None:
+    store = GaiaHealpixStore(
+        GaiaStoreConfig(root=tmp_path, release="dr3", healpix_level=6)
+    )
+    expected = _make_table()
+    filename = store.healpix_filename(0)
+    _write_legacy_gzip_hdf5(filename, expected)
 
     loaded = store.load_healpix(0)
 
@@ -236,9 +274,7 @@ def test_materialized_hdf5_uses_expected_dataset_settings(
 
     with h5py.File(store.healpix_filename(0), "r") as handle:
         dataset = handle[HDF5_DATASET_NAME]
-        assert dataset.compression == HDF5_COMPRESSION
-        assert dataset.compression_opts == HDF5_COMPRESSION_OPTS
-        assert dataset.shuffle == HDF5_SHUFFLE
+        _assert_blosc_zstd_dataset(dataset)
 
 
 def test_summary_filename_uses_release_and_level_root(tmp_path: Path) -> None:
@@ -277,9 +313,7 @@ def test_fetch_gaia_store_writes_dense_summary_and_skips_existing_by_default(
     assert np.all(np.asarray(summary["loaded"], dtype=np.bool_))
     with h5py.File(summary_filename, "r") as handle:
         dataset = handle[GAIA_SUMMARY_DATASET_NAME]
-        assert dataset.compression == HDF5_COMPRESSION
-        assert dataset.compression_opts == HDF5_COMPRESSION_OPTS
-        assert dataset.shuffle == HDF5_SHUFFLE
+        _assert_blosc_zstd_dataset(dataset)
 
 
 def test_fetch_gaia_store_force_rewrites_files_one_pixel_at_a_time(

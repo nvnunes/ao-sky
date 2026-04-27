@@ -182,11 +182,11 @@ least `max(4, workers * 4)` outer pixels per region, clamped by `outer_level`.
 Worker-local Gaia table cache settings are also runtime-only. Set
 `--gaia-cache-entries 0` or `--gaia-cache-mb 0` only for cache comparison
 benchmarks; normal Traversal should keep the prepared Gaia table cache enabled.
-Derived build artifacts use Blosc Zstd compression by default through
-`hdf5plugin`. This keeps `outer.h5` and `maps-hpx<level>.h5` close to the
-smallest measured artifact size while removing most of the old `gzip=9`
-write-time cost. If you inspect these files directly with `h5py`, import
-`hdf5plugin` first so the HDF5 filter is registered in the process.
+Repo-owned HDF5 datasets use Blosc Zstd level 5 compression through
+`hdf5plugin` for new writes, including canonical Gaia files and derived
+artifacts. Existing legacy `gzip=9` Gaia files remain readable. If you inspect
+these files directly with `h5py`, import `hdf5plugin` first so the HDF5 filter
+is registered in the process.
 Artifact writes are direct and worker-owned; SSD artifact staging was measured
 and removed from the active execution surface.
 
