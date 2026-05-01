@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import os
 from pathlib import Path
 import time
 
@@ -20,8 +19,6 @@ _POINT_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
 _MEAN_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
 _FEATURE_TEMPLATE_CACHE: dict[_FeatureTemplateKey, "_FeatureTemplate"] = {}
 _FEATURE_BUFFER_CACHE: dict[int, np.ndarray] = {}
-PREDICT_DEVICE_ENV_VAR = "AO_SKY_PREDICT_DEVICE"
-AVERAGED_PREDICT_DEVICE_ENV_VAR = "AO_SKY_AVERAGED_PREDICT_DEVICE"
 
 
 @dataclass(slots=True)
@@ -119,17 +116,13 @@ def _get_model_cache_key(
     )
 
 
-def _force_cpu_for_device_env(env_var: str) -> bool:
-    value = os.environ.get(env_var, "cpu").strip().lower()
+def _force_cpu_for_device(device: str, *, field_name: str) -> bool:
+    value = str(device).strip().lower()
     if value in {"", "cpu"}:
         return True
     if value == "auto":
         return False
-    raise PredictError(f"{env_var} must be 'cpu' or 'auto', got {value!r}")
-
-
-def _force_cpu_for_backend() -> bool:
-    return _force_cpu_for_device_env(PREDICT_DEVICE_ENV_VAR)
+    raise PredictError(f"{field_name} must be 'cpu' or 'auto', got {value!r}")
 
 
 def clear_backend_cache() -> None:
@@ -150,7 +143,7 @@ def configure_inference_threads(num_threads: int) -> None:
     backend.configure_inference_threads(num_threads)
 
 
-def get_point_model(runtime: PredictRuntime, num_stars: int):
+def get_point_model(runtime: PredictRuntime, num_stars: int, *, device: str = "cpu"):
     """Return the cached point model for one surviving guide-star count."""
 
     key = f"{int(num_stars)}star"
@@ -158,7 +151,7 @@ def get_point_model(runtime: PredictRuntime, num_stars: int):
     if model_name is None:
         raise PredictError(f"Missing resolved model for {key}")
 
-    force_cpu = _force_cpu_for_backend()
+    force_cpu = _force_cpu_for_device(device, field_name="device")
     cache_key = _get_model_cache_key(
         "point",
         runtime,
@@ -175,7 +168,7 @@ def get_point_model(runtime: PredictRuntime, num_stars: int):
     return _POINT_MODEL_CACHE[cache_key]
 
 
-def get_mean_model(runtime: PredictRuntime, num_stars: int):
+def get_mean_model(runtime: PredictRuntime, num_stars: int, *, device: str = "cpu"):
     """Return the cached mean-field model for one surviving guide-star count."""
 
     key = f"{int(num_stars)}star"
@@ -183,7 +176,7 @@ def get_mean_model(runtime: PredictRuntime, num_stars: int):
     if model_name is None:
         raise PredictError(f"Missing averaged model for {key}")
 
-    force_cpu = _force_cpu_for_device_env(AVERAGED_PREDICT_DEVICE_ENV_VAR)
+    force_cpu = _force_cpu_for_device(device, field_name="device")
     cache_key = _get_model_cache_key(
         "mean",
         runtime,
@@ -200,12 +193,17 @@ def get_mean_model(runtime: PredictRuntime, num_stars: int):
     return _MEAN_MODEL_CACHE[cache_key]
 
 
-def warm_model_cache(runtime: PredictRuntime) -> None:
+def warm_model_cache(
+    runtime: PredictRuntime,
+    *,
+    prediction_device: str = "cpu",
+    averaged_prediction_device: str = "cpu",
+) -> None:
     """Load all configured temporary backend models for one AO runtime."""
 
     for num_stars in range(runtime.ao_system.min_wfs, runtime.ao_system.max_wfs + 1):
-        get_point_model(runtime, num_stars)
-        get_mean_model(runtime, num_stars)
+        get_point_model(runtime, num_stars, device=prediction_device)
+        get_mean_model(runtime, num_stars, device=averaged_prediction_device)
 
 
 def _get_ao_lgs_xy(lgs: tuple[dict[str, float], ...]) -> list[dict[str, float]]:

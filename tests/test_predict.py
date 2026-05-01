@@ -13,7 +13,7 @@ import astropy.units as u
 from astropy.table import Table
 
 from ao_sky.build import init_build as real_init_build
-from ao_sky.build._models import BuildDefinition
+from ao_sky.build._models import BuildDefinition, TraversalExecutionConfig
 from ao_sky.build._exceptions import BuildError
 from ao_sky.build.config import load_build_definition as load_build_definition_yaml
 from ao_sky.build.control import load_build_roots
@@ -26,7 +26,6 @@ from ao_sky.build.runtime_config import (
 )
 from ao_sky.build.traversal import (
     DEFAULT_BACKEND_BUCKETS,
-    RESOLVED_CACHE_CLEAR_EVERY,
     TraversalGeometry,
     TraversalStructureProfile,
     _backend_buffer_row_count,
@@ -877,7 +876,6 @@ def test_backend_bucket_helpers_cap_logical_batches_at_buffer_size() -> None:
     buckets = (1024, 2048, 4096)
 
     assert DEFAULT_BACKEND_BUCKETS == tuple(range(1000, 25001, 1000))
-    assert RESOLVED_CACHE_CLEAR_EVERY == -1
     assert _stream_batch_size(5000, buckets) == 4096
     assert _stream_batch_size(3000, buckets) == 3000
     assert _stream_batch_size(3000, ()) == 3000
@@ -1557,7 +1555,6 @@ def test_model_cache_key_includes_model_root_and_model_name(
 ) -> None:
     predict_service._POINT_MODEL_CACHE.clear()
     predict_service._MEAN_MODEL_CACHE.clear()
-    monkeypatch.delenv(predict_service.PREDICT_DEVICE_ENV_VAR, raising=False)
     loaded: list[tuple[Path, str, bool]] = []
 
     def fake_load_model(
@@ -1607,11 +1604,9 @@ def test_model_cache_key_includes_backend_device_policy(
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
     runtime = _make_predict_runtime(model_root=tmp_path / "models")
 
-    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "cpu")
-    assert predict_service.get_point_model(runtime, 2) == "force_cpu=True"
+    assert predict_service.get_point_model(runtime, 2, device="cpu") == "force_cpu=True"
 
-    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "auto")
-    assert predict_service.get_point_model(runtime, 2) == "force_cpu=False"
+    assert predict_service.get_point_model(runtime, 2, device="auto") == "force_cpu=False"
 
     assert loaded == [True, False]
 
@@ -1633,9 +1628,6 @@ def test_mean_model_stays_on_cpu_when_resolved_allows_auto_device(
         return f"force_cpu={bool(force_cpu)}"
 
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
-    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "auto")
-    monkeypatch.delenv(predict_service.AVERAGED_PREDICT_DEVICE_ENV_VAR, raising=False)
-
     runtime = _make_predict_runtime(model_root=tmp_path / "models")
 
     assert predict_service.get_mean_model(runtime, 2) == "force_cpu=True"
@@ -1659,11 +1651,9 @@ def test_mean_model_can_use_auto_device_when_explicitly_enabled(
         return f"force_cpu={bool(force_cpu)}"
 
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
-    monkeypatch.setenv(predict_service.AVERAGED_PREDICT_DEVICE_ENV_VAR, "auto")
-
     runtime = _make_predict_runtime(model_root=tmp_path / "models")
 
-    assert predict_service.get_mean_model(runtime, 2) == "force_cpu=False"
+    assert predict_service.get_mean_model(runtime, 2, device="auto") == "force_cpu=False"
     assert loaded == [False]
 
 
@@ -1673,12 +1663,12 @@ def test_model_device_policy_rejects_unknown_value(
 ) -> None:
     predict_service._POINT_MODEL_CACHE.clear()
     predict_service._MEAN_MODEL_CACHE.clear()
-    monkeypatch.setenv(predict_service.PREDICT_DEVICE_ENV_VAR, "mps")
 
-    with pytest.raises(PredictError, match="AO_SKY_PREDICT_DEVICE"):
+    with pytest.raises(PredictError, match="device"):
         predict_service.get_point_model(
             _make_predict_runtime(model_root=tmp_path / "models"),
             2,
+            device="mps",
         )
 
 
@@ -1688,12 +1678,12 @@ def test_mean_model_validates_averaged_device_policy_value(
 ) -> None:
     predict_service._POINT_MODEL_CACHE.clear()
     predict_service._MEAN_MODEL_CACHE.clear()
-    monkeypatch.setenv(predict_service.AVERAGED_PREDICT_DEVICE_ENV_VAR, "mps")
 
-    with pytest.raises(PredictError, match="AO_SKY_AVERAGED_PREDICT_DEVICE"):
+    with pytest.raises(PredictError, match="device"):
         predict_service.get_mean_model(
             _make_predict_runtime(model_root=tmp_path / "models"),
             2,
+            device="mps",
         )
 
 
@@ -1795,8 +1785,14 @@ def test_build_traversal_products_retains_regularized_winners(
         )
 
     monkeypatch.setattr("ao_sky.build.traversal.build_base_inner_table", fake_build_base_inner_table)
-    monkeypatch.setattr("ao_sky.build.traversal.get_point_model", lambda runtime, num_stars: object())
-    monkeypatch.setattr("ao_sky.build.traversal.get_mean_model", lambda runtime, num_stars: object())
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.get_point_model",
+        lambda runtime, num_stars, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.get_mean_model",
+        lambda runtime, num_stars, **kwargs: object(),
+    )
 
     def fake_predict_point_arrays(
         runtime,
@@ -1845,10 +1841,6 @@ def test_build_traversal_products_retains_regularized_winners(
     monkeypatch.setattr("ao_sky.build.traversal.add_gaia_a0_to_inner", lambda inner, **kwargs: inner)
     cleared_backend_cache: list[None] = []
     monkeypatch.setattr(
-        "ao_sky.build.traversal.RESOLVED_CACHE_CLEAR_EVERY",
-        cache_clear_every,
-    )
-    monkeypatch.setattr(
         "ao_sky.build.traversal.clear_backend_cache",
         lambda: cleared_backend_cache.append(None),
     )
@@ -1858,6 +1850,9 @@ def test_build_traversal_products_retains_regularized_winners(
         _FakeStore(),
         runtime,
         0,
+        execution_config=TraversalExecutionConfig(
+            resolved_cache_clear_every=cache_clear_every,
+        ),
         dust_root=tmp_path / "dust",
         max_data_level=2,
         structure_profile=structure_profile,

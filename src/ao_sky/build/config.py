@@ -392,14 +392,16 @@ def resolve_traversal_execution_config(
 
 def _resolve_prediction_device_defaults(
     conf_data: dict[str, object],
-) -> tuple[str | None, str | None]:
+) -> tuple[str, str]:
     prediction_raw = conf_data.get("prediction")
     if not isinstance(prediction_raw, dict):
-        return None, None
+        return "cpu", "cpu"
 
     resolved_device = prediction_raw.get("resolved_device")
     averaged_device = prediction_raw.get("averaged_device")
-    shared_device = prediction_raw.get("device")
+    shared_device = prediction_raw.get("device", "cpu")
+    if shared_device is None:
+        shared_device = "cpu"
     if resolved_device is None:
         resolved_device = shared_device
     if averaged_device is None:

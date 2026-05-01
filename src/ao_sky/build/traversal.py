@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import math
-import os
 from pathlib import Path
 import time
 
@@ -37,95 +36,20 @@ from ..spatial import (
     get_subpixels,
 )
 from ._exceptions import BuildError
-from ._models import TraversalStageStats, TraversalStructureStats
+from ._models import (
+    DEFAULT_BACKEND_BUCKETS as _DEFAULT_BACKEND_BUCKETS,
+    DEFAULT_PREDICTION_BATCH_SIZE as _DEFAULT_PREDICTION_BATCH_SIZE,
+    TraversalExecutionConfig,
+    TraversalStageStats,
+    TraversalStructureStats,
+)
 from .runtime_gaia import RUNTIME_HPX_COLUMN, RUNTIME_HPX_LEVEL
 
 ASTERISM_BOUNDARY_RINGS = 2
 WINNER_TOP_K = 3
 WINNER_REGULARIZATION_PASSES = 3
-DEFAULT_PREDICTION_BATCH_SIZE = 25000
-DEFAULT_BACKEND_BUCKETS = tuple(range(1000, DEFAULT_PREDICTION_BATCH_SIZE + 1, 1000))
-PREDICTION_BATCH_SIZE_ENV_VAR = "AO_SKY_PREDICTION_BATCH_SIZE"
-RESOLVED_BACKEND_BUCKETS_ENV_VAR = "AO_SKY_RESOLVED_BACKEND_BUCKETS"
-AVERAGED_BACKEND_BUCKETS_ENV_VAR = "AO_SKY_AVERAGED_BACKEND_BUCKETS"
-RESOLVED_CACHE_CLEAR_EVERY_ENV_VAR = "AO_SKY_RESOLVED_CACHE_CLEAR_EVERY"
-
-
-def _read_prediction_batch_size() -> int:
-    raw = os.environ.get(
-        PREDICTION_BATCH_SIZE_ENV_VAR,
-        str(DEFAULT_PREDICTION_BATCH_SIZE),
-    )
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise BuildError(
-            f"{PREDICTION_BATCH_SIZE_ENV_VAR} must be a positive integer"
-        ) from exc
-    if value < 1:
-        raise BuildError(f"{PREDICTION_BATCH_SIZE_ENV_VAR} must be a positive integer")
-    return value
-
-
-PREDICTION_BATCH_SIZE = _read_prediction_batch_size()
-
-
-def _read_backend_buckets(
-    env_var: str,
-    *,
-    default: tuple[int, ...],
-) -> tuple[int, ...]:
-    raw = os.environ.get(env_var)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in {"", "none", "variable", "off"}:
-        return ()
-    try:
-        values = tuple(
-            sorted(
-                {
-                    int(value.strip())
-                    for value in raw.split(",")
-                    if value.strip()
-                }
-            )
-        )
-    except ValueError as exc:
-        raise BuildError(f"{env_var} must be a comma-separated list of integers") from exc
-    if not values or any(value < 1 for value in values):
-        raise BuildError(f"{env_var} must contain positive integer bucket sizes")
-    return values
-
-
-def _read_cache_clear_every() -> int:
-    raw = os.environ.get(RESOLVED_CACHE_CLEAR_EVERY_ENV_VAR, "never").strip().lower()
-    if raw in {"never", "none", "off"}:
-        return -1
-    if raw in {"end", "final", "0"}:
-        return 0
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise BuildError(
-            f"{RESOLVED_CACHE_CLEAR_EVERY_ENV_VAR} must be an integer, 'end', or 'never'"
-        ) from exc
-    if value < -1:
-        raise BuildError(
-            f"{RESOLVED_CACHE_CLEAR_EVERY_ENV_VAR} must be >= -1, 'end', or 'never'"
-        )
-    return value
-
-
-RESOLVED_BACKEND_BUCKETS = _read_backend_buckets(
-    RESOLVED_BACKEND_BUCKETS_ENV_VAR,
-    default=DEFAULT_BACKEND_BUCKETS,
-)
-AVERAGED_BACKEND_BUCKETS = _read_backend_buckets(
-    AVERAGED_BACKEND_BUCKETS_ENV_VAR,
-    default=DEFAULT_BACKEND_BUCKETS,
-)
-RESOLVED_CACHE_CLEAR_EVERY = _read_cache_clear_every()
+DEFAULT_PREDICTION_BATCH_SIZE = _DEFAULT_PREDICTION_BATCH_SIZE
+DEFAULT_BACKEND_BUCKETS = _DEFAULT_BACKEND_BUCKETS
 
 
 def _stream_batch_size(
@@ -135,16 +59,6 @@ def _stream_batch_size(
     if not buckets:
         return int(prediction_batch_size)
     return min(int(prediction_batch_size), int(buckets[-1]))
-
-
-RESOLVED_STREAM_BATCH_SIZE = _stream_batch_size(
-    PREDICTION_BATCH_SIZE,
-    RESOLVED_BACKEND_BUCKETS,
-)
-AVERAGED_STREAM_BATCH_SIZE = _stream_batch_size(
-    PREDICTION_BATCH_SIZE,
-    AVERAGED_BACKEND_BUCKETS,
-)
 
 
 def _backend_row_count(row_count: int, buckets: tuple[int, ...]) -> int | None:
@@ -1999,6 +1913,7 @@ def _scatter_top_candidates(
 
 def _flush_resolved_prediction_rows(
     runtime: PredictRuntime,
+    execution_config: TraversalExecutionConfig,
     *,
     num_stars: int,
     pixel_idxs: np.ndarray,
@@ -2038,7 +1953,11 @@ def _flush_resolved_prediction_rows(
     if profile is not None:
         profile.point_prediction_ngs_array_seconds += time.perf_counter() - started
     started = time.perf_counter()
-    model = get_point_model(runtime, num_stars)
+    model = get_point_model(
+        runtime,
+        num_stars,
+        device=execution_config.prediction_device,
+    )
     if profile is not None:
         profile.point_prediction_model_seconds += time.perf_counter() - started
     prediction_telemetry = _new_prediction_telemetry(profile, structure_profile)
@@ -2049,8 +1968,13 @@ def _flush_resolved_prediction_rows(
         ngs_zd=ngs_zd,
         ngs_az_deg=ngs_az,
         ngs_mag=ngs_mag,
-        backend_row_count=_backend_row_count(len(ngs_zd), RESOLVED_BACKEND_BUCKETS),
-        feature_buffer_row_count=_backend_buffer_row_count(RESOLVED_BACKEND_BUCKETS),
+        backend_row_count=_backend_row_count(
+            len(ngs_zd),
+            execution_config.resolved_backend_buckets,
+        ),
+        feature_buffer_row_count=_backend_buffer_row_count(
+            execution_config.resolved_backend_buckets,
+        ),
         prediction_telemetry=prediction_telemetry,
     )
     _record_prediction_telemetry(
@@ -2081,6 +2005,7 @@ def _flush_resolved_prediction_rows(
 
 def _stream_resolved_candidate_predictions(
     runtime: PredictRuntime,
+    execution_config: TraversalExecutionConfig,
     candidate_set: _CandidateSet,
     star_pixel_bits: np.ndarray,
     bright_allowed_bits: np.ndarray,
@@ -2102,7 +2027,11 @@ def _stream_resolved_candidate_predictions(
     memory_pressure_callback: Callable[[], None] | None = None,
 ) -> int:
     inner_count = len(inner_x)
-    buffer_capacity = RESOLVED_STREAM_BATCH_SIZE + inner_count
+    stream_batch_size = _stream_batch_size(
+        execution_config.prediction_batch_size,
+        execution_config.resolved_backend_buckets,
+    )
+    buffer_capacity = stream_batch_size + inner_count
     buffers: dict[int, _PredictionRowBuffer] = {
         order: _PredictionRowBuffer.create(buffer_capacity)
         for order in _enabled_candidate_orders(runtime)
@@ -2112,9 +2041,9 @@ def _stream_resolved_candidate_predictions(
     prediction_flushes = 0
 
     def maybe_clear_cache() -> None:
-        if RESOLVED_CACHE_CLEAR_EVERY < 1:
+        if execution_config.resolved_cache_clear_every < 1:
             return
-        if prediction_flushes % RESOLVED_CACHE_CLEAR_EVERY == 0:
+        if prediction_flushes % execution_config.resolved_cache_clear_every == 0:
             _clear_backend_cache_with_profile(profile)
 
     for candidate_id, members in enumerate(candidate_set.members):
@@ -2147,12 +2076,11 @@ def _stream_resolved_candidate_predictions(
         if profile is not None:
             profile.point_prediction_buffer_seconds += time.perf_counter() - started
         evaluated_rows += int(len(pixel_idxs))
-        while buffer.size >= RESOLVED_STREAM_BATCH_SIZE:
-            batch_pixel_idxs, batch_candidate_ids = buffer.head(
-                RESOLVED_STREAM_BATCH_SIZE
-            )
+        while buffer.size >= stream_batch_size:
+            batch_pixel_idxs, batch_candidate_ids = buffer.head(stream_batch_size)
             _flush_resolved_prediction_rows(
                 runtime,
+                execution_config,
                 num_stars=num_stars,
                 pixel_idxs=batch_pixel_idxs,
                 candidate_ids=batch_candidate_ids,
@@ -2173,7 +2101,7 @@ def _stream_resolved_candidate_predictions(
                 structure_profile=structure_profile,
             )
             prediction_flushes += 1
-            buffer.discard(RESOLVED_STREAM_BATCH_SIZE)
+            buffer.discard(stream_batch_size)
             maybe_clear_cache()
             if memory_pressure_callback is not None:
                 memory_pressure_callback()
@@ -2181,6 +2109,7 @@ def _stream_resolved_candidate_predictions(
         batch_pixel_idxs, batch_candidate_ids = buffer.arrays()
         _flush_resolved_prediction_rows(
             runtime,
+            execution_config,
             num_stars=num_stars,
             pixel_idxs=batch_pixel_idxs,
             candidate_ids=batch_candidate_ids,
@@ -2205,7 +2134,7 @@ def _stream_resolved_candidate_predictions(
             maybe_clear_cache()
             if memory_pressure_callback is not None:
                 memory_pressure_callback()
-    if RESOLVED_CACHE_CLEAR_EVERY > 0:
+    if execution_config.resolved_cache_clear_every > 0:
         _clear_backend_cache_with_profile(profile)
     if structure_profile is not None:
         structure_profile.context_pair_rows = int(evaluated_rows)
@@ -2463,6 +2392,7 @@ def _build_retained_asterism_table(
 
 def _update_regularized_winner_averaged_ee(
     runtime: PredictRuntime,
+    execution_config: TraversalExecutionConfig,
     inner: Table,
     labels: np.ndarray,
     candidate_set: _CandidateSet,
@@ -2484,11 +2414,15 @@ def _update_regularized_winner_averaged_ee(
         for order in _enabled_candidate_orders(runtime)
     }
     prediction_flushes = 0
+    stream_batch_size = _stream_batch_size(
+        execution_config.prediction_batch_size,
+        execution_config.averaged_backend_buckets,
+    )
 
     def maybe_clear_cache() -> None:
-        if RESOLVED_CACHE_CLEAR_EVERY < 1:
+        if execution_config.resolved_cache_clear_every < 1:
             return
-        if prediction_flushes % RESOLVED_CACHE_CLEAR_EVERY == 0:
+        if prediction_flushes % execution_config.resolved_cache_clear_every == 0:
             _clear_backend_cache_with_profile(profile)
 
     for pixel_idx in winner_pixel_idxs:
@@ -2502,9 +2436,13 @@ def _update_regularized_winner_averaged_ee(
         candidate_ids = buffer["candidate_ids"]
         if not pixel_idxs:
             continue
-        model = get_mean_model(runtime, num_stars)
-        for start_idx in range(0, len(pixel_idxs), AVERAGED_STREAM_BATCH_SIZE):
-            end_idx = min(start_idx + AVERAGED_STREAM_BATCH_SIZE, len(pixel_idxs))
+        model = get_mean_model(
+            runtime,
+            num_stars,
+            device=execution_config.averaged_prediction_device,
+        )
+        for start_idx in range(0, len(pixel_idxs), stream_batch_size):
+            end_idx = min(start_idx + stream_batch_size, len(pixel_idxs))
             batch_pixel_idxs = np.asarray(pixel_idxs[start_idx:end_idx], dtype=np.int64)
             batch_candidate_ids = np.asarray(candidate_ids[start_idx:end_idx], dtype=np.int64)
             ngs_zd, ngs_az, ngs_mag = _build_ngs_feature_arrays(
@@ -2528,10 +2466,10 @@ def _update_regularized_winner_averaged_ee(
                 ngs_mag=ngs_mag,
                 backend_row_count=_backend_row_count(
                     len(ngs_zd),
-                    AVERAGED_BACKEND_BUCKETS,
+                    execution_config.averaged_backend_buckets,
                 ),
                 feature_buffer_row_count=_backend_buffer_row_count(
-                    AVERAGED_BACKEND_BUCKETS,
+                    execution_config.averaged_backend_buckets,
                 ),
                 prediction_telemetry=prediction_telemetry,
             )
@@ -2545,7 +2483,7 @@ def _update_regularized_winner_averaged_ee(
             maybe_clear_cache()
             if memory_pressure_callback is not None:
                 memory_pressure_callback()
-    if RESOLVED_CACHE_CLEAR_EVERY > 0:
+    if execution_config.resolved_cache_clear_every > 0:
         _clear_backend_cache_with_profile(profile)
 
 
@@ -2554,6 +2492,7 @@ def build_traversal_products(
     runtime: PredictRuntime,
     outer_pix: int,
     *,
+    execution_config: TraversalExecutionConfig | None = None,
     dust_root: Path,
     max_data_level: int,
     geometry: TraversalGeometry | None = None,
@@ -2566,6 +2505,7 @@ def build_traversal_products(
 ) -> tuple[Table, Table]:
     """Return retained asterisms and the rich inner table for one outer pixel."""
 
+    execution_config = execution_config or TraversalExecutionConfig()
     geometry = geometry or TraversalGeometry.from_runtime(runtime)
 
     started = time.perf_counter()
@@ -2675,6 +2615,7 @@ def build_traversal_products(
         started = time.perf_counter()
         _stream_resolved_candidate_predictions(
             runtime,
+            execution_config,
             candidate_set,
             star_pixel_bits,
             bright_allowed_bits,
@@ -2745,6 +2686,7 @@ def build_traversal_products(
         started = time.perf_counter()
         _update_regularized_winner_averaged_ee(
             runtime,
+            execution_config,
             inner,
             labels,
             candidate_set,
@@ -2759,7 +2701,7 @@ def build_traversal_products(
         )
         if profile is not None:
             profile.field_mean_prediction_seconds += time.perf_counter() - started
-        if RESOLVED_CACHE_CLEAR_EVERY == 0:
+        if execution_config.resolved_cache_clear_every == 0:
             _clear_backend_cache_with_profile(profile)
         _sample_memory(
             memory_profile,

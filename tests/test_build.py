@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 from pathlib import Path
 from gzip import open as gzip_open
 
@@ -89,7 +88,10 @@ from ao_sky.predict import AOSystemRuntime, PredictRuntime
 
 @pytest.fixture(autouse=True)
 def _disable_runner_model_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("ao_sky.build.runner.warm_model_cache", lambda runtime: None)
+    monkeypatch.setattr(
+        "ao_sky.build.runner.warm_model_cache",
+        lambda runtime, **kwargs: None,
+    )
 
 
 def _write_build_definition(
@@ -800,8 +802,6 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("AO_SKY_PREDICT_DEVICE", raising=False)
-    monkeypatch.delenv("AO_SKY_AVERAGED_PREDICT_DEVICE", raising=False)
     conf = tmp_path / "ao-sky.yaml"
     conf.write_text(
         "\n".join(
@@ -835,8 +835,6 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         prediction_device="auto",
         averaged_prediction_device="auto",
     )
-    assert "AO_SKY_PREDICT_DEVICE" not in os.environ
-    assert "AO_SKY_AVERAGED_PREDICT_DEVICE" not in os.environ
 
     override = resolve_traversal_execution_config(
         outer_level=6,
@@ -864,8 +862,8 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         encoding="utf-8",
     )
     without_device = resolve_traversal_execution_config(outer_level=6, aosky_yaml=conf)
-    assert without_device.prediction_device is None
-    assert without_device.averaged_prediction_device is None
+    assert without_device.prediction_device == "cpu"
+    assert without_device.averaged_prediction_device == "cpu"
 
 
 def test_resolve_traversal_execution_config_validates_values(tmp_path: Path) -> None:
@@ -1138,7 +1136,10 @@ def test_run_build_uses_build_local_model_root_after_fetch_model(
         )
 
     monkeypatch.setattr("ao_sky.build.runner.load_runtime_config", capture_runtime)
-    monkeypatch.setattr("ao_sky.build.runner.warm_model_cache", lambda runtime: None)
+    monkeypatch.setattr(
+        "ao_sky.build.runner.warm_model_cache",
+        lambda runtime, **kwargs: None,
+    )
     monkeypatch.setattr(
         "ao_sky.build.runner.build_traversal_products",
         lambda store, runtime, outer_pix, **kwargs: (_make_asterisms(), _make_inner()),
@@ -1880,8 +1881,6 @@ def test_parent_memory_limit_uses_parent_plus_worker_current_rss(
     class FakeProcess:
         pid = 123
 
-    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "cpu")
-    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
     monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 4096.0)
     monkeypatch.setattr(runner_module, "_process_current_rss_mb", lambda pid: 9000.0)
 
@@ -1905,16 +1904,17 @@ def test_parent_memory_limit_reserves_gpu_driver_memory(
     class FakeProcess:
         pid = 123
 
-    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "auto")
-    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
-    monkeypatch.setenv("AO_SKY_PARENT_GPU_DRIVER_RESERVE_MB", "1000")
     monkeypatch.setattr(runner_module.predict_backend, "mps_is_available", lambda: True)
     monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 4096.0)
     monkeypatch.setattr(runner_module, "_process_current_rss_mb", lambda pid: 9000.0)
 
     with pytest.raises(BuildError, match="current total RAM"):
         runner_module._raise_if_parent_memory_limit_exceeded(
-            TraversalExecutionConfig(parent_memory_limit_mb=14000),
+            TraversalExecutionConfig(
+                parent_memory_limit_mb=14000,
+                prediction_device="auto",
+                parent_gpu_driver_reserve_mb=1000.0,
+            ),
             [FakeProcess()],
         )
 
@@ -1927,14 +1927,16 @@ def test_parent_memory_limit_does_not_reserve_gpu_when_mps_unavailable(
     class FakeProcess:
         pid = 123
 
-    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "auto")
-    monkeypatch.setenv("AO_SKY_PARENT_GPU_DRIVER_RESERVE_MB", "1000")
     monkeypatch.setattr(runner_module.predict_backend, "mps_is_available", lambda: False)
     monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 4096.0)
     monkeypatch.setattr(runner_module, "_process_current_rss_mb", lambda pid: 9000.0)
 
     runner_module._raise_if_parent_memory_limit_exceeded(
-        TraversalExecutionConfig(parent_memory_limit_mb=14000),
+        TraversalExecutionConfig(
+            parent_memory_limit_mb=14000,
+            prediction_device="auto",
+            parent_gpu_driver_reserve_mb=1000.0,
+        ),
         [FakeProcess()],
     )
 
@@ -1957,8 +1959,6 @@ def test_parent_memory_pressure_trims_heaviest_worker(
             self.commands.append(command)
 
     worker_rss = {10: 1000.0, 11: 1500.0, 12: 5750.0}
-    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "cpu")
-    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
     monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 500.0)
     monkeypatch.setattr(
         runner_module,
@@ -2012,8 +2012,6 @@ def test_parent_memory_pressure_pauses_heaviest_workers(
             self.commands.append(command)
 
     worker_rss = {10: 4000.0, 11: 3000.0, 12: 2500.0}
-    monkeypatch.setenv("AO_SKY_PREDICT_DEVICE", "cpu")
-    monkeypatch.setenv("AO_SKY_AVERAGED_PREDICT_DEVICE", "cpu")
     monkeypatch.setattr(runner_module, "_current_rss_mb", lambda: 250.0)
     monkeypatch.setattr(
         runner_module,

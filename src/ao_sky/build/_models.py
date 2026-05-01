@@ -7,6 +7,10 @@ from pathlib import Path
 
 from ..survey import SurveyExtentOverlaySpec
 
+DEFAULT_PREDICTION_BATCH_SIZE = 25000
+DEFAULT_BACKEND_BUCKETS = tuple(range(1000, DEFAULT_PREDICTION_BATCH_SIZE + 1, 1000))
+DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB = 1075.0
+
 
 @dataclass(frozen=True, slots=True)
 class BuildDefinition:
@@ -61,8 +65,13 @@ class TraversalExecutionConfig:
     region_level: int = 0
     parent_memory_limit_mb: int = 0
     telemetry: str = "basic"
-    prediction_device: str | None = None
-    averaged_prediction_device: str | None = None
+    prediction_device: str = "cpu"
+    averaged_prediction_device: str = "cpu"
+    prediction_batch_size: int = DEFAULT_PREDICTION_BATCH_SIZE
+    resolved_backend_buckets: tuple[int, ...] = DEFAULT_BACKEND_BUCKETS
+    averaged_backend_buckets: tuple[int, ...] = DEFAULT_BACKEND_BUCKETS
+    resolved_cache_clear_every: int = -1
+    parent_gpu_driver_reserve_mb: float = DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB
 
 
 @dataclass(frozen=True, slots=True)

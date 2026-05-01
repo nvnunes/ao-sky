@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
 import csv
 from dataclasses import dataclass, field
 import gc
 import multiprocessing
-import os
 from pathlib import Path
 from queue import Empty
 import resource
@@ -116,10 +114,6 @@ PARENT_MEMORY_PRESSURE_COMMAND_INTERVAL_SECONDS = 5.0
 PARENT_MEMORY_SNAPSHOT_INTERVAL_SECONDS = 60.0
 WORKER_MEMORY_PRESSURE_SLEEP_SECONDS = 0.25
 WORKER_MEMORY_PRESSURE_MAX_PAUSE_SECONDS = 30.0
-PREDICT_DEVICE_ENV_VAR = "AO_SKY_PREDICT_DEVICE"
-AVERAGED_PREDICT_DEVICE_ENV_VAR = "AO_SKY_AVERAGED_PREDICT_DEVICE"
-PARENT_GPU_DRIVER_RESERVE_MB_ENV_VAR = "AO_SKY_PARENT_GPU_DRIVER_RESERVE_MB"
-DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB = 1075.0
 
 
 def init_build(
@@ -1139,6 +1133,7 @@ def _materialize_outer_pixel_products(
     context: TraversalTaskContext,
     outer_pix: int,
     *,
+    execution_config: TraversalExecutionConfig | None = None,
     runtime=None,
     store=None,
     geometry: TraversalGeometry | None = None,
@@ -1148,9 +1143,11 @@ def _materialize_outer_pixel_products(
 ) -> tuple[ArtifactWriteProfile, TraversalStageStats, TraversalStructureStats]:
     """Run the Traversal pipeline for one outer pixel without mutating build state."""
 
+    execution_config = execution_config or TraversalExecutionConfig()
     filename, inner, asterisms, stage_stats, structure_stats = _build_outer_pixel_products(
         context,
         outer_pix,
+        execution_config=execution_config,
         runtime=runtime,
         store=store,
         geometry=geometry,
@@ -1174,6 +1171,7 @@ def _build_outer_pixel_products(
     context: TraversalTaskContext,
     outer_pix: int,
     *,
+    execution_config: TraversalExecutionConfig | None = None,
     runtime=None,
     store=None,
     geometry: TraversalGeometry | None = None,
@@ -1182,12 +1180,17 @@ def _build_outer_pixel_products(
 ) -> tuple[Path, Table, Table, TraversalStageStats, TraversalStructureStats]:
     """Build Traversal products for one outer pixel without writing artifacts."""
 
+    execution_config = execution_config or TraversalExecutionConfig()
     if runtime is None:
         runtime = load_runtime_config(
             context.runtime_config_path,
             model_root=context.roots.model_root,
         )
-        warm_model_cache(runtime)
+        warm_model_cache(
+            runtime,
+            prediction_device=execution_config.prediction_device,
+            averaged_prediction_device=execution_config.averaged_prediction_device,
+        )
     if store is None:
         base_store = GaiaHealpixStore(
             GaiaStoreConfig(
@@ -1210,6 +1213,7 @@ def _build_outer_pixel_products(
         store,
         runtime,
         outer_pix,
+        execution_config=execution_config,
         dust_root=context.roots.dust_root,
         max_data_level=context.definition.max_data_level,
         geometry=geometry,
@@ -1614,55 +1618,18 @@ def _parent_total_current_rss_mb(processes: tuple | list = ()) -> float:
     return total
 
 
-@contextmanager
-def _prediction_device_environment(execution_config: TraversalExecutionConfig):
-    updates = {
-        PREDICT_DEVICE_ENV_VAR: execution_config.prediction_device,
-        AVERAGED_PREDICT_DEVICE_ENV_VAR: execution_config.averaged_prediction_device,
-    }
-    previous = {
-        env_var: os.environ.get(env_var)
-        for env_var, value in updates.items()
-        if value is not None
-    }
-    try:
-        for env_var, value in updates.items():
-            if value is not None:
-                os.environ[env_var] = value
-        yield
-    finally:
-        for env_var, old_value in previous.items():
-            if old_value is None:
-                os.environ.pop(env_var, None)
-            else:
-                os.environ[env_var] = old_value
-
-
-def _prediction_device_value(
-    env_var: str,
-    configured_value: str | None,
-) -> str:
-    if configured_value is not None:
-        return configured_value
-    return os.environ.get(env_var, "cpu").strip().lower()
-
-
 def _gpu_prediction_enabled(
     execution_config: TraversalExecutionConfig | None = None,
 ) -> bool:
     if not predict_backend.mps_is_available():
         return False
-    resolved_device = _prediction_device_value(
-        PREDICT_DEVICE_ENV_VAR,
-        None if execution_config is None else execution_config.prediction_device,
-    )
-    averaged_device = _prediction_device_value(
-        AVERAGED_PREDICT_DEVICE_ENV_VAR,
-        None if execution_config is None else execution_config.averaged_prediction_device,
-    )
+    execution_config = execution_config or TraversalExecutionConfig()
     return any(
         value == "auto"
-        for value in (resolved_device, averaged_device)
+        for value in (
+            execution_config.prediction_device,
+            execution_config.averaged_prediction_device,
+        )
     )
 
 
@@ -1672,15 +1639,11 @@ def _parent_gpu_driver_reserve_mb(
 ) -> float:
     if int(worker_count) <= 0 or not _gpu_prediction_enabled(execution_config):
         return 0.0
-    raw = os.environ.get(
-        PARENT_GPU_DRIVER_RESERVE_MB_ENV_VAR,
-        str(DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB),
-    )
-    try:
-        reserve_mb = float(raw)
-    except ValueError:
-        reserve_mb = DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB
-    return max(0.0, reserve_mb) * int(worker_count)
+    execution_config = execution_config or TraversalExecutionConfig()
+    return max(
+        0.0,
+        float(execution_config.parent_gpu_driver_reserve_mb),
+    ) * int(worker_count)
 
 
 def _active_process_count(processes: tuple | list) -> int:
@@ -2288,7 +2251,11 @@ def _iter_long_lived_traversal_worker_messages(
             event="after_runtime_config",
             run_started=run_started,
         )
-    warm_model_cache(runtime)
+    warm_model_cache(
+        runtime,
+        prediction_device=execution_config.prediction_device,
+        averaged_prediction_device=execution_config.averaged_prediction_device,
+    )
     if detailed:
         yield _worker_memory_sample(
             worker_id=plan.worker_id,
@@ -2383,6 +2350,7 @@ def _iter_long_lived_traversal_worker_messages(
             write_profile, stage_stats, structure_stats = _materialize_outer_pixel_products(
                 context,
                 int(outer_pix),
+                execution_config=execution_config,
                 runtime=runtime,
                 store=store,
                 geometry=geometry,
@@ -2560,7 +2528,11 @@ def _iter_dynamic_traversal_worker_messages(
             event="after_runtime_config",
             run_started=run_started,
         )
-    warm_model_cache(runtime)
+    warm_model_cache(
+        runtime,
+        prediction_device=execution_config.prediction_device,
+        averaged_prediction_device=execution_config.averaged_prediction_device,
+    )
     if detailed:
         yield _worker_memory_sample(
             worker_id=worker_id,
@@ -2670,6 +2642,7 @@ def _iter_dynamic_traversal_worker_messages(
                 write_profile, stage_stats, structure_stats = _materialize_outer_pixel_products(
                     context,
                     int(outer_pix),
+                    execution_config=execution_config,
                     runtime=runtime,
                     store=store,
                     geometry=geometry,
@@ -3207,29 +3180,28 @@ def _run_regional_traversal_workers(
     last_parent_memory_check = 0.0
     last_parent_memory_snapshot = 0.0
 
-    with _prediction_device_environment(execution_config):
-        for plan in plans:
-            append_build_log(
-                build_path,
-                "phase=traversal "
-                f"worker={plan.worker_id} "
-                f"regions={','.join(str(pix) for pix in plan.region_pixs)} "
-                f"outer_pixels={len(plan.outer_pixs)} "
-                f"estimated_star_count={plan.estimated_star_count} started",
-            )
-            process = process_context.Process(
-                target=_run_regional_traversal_worker,
-                args=(
-                    context,
-                    plan,
-                    execution_config,
-                    result_queue,
-                    control_queues[plan.worker_id],
-                ),
-            )
-            process.start()
-            processes.append(process)
-            process_by_worker_id[plan.worker_id] = process
+    for plan in plans:
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={plan.worker_id} "
+            f"regions={','.join(str(pix) for pix in plan.region_pixs)} "
+            f"outer_pixels={len(plan.outer_pixs)} "
+            f"estimated_star_count={plan.estimated_star_count} started",
+        )
+        process = process_context.Process(
+            target=_run_regional_traversal_worker,
+            args=(
+                context,
+                plan,
+                execution_config,
+                result_queue,
+                control_queues[plan.worker_id],
+            ),
+        )
+        process.start()
+        processes.append(process)
+        process_by_worker_id[plan.worker_id] = process
 
     try:
         while active_worker_ids:
@@ -3575,27 +3547,26 @@ def _run_dynamic_traversal_workers(
             idle_worker_ids.insert(index, worker_id)
             index += 1
 
-    with _prediction_device_environment(execution_config):
-        for worker_id in range(worker_count):
-            append_build_log(
-                build_path,
-                "phase=traversal "
-                f"worker={worker_id} dynamic started",
-            )
-            process = process_context.Process(
-                target=_run_dynamic_traversal_worker,
-                args=(
-                    context,
-                    worker_id,
-                    execution_config,
-                    result_queue,
-                    work_queues[worker_id],
-                    control_queues[worker_id],
-                ),
-            )
-            process.start()
-            processes.append(process)
-            process_by_worker_id[worker_id] = process
+    for worker_id in range(worker_count):
+        append_build_log(
+            build_path,
+            "phase=traversal "
+            f"worker={worker_id} dynamic started",
+        )
+        process = process_context.Process(
+            target=_run_dynamic_traversal_worker,
+            args=(
+                context,
+                worker_id,
+                execution_config,
+                result_queue,
+                work_queues[worker_id],
+                control_queues[worker_id],
+            ),
+        )
+        process.start()
+        processes.append(process)
+        process_by_worker_id[worker_id] = process
 
     try:
         while active_worker_ids:
@@ -3925,32 +3896,31 @@ def _run_in_process_traversal_worker(
         f"outer_pixels={len(plan.outer_pixs)} "
         f"estimated_star_count={plan.estimated_star_count} started",
     )
-    with _prediction_device_environment(execution_config):
-        for message in _iter_long_lived_traversal_worker_messages(
-            context,
-            plan,
-            execution_config,
-        ):
-            _raise_if_parent_memory_limit_exceeded(execution_config)
-            failed = _handle_regional_worker_message(
-                build_path=build_path,
-                state=state,
-                message=message,
-                star_counts=star_counts,
-                progress=progress,
-                telemetry=telemetry,
-                state_writer=state_writer,
-                diagnostics_writer=diagnostics_writer,
-            ) or failed
-            if message.kind == "done":
-                worker_progress = progress[message.worker_id]
-                append_build_log(
-                    build_path,
-                    "phase=traversal "
-                    f"worker={message.worker_id} "
-                    f"done completed={worker_progress['completed']} "
-                    f"failed={worker_progress['failed']}",
-                )
+    for message in _iter_long_lived_traversal_worker_messages(
+        context,
+        plan,
+        execution_config,
+    ):
+        _raise_if_parent_memory_limit_exceeded(execution_config)
+        failed = _handle_regional_worker_message(
+            build_path=build_path,
+            state=state,
+            message=message,
+            star_counts=star_counts,
+            progress=progress,
+            telemetry=telemetry,
+            state_writer=state_writer,
+            diagnostics_writer=diagnostics_writer,
+        ) or failed
+        if message.kind == "done":
+            worker_progress = progress[message.worker_id]
+            append_build_log(
+                build_path,
+                "phase=traversal "
+                f"worker={message.worker_id} "
+                f"done completed={worker_progress['completed']} "
+                f"failed={worker_progress['failed']}",
+            )
     return failed
 
 
