@@ -8,12 +8,14 @@ It describes a mix of implemented and intended architecture. Use
 [`plan.md`](plan.md) for the transitional migration context and implementation
 sequencing around that architecture.
 
-## Shared Guidance
+## Shared Validation And Skills
 
-This repo adopts the shared guidance in:
-- `astro-agents/guidance/agent-surface.md`
-- `astro-agents/guidance/public-python-projects.md`
-- `astro-agents/guidance/python-development.md`
+This project uses runtime-discovered `astro-agents` skills for shared review and authoring support:
+
+- `$agent-surface-review`
+- `$documentation-surface-review` with the `public-python` profile
+- `$code-quality-review`
+- `$python-code-writing`
 
 Repo-local package boundaries, persisted contracts, artifact rules, and
 exceptions in this document remain the source of truth.
@@ -166,7 +168,7 @@ The architecture uses distinct data layers with explicit ownership.
 - Persisted schema rules and path/version rules live in narrow contract modules.
 - Path layout, schema ownership, and derived-field rules are treated as
   user-facing contracts.
- 
+
 ## Build Model
 
 `ao-sky` uses an explicit build model for derived artifacts.

@@ -1,8 +1,5 @@
 # AGENTS.md
 
-## Astro-Agents Bootstrap
-- Use `astro-agents` for reusable authoring, review, and routing guidance in this repo.
-
 ## Scope
 - Documentation surface profile: public-python.
 
@@ -18,18 +15,20 @@
 - Follow `docs/testing.md` for verification expectations.
 
 ## Research Logs
-- For capture, summary update, summary check, concept maintenance, or source-document upgrade work in `benchmarking` (`docs/benchmarking.md`, `docs/benchmarking/`) or `validation` (`docs/validation.md`, `docs/validation/`), use `astro-agents/research-log/AGENTS.md`.
+- `docs/benchmarking.md` is the benchmarking research log. Its companion folder is `docs/benchmarking/`. Common aliases: `benchmarking`, `benchmarks`, `benchmarking.md`.
+- `docs/validation.md` is the validation research log. Its companion folder is `docs/validation/`. Common aliases: `validation`, `validation.md`.
+- Use `$research-logging` for capture, entry updates, summary checks, concept maintenance, or source-document conversion in these logs.
 
-## Shared Guidance
-- Use `astro-agents/guidance/agent-surface.md` for shared agent-surface guidance.
-- Use `astro-agents/guidance/public-python-projects.md` for shared public Python repo guidance.
-- Use `astro-agents/guidance/python-development.md` for shared Python development guidance.
+## Shared Validation
+- Use `$agent-surface-review` for shared agent-surface review.
+- Use `$documentation-surface-review` for documentation-surface review with the `public-python` profile.
+- Use `$code-quality-review` for source-code quality review.
 
-## Authoring Requirements
-- For Python code, follow `astro-agents/authoring/code/python.md`.
-- For repo docs such as `docs/architecture.md`, `docs/testing.md`, `docs/development.md`, and similar long-lived repo documents, follow `astro-agents/authoring/writing/repo-docs.md`.
-- For `README.md`, follow `astro-agents/authoring/writing/readme-md.md` in addition to `astro-agents/authoring/writing/repo-docs.md`.
-- For plan documents or execution-roadmap docs when they are created or revised, follow `astro-agents/authoring/writing/plan.md`.
+## Skill Requirements
+- For Python code, use `$python-code-writing`.
+- For project docs such as `docs/architecture.md`, `docs/testing.md`, `docs/development.md`, and similar long-lived project documents, use `$project-docs-writing`.
+- For `README.md`, use `$readme-writing`.
+- For plan documents or execution-roadmap docs when they are created or revised, use `$plan-writing`.
 
 ## Working Rules
 - For package structure, public API boundaries, persisted contracts, and lifecycle-sensitive changes, consult `docs/architecture.md` before editing.

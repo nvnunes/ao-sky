@@ -6,11 +6,10 @@ and daily development workflow in `ao-sky`.
 This document records the exact repo-local commands for environment creation,
 editable installs, and daily development work.
 
-## Shared Guidance
+## Shared Skills
 
-This repo adopts the shared Python-development guidance in:
-
-- `astro-agents/guidance/python-development.md`
+For Python code changes, use `$python-code-writing` alongside this project's
+local environment and workflow rules.
 
 Repo-local environment choices, bootstrap commands, and daily workflow
 expectations in this document remain the source of truth for `ao-sky`.
