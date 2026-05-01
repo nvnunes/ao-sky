@@ -556,7 +556,7 @@ Retained prediction policy:
 - Use GPU prediction by default, while keeping CPU prediction as the lower-RAM
   fallback.
 - Encode the retained GPU prediction policy in `ao-sky.yaml` with
-  `prediction.resolved_device: auto` and `prediction.averaged_device: auto`.
+  `prediction.resolved_device: gpu` and `prediction.averaged_device: gpu`.
 
 Retained memory policy:
 

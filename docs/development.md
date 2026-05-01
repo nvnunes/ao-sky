@@ -124,8 +124,8 @@ ao_system:
   max_mag: 18.5
   min_sep_arcsec: 5.0
 prediction:
-  resolved_device: auto
-  averaged_device: auto
+  resolved_device: gpu
+  averaged_device: gpu
   wavelength_micron: 1.654
   resolved_models:
     1star: point_one

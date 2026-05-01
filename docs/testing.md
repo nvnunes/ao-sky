@@ -195,8 +195,8 @@ The current full-build operating default on the local workstation is:
 - `build.workers: 9`
 - `build.scheduler: dynamic`
 - `build.memory_limit_mb: 26624`
-- `prediction.resolved_device: auto`
-- `prediction.averaged_device: auto`
+- `prediction.resolved_device: gpu`
+- `prediction.averaged_device: gpu`
 - `build.roots.gaia: /Users/nelsonnunes/ao-sky-cache/gaia`
 - artifact writes go directly to the build tree on `/Volumes/Data/Galaxy/aosky`
 - repo-owned HDF5 writes use Blosc Zstd level 5 compression, including

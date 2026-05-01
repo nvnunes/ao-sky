@@ -1625,7 +1625,7 @@ def _gpu_prediction_enabled(
         return False
     execution_config = execution_config or TraversalExecutionConfig()
     return any(
-        value == "auto"
+        value == "gpu"
         for value in (
             execution_config.prediction_device,
             execution_config.averaged_prediction_device,

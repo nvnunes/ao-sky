@@ -1606,7 +1606,7 @@ def test_model_cache_key_includes_backend_device_policy(
 
     assert predict_service.get_point_model(runtime, 2, device="cpu") == "force_cpu=True"
 
-    assert predict_service.get_point_model(runtime, 2, device="auto") == "force_cpu=False"
+    assert predict_service.get_point_model(runtime, 2, device="gpu") == "force_cpu=False"
 
     assert loaded == [True, False]
 
@@ -1653,7 +1653,7 @@ def test_mean_model_can_use_auto_device_when_explicitly_enabled(
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
     runtime = _make_predict_runtime(model_root=tmp_path / "models")
 
-    assert predict_service.get_mean_model(runtime, 2, device="auto") == "force_cpu=False"
+    assert predict_service.get_mean_model(runtime, 2, device="gpu") == "force_cpu=False"
     assert loaded == [False]
 
 

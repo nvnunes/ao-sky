@@ -120,9 +120,9 @@ def _force_cpu_for_device(device: str, *, field_name: str) -> bool:
     value = str(device).strip().lower()
     if value in {"", "cpu"}:
         return True
-    if value == "auto":
+    if value == "gpu":
         return False
-    raise PredictError(f"{field_name} must be 'cpu' or 'auto', got {value!r}")
+    raise PredictError(f"{field_name} must be 'cpu' or 'gpu', got {value!r}")
 
 
 def clear_backend_cache() -> None:

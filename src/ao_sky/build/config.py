@@ -427,8 +427,8 @@ def _validate_prediction_device_default(
     if value is None:
         return None
     normalized = str(value).strip().lower()
-    if normalized not in {"cpu", "auto"}:
-        raise BuildError(f"{field_name} must be either 'cpu' or 'auto'")
+    if normalized not in {"cpu", "gpu"}:
+        raise BuildError(f"{field_name} must be either 'cpu' or 'gpu'")
     return normalized
 
 

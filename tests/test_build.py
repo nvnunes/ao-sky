@@ -814,8 +814,8 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
                 "gaia_cache_entries: 128",
                 "gaia_cache_mb: 4096",
                 "prediction:",
-                "  resolved_device: auto",
-                "  averaged_device: auto",
+                "  resolved_device: gpu",
+                "  averaged_device: gpu",
             )
         )
         + "\n",
@@ -832,8 +832,8 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         gaia_cache_mb=4096,
         region_level=3,
         parent_memory_limit_mb=12288,
-        prediction_device="auto",
-        averaged_prediction_device="auto",
+        prediction_device="gpu",
+        averaged_prediction_device="gpu",
     )
 
     override = resolve_traversal_execution_config(
@@ -853,8 +853,8 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         gaia_cache_mb=2048,
         region_level=4,
         parent_memory_limit_mb=8192,
-        prediction_device="auto",
-        averaged_prediction_device="auto",
+        prediction_device="gpu",
+        averaged_prediction_device="gpu",
     )
 
     conf.write_text(
@@ -1912,7 +1912,7 @@ def test_parent_memory_limit_reserves_gpu_driver_memory(
         runner_module._raise_if_parent_memory_limit_exceeded(
             TraversalExecutionConfig(
                 parent_memory_limit_mb=14000,
-                prediction_device="auto",
+                prediction_device="gpu",
                 parent_gpu_driver_reserve_mb=1000.0,
             ),
             [FakeProcess()],
@@ -1934,7 +1934,7 @@ def test_parent_memory_limit_does_not_reserve_gpu_when_mps_unavailable(
     runner_module._raise_if_parent_memory_limit_exceeded(
         TraversalExecutionConfig(
             parent_memory_limit_mb=14000,
-            prediction_device="auto",
+            prediction_device="gpu",
             parent_gpu_driver_reserve_mb=1000.0,
         ),
         [FakeProcess()],

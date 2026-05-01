@@ -161,7 +161,7 @@ These helpers are primarily the build Traversal prediction boundary. Direct
 callers should pass homogeneous, magnitude-ordered NGS arrays whose second
 dimension matches the requested star count and should obtain models through
 `get_point_model` or `get_mean_model`. Model loading defaults to CPU unless the
-caller passes `device="auto"` explicitly. The current implementation still uses
+caller passes `device="gpu"` explicitly. The current implementation still uses
 the temporary `girmos-aosims` backend adapter behind this native API.
 
 ### `ao_sky.build`
