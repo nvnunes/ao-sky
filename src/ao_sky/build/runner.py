@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 import csv
 from dataclasses import dataclass, field
 import gc
@@ -4271,6 +4271,92 @@ def run_build(
     return build_path
 
 
+def run_build_outer_pixels(
+    build_path: Path,
+    outer_pixels: int | Iterable[int],
+    *,
+    force: bool = False,
+) -> Path:
+    """Run Traversal for selected outer pixels without running aggregation.
+
+    This helper exists for validation and targeted rebuild workflows that need
+    fresh per-outer-pixel `outer.h5` artifacts for a small sky patch. It uses
+    the same persisted build configuration, model snapshots, Gaia root, and dust
+    root as normal Traversal execution, updates the central `build.h5` state,
+    and leaves the build in the `traversal` phase. It does not schedule
+    multi-worker execution and it never advances into aggregation.
+
+    Args:
+        build_path: Initialized build root whose current phase is `traversal`.
+        outer_pixels: One outer-pixel id or an iterable of outer-pixel ids.
+        force: Re-run selected pixels even when they are already marked done.
+
+    Returns:
+        The input build path.
+
+    Raises:
+        BuildError: If the build is missing, is not in the traversal phase, or
+            any selected outer pixel is invalid.
+    """
+
+    if not build_path.is_dir():
+        raise BuildError(f"Build path does not exist: {build_path}")
+    current_phase = load_current_phase(build_path)
+    if current_phase != BUILD_PHASE_TRAVERSAL:
+        raise BuildError(f"Expected traversal phase, got {current_phase!r}")
+
+    selected = _normalize_selected_outer_pixels(outer_pixels)
+    state = load_state(build_path)
+    _validate_selected_outer_pixels(selected, state)
+    definition = load_persisted_build_definition(build_path)
+    build_artifact_root(build_path, definition).mkdir(parents=True, exist_ok=True)
+    context = TraversalTaskContext(
+        build_path=build_path,
+        definition=definition,
+        roots=load_build_roots(build_path),
+        runtime_config_path=load_runtime_config_path(build_path),
+    )
+
+    set_build_status(build_path, BUILD_STATUS_RUNNING)
+    append_build_log(
+        build_path,
+        "run selected_outer_pixels start "
+        f"phase={current_phase} "
+        f"force={bool(force)} "
+        f"outer_pixels={','.join(str(pixel) for pixel in selected)}",
+    )
+    failed = False
+    skipped: list[int] = []
+    for outer_pix in selected:
+        if not force and int(state["traversal_status"][outer_pix]) == WORK_STATUS_DONE:
+            skipped.append(outer_pix)
+            continue
+        _mark_outer_pixel_running(build_path, state, outer_pix)
+        result = _run_outer_pixel_traversal_task(context, outer_pix)
+        _record_traversal_result(build_path, state, result)
+        if result.success:
+            append_build_log(build_path, f"selected_outer_pixels outer_pixel={outer_pix} done")
+        else:
+            failed = True
+            append_build_log(
+                build_path,
+                f"selected_outer_pixels outer_pixel={outer_pix} failed: {result.error_message}",
+            )
+
+    final_status = BUILD_STATUS_FAILED if failed else BUILD_STATUS_RUNNING
+    set_build_status(build_path, final_status)
+    append_build_log(
+        build_path,
+        "run selected_outer_pixels complete "
+        f"phase={current_phase} "
+        f"status={final_status} "
+        f"requested={len(selected)} "
+        f"skipped_done={len(skipped)} "
+        f"failed={int(failed)}",
+    )
+    return build_path
+
+
 def restart_build(
     *,
     lineage_name: str,
@@ -4305,6 +4391,32 @@ def restart_build(
         telemetry=telemetry,
         aosky_yaml=aosky_yaml,
     )
+
+
+def _normalize_selected_outer_pixels(outer_pixels: int | Iterable[int]) -> tuple[int, ...]:
+    if isinstance(outer_pixels, int):
+        values = [outer_pixels]
+    elif isinstance(outer_pixels, (str, bytes)):
+        raise BuildError("outer_pixels must be an int or iterable of ints")
+    else:
+        try:
+            values = [int(pixel) for pixel in outer_pixels]
+        except TypeError as exc:
+            raise BuildError("outer_pixels must be an int or iterable of ints") from exc
+    selected = tuple(dict.fromkeys(values))
+    if not selected:
+        raise BuildError("outer_pixels must not be empty")
+    return selected
+
+
+def _validate_selected_outer_pixels(outer_pixels: tuple[int, ...], state: np.ndarray) -> None:
+    max_pixel = len(state) - 1
+    invalid = [pixel for pixel in outer_pixels if pixel < 0 or pixel > max_pixel]
+    if invalid:
+        raise BuildError(
+            "outer_pixels must be between "
+            f"0 and {max_pixel}, got {invalid}"
+        )
 
 
 def show_build(build_path: Path) -> str:

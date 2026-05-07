@@ -8,7 +8,7 @@ from .config import (
     resolve_build_roots,
 )
 from .environment import check_runtime_roots, fetch_gaia_data
-from .runner import init_build, restart_build, run_build, show_build
+from .runner import init_build, restart_build, run_build, run_build_outer_pixels, show_build
 
 __all__ = [
     "BuildError",
@@ -21,5 +21,6 @@ __all__ = [
     "resolve_build_roots",
     "restart_build",
     "run_build",
+    "run_build_outer_pixels",
     "show_build",
 ]

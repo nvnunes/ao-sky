@@ -22,6 +22,7 @@ from ao_sky.build import (
     init_build as real_init_build,
     restart_build,
     run_build,
+    run_build_outer_pixels,
     show_build,
 )
 import ao_sky.build.aggregation as aggregation_module
@@ -1543,6 +1544,43 @@ def test_run_build_rejects_invalid_worker_count(tmp_path: Path) -> None:
 
     with pytest.raises(BuildError, match="workers must be at least 1"):
         run_build(build_path, workers=0)
+
+
+def test_run_build_outer_pixels_runs_selected_traversal_without_aggregation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    seen: list[int] = []
+
+    def fake_run_outer_pixel(context, outer_pix: int) -> TraversalTaskResult:
+        seen.append(int(outer_pix))
+        return TraversalTaskResult(outer_pix=int(outer_pix), success=True)
+
+    monkeypatch.setattr(
+        "ao_sky.build.runner._run_outer_pixel_traversal_task",
+        fake_run_outer_pixel,
+    )
+
+    result = run_build_outer_pixels(build_path, [0, 1])
+
+    state = load_state(build_path)
+    assert result == build_path
+    assert seen == [0, 1]
+    assert state["traversal_status"][0] == WORK_STATUS_DONE
+    assert state["traversal_status"][1] == WORK_STATUS_DONE
+    assert state["traversal_status"][2] == WORK_STATUS_PENDING
+    assert summarize_build(build_path)["current_phase"] == BUILD_PHASE_TRAVERSAL
+    assert summarize_build(build_path)["build_status"] == "running"
+    assert not maps_artifact_filename(build_path, 1).exists()
 
 
 def test_run_build_parallel_workers_dispatch_distinct_pixels_and_update_parent_state(

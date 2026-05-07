@@ -478,6 +478,25 @@ Artifact writes are direct and worker-owned. SSD artifact staging was benchmarke
 and rejected as an active runtime option after Blosc Zstd made write latency
 negligible relative to Traversal compute.
 
+### `run_build_outer_pixels(build_path, outer_pixels, *, force=False) -> Path`
+
+Run Traversal for an explicit set of outer pixels without advancing the build to
+aggregation. This helper is for validation and targeted rebuild workflows that
+need fresh local `outer.h5` artifacts for a small sky patch.
+
+Behavior:
+
+- require the build to be initialized and still in the `traversal` phase
+- use the persisted build config, build-local model snapshot, Gaia root, and
+  dust root
+- run the selected outer pixels in-process
+- update `build.h5` traversal status and attempt counts for those selected
+  pixels
+- skip selected pixels that are already `done` unless `force=True`
+- leave unrelated outer pixels unchanged
+- do not run aggregation, augmentation, scheduling, worker parallelism, or
+  detailed telemetry
+
 ### `restart_build(..., workers=None, scheduler=None, low_latitude_workers=None, gaia_cache_entries=None, gaia_cache_mb=None, parent_memory_limit_mb=None, telemetry=None) -> Path`
 
 Resume the latest `v<N>` build under the lineage workspace, using the same
