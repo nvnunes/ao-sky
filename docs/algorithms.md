@@ -106,6 +106,7 @@ gaia:
 
 asterism:
   winner_ee_epsilon: 0.01
+  winner_top_k: 3
 ```
 
 `gaia.max_bright_star_exclusion_arcsec` is the angular radius around bright
@@ -127,11 +128,17 @@ its raw best asterism to another retained candidate only when:
 candidate_ee >= (1 - winner_ee_epsilon) * best_ee
 ```
 
+`winner_top_k` controls how many candidate labels each inner pixel retains
+before epsilon filtering and regularization. Larger values give the
+regularizer more alternatives but increase top-K memory and candidate
+bookkeeping linearly.
+
 Validate:
 
 ```text
 max_bright_star_exclusion_arcsec is null or positive
 0 <= winner_ee_epsilon < 1
+1 <= winner_top_k <= 32
 1 <= min_wfs <= max_wfs <= 3
 ```
 
@@ -143,7 +150,6 @@ need to be exposed:
 
 ```text
 max_regional_combination_work = inner pixels per outer pixel
-winner_top_k = 3
 winner_regularization_passes = 3
 ```
 
@@ -359,7 +365,8 @@ top_fwhm[P, K]
 top_pointing_xy[P, K]
 ```
 
-The shortlist is ranked by predicted EE. The pointing-center offsets are
+`K` is `asterism.winner_top_k`, with a default of `3`. The shortlist is ranked
+by predicted EE. The pointing-center offsets are
 internal state used to preserve the model-input center for normal and recovered
 rows. Candidate payloads are retained only when they appear in at least one
 pixel shortlist; a later implementation may drop zero-reference payloads during

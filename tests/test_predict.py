@@ -188,6 +188,7 @@ def load_native_runtime(
         ),
         max_bright_star_exclusion=2.0 * ao_system.fov,
         winner_ee_epsilon=0.01,
+        winner_top_k=3,
         prediction_wavelength=1.654 * u.micron,
         resolved_models={
             str(key): str(value)
@@ -432,6 +433,7 @@ def test_runtime_config_round_trips_native_policy(tmp_path: Path) -> None:
         runtime.max_bright_star_exclusion.to_value(u.arcsec)
     )
     assert loaded.winner_ee_epsilon == pytest.approx(runtime.winner_ee_epsilon)
+    assert loaded.winner_top_k == runtime.winner_top_k
     assert loaded.prediction_wavelength.to_value(u.micron) == pytest.approx(1.654)
 
 
@@ -467,6 +469,7 @@ def test_load_runtime_config_rejects_invalid_runtime_values(tmp_path: Path) -> N
         ("asterism", "max_overlap", 0.66, "max_overlap is legacy-only"),
         ("asterism", "max_candidate_asterisms", 64, "max_candidate_asterisms was removed"),
         ("asterism", "winner_ee_epsilon", 1.0, "winner_ee_epsilon must be at least 0"),
+        ("asterism", "winner_top_k", 0, "winner_top_k must be between"),
         (
             "gaia",
             "max_bright_star_exclusion_arcsec",
@@ -573,6 +576,7 @@ def _make_predict_runtime(
         max_bright_star_mag=None,
         max_bright_star_exclusion=2.0 * fov,
         winner_ee_epsilon=0.01,
+        winner_top_k=3,
         prediction_wavelength=1.654 * u.micron,
         resolved_models={
             f"{count}star": point_model

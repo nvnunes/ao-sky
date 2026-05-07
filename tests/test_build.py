@@ -250,6 +250,7 @@ def load_native_runtime(
         ),
         max_bright_star_exclusion=2.0 * ao_system.fov,
         winner_ee_epsilon=0.01,
+        winner_top_k=3,
         prediction_wavelength=1.654 * u.micron,
         resolved_models={
             str(key): str(value)

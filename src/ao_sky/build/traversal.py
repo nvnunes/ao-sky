@@ -46,7 +46,6 @@ from ._models import (
 from .runtime_gaia import RUNTIME_HPX_COLUMN, RUNTIME_HPX_LEVEL
 
 ASTERISM_BOUNDARY_RINGS = 2
-WINNER_TOP_K = 3
 WINNER_REGULARIZATION_PASSES = 3
 ASTERISM_CENTER_TOLERANCE_ARCSEC = 1e-6
 DEFAULT_PREDICTION_BATCH_SIZE = _DEFAULT_PREDICTION_BATCH_SIZE
@@ -2223,8 +2222,9 @@ def _insert_top_candidate(
         return
     row_refs = top_refs[pixel_idx]
     row_ee = top_ee[pixel_idx]
-    position = WINNER_TOP_K
-    for idx in range(WINNER_TOP_K):
+    top_k = top_refs.shape[1]
+    position = top_k
+    for idx in range(top_k):
         if _candidate_is_better(
             ee=ee,
             candidate_id=candidate_id,
@@ -2233,9 +2233,9 @@ def _insert_top_candidate(
         ):
             position = idx
             break
-    if position == WINNER_TOP_K:
+    if position == top_k:
         return
-    if position + 1 < WINNER_TOP_K:
+    if position + 1 < top_k:
         row_refs[position + 1 :] = row_refs[position:-1]
         row_ee[position + 1 :] = row_ee[position:-1]
         top_sr[pixel_idx, position + 1 :] = top_sr[pixel_idx, position:-1]
@@ -2289,7 +2289,8 @@ def _scatter_top_candidates(
 
     started = time.perf_counter()
     affected_pixels = np.unique(batch_pixels)
-    existing_pixels = np.repeat(affected_pixels, WINNER_TOP_K)
+    top_k = top_refs.shape[1]
+    existing_pixels = np.repeat(affected_pixels, top_k)
     existing_refs = top_refs[affected_pixels].reshape(-1)
     existing_ee = top_ee[affected_pixels].reshape(-1)
     existing_sr = top_sr[affected_pixels].reshape(-1)
@@ -2323,7 +2324,7 @@ def _scatter_top_candidates(
         np.where(group_start, np.arange(len(sorted_pixels)), 0)
     )
     ranks = np.arange(len(sorted_pixels)) - group_start_indexes
-    keep = ranks < WINNER_TOP_K
+    keep = ranks < top_k
     if profile is not None:
         profile.point_prediction_scatter_sort_seconds += time.perf_counter() - started
 
@@ -3267,12 +3268,13 @@ def build_traversal_products(
         best_ee = np.asarray(inner["best_ee"], dtype=np.float64).copy()
         best_sr = np.asarray(inner["best_sr"], dtype=np.float64).copy()
         best_fwhm = np.asarray(inner["best_fwhm"], dtype=np.float64).copy()
-        top_refs = np.full((len(inner), WINNER_TOP_K), -1, dtype=np.int64)
-        top_ee = np.full((len(inner), WINNER_TOP_K), -np.inf, dtype=np.float64)
-        top_sr = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
-        top_fwhm = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
-        top_pointing_x = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
-        top_pointing_y = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
+        top_shape = (len(inner), int(runtime.winner_top_k))
+        top_refs = np.full(top_shape, -1, dtype=np.int64)
+        top_ee = np.full(top_shape, -np.inf, dtype=np.float64)
+        top_sr = np.full(top_shape, np.nan, dtype=np.float64)
+        top_fwhm = np.full(top_shape, np.nan, dtype=np.float64)
+        top_pointing_x = np.full(top_shape, np.nan, dtype=np.float64)
+        top_pointing_y = np.full(top_shape, np.nan, dtype=np.float64)
 
         started = time.perf_counter()
         _stream_resolved_candidate_predictions(

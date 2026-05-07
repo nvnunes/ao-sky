@@ -33,6 +33,7 @@ class PredictRuntime:
     max_bright_star_mag: float | None
     max_bright_star_exclusion: u.Quantity
     winner_ee_epsilon: float
+    winner_top_k: int
     prediction_wavelength: u.Quantity
     resolved_models: dict[str, str]
     averaged_models: dict[str, str]

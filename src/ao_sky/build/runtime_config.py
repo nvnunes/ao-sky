@@ -14,6 +14,8 @@ from ._constants import RUNTIME_CONFIG_FILENAME
 from ._exceptions import BuildError
 
 RUNTIME_CONFIG_SCHEMA_VERSION = 2
+DEFAULT_WINNER_TOP_K = 3
+MAX_WINNER_TOP_K = 32
 
 
 def runtime_config_filename(build_path: Path) -> Path:
@@ -115,6 +117,12 @@ def load_runtime_config(
     )
     if winner_ee_epsilon is None:
         winner_ee_epsilon = 0.01
+    winner_top_k = _optional_int(
+        asterism_raw.get("winner_top_k"),
+        field_name="asterism.winner_top_k",
+    )
+    if winner_top_k is None:
+        winner_top_k = DEFAULT_WINNER_TOP_K
     prediction_wavelength = _required_float(
         prediction_raw,
         "wavelength_micron",
@@ -150,6 +158,7 @@ def load_runtime_config(
         inner_level=inner_level,
         max_bright_star_exclusion_arcsec=max_bright_star_exclusion_arcsec,
         winner_ee_epsilon=winner_ee_epsilon,
+        winner_top_k=winner_top_k,
         prediction_wavelength=prediction_wavelength,
         seeing_wavelength=seeing_wavelength,
         seeing_fwhm=seeing_fwhm,
@@ -185,6 +194,7 @@ def load_runtime_config(
         max_bright_star_mag=max_bright_star_mag,
         max_bright_star_exclusion=max_bright_star_exclusion_arcsec * u.arcsec,
         winner_ee_epsilon=winner_ee_epsilon,
+        winner_top_k=winner_top_k,
         prediction_wavelength=prediction_wavelength * u.micron,
         resolved_models=resolved_models,
         averaged_models=averaged_models,
@@ -240,6 +250,7 @@ def runtime_to_config(runtime: PredictRuntime) -> dict[str, Any]:
             },
             "asterism": {
                 "winner_ee_epsilon": float(runtime.winner_ee_epsilon),
+                "winner_top_k": int(runtime.winner_top_k),
             },
             "best": {
                 "seeing_baseline": {
@@ -352,6 +363,15 @@ def _required_int(
     return value
 
 
+def _optional_int(value: object, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise BuildError(f"Runtime config {field_name} must be an integer") from exc
+
+
 def _optional_float(value: object, *, field_name: str) -> float | None:
     if value is None:
         return None
@@ -396,6 +416,7 @@ def _validate_runtime_values(
     inner_level: int,
     max_bright_star_exclusion_arcsec: float,
     winner_ee_epsilon: float,
+    winner_top_k: int,
     prediction_wavelength: float,
     seeing_wavelength: float,
     seeing_fwhm: float,
@@ -423,6 +444,11 @@ def _validate_runtime_values(
     if not 0 <= winner_ee_epsilon < 1:
         raise BuildError(
             "Runtime config asterism.winner_ee_epsilon must be at least 0 and less than 1"
+        )
+    if not 1 <= winner_top_k <= MAX_WINNER_TOP_K:
+        raise BuildError(
+            "Runtime config asterism.winner_top_k must be between "
+            f"1 and {MAX_WINNER_TOP_K}"
         )
     if prediction_wavelength <= 0:
         raise BuildError("Runtime config prediction.wavelength_micron must be positive")
