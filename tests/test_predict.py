@@ -36,6 +36,7 @@ from ao_sky.build.traversal import (
     _build_retained_asterism_table,
     _build_regional_candidate_graph,
     _candidate_enclosing_fov_center,
+    _fill_regularized_winner_fields,
     _MulticoverSelection,
     _nearest_feasible_pointing,
     _nearest_feasible_pointing_generic,
@@ -1072,7 +1073,7 @@ def test_averaged_prediction_uses_selected_pointing(
             np.full(1, np.nan, dtype=np.float64),
             np.asarray([1], dtype=np.int64),
             np.full(1, np.nan, dtype=np.float64),
-            np.full(1, np.nan, dtype=np.float64),
+            np.full(1, 0.7, dtype=np.float64),
             np.zeros(1, dtype=np.bool_),
             np.zeros(1, dtype=np.bool_),
         ],
@@ -1138,7 +1139,7 @@ def test_averaged_prediction_uses_selected_pointing(
     )
 
     assert seen["ngs_zd"][0].tolist() == pytest.approx([60.0, 60.0])
-    assert float(inner["winner_ee_averaged"][0]) == pytest.approx(0.6)
+    assert float(inner["winner_ee_averaged"][0]) == pytest.approx(0.7)
 
 
 def test_regional_candidate_graph_keeps_exact_tractable_region(
@@ -1991,6 +1992,27 @@ def test_build_base_inner_table_initializes_winners_to_seeing_baseline(tmp_path:
     assert np.allclose(inner["winner_ee_resolved"], baseline.ee)
     assert np.allclose(inner["winner_ee_averaged"], baseline.ee)
     assert np.all(np.asarray(inner["winner_asterism_id"], dtype=np.int64) == -1)
+
+
+def test_regularized_winner_resolved_ee_keeps_seeing_floor() -> None:
+    inner = Table()
+    inner["winner_asterism_id"] = np.asarray([-1, -1], dtype=np.int64)
+    inner["winner_ee_resolved"] = np.asarray([0.5, 0.5], dtype=np.float64)
+
+    _fill_regularized_winner_fields(
+        inner,
+        labels=np.asarray([10, 20], dtype=np.int64),
+        top_refs=np.asarray([[10], [20]], dtype=np.int64),
+        top_ee=np.asarray([[0.3], [0.8]], dtype=np.float64),
+        top_pointing_x=np.asarray([[1.0], [2.0]], dtype=np.float64),
+        top_pointing_y=np.asarray([[3.0], [4.0]], dtype=np.float64),
+        retained_candidate_ids=np.asarray([10, 20], dtype=np.int64),
+    )
+
+    assert np.asarray(inner["winner_asterism_id"], dtype=np.int64).tolist() == [1, 2]
+    assert np.asarray(inner["winner_ee_resolved"], dtype=np.float64).tolist() == pytest.approx(
+        [0.5, 0.8]
+    )
 
 
 def test_build_base_inner_table_uses_runtime_gaia_projection(

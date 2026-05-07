@@ -342,7 +342,10 @@ persist the seeing baseline in `best_*`, leave `winner_asterism_id = -1`, and
 persist the seeing baseline in `winner_ee_resolved` and `winner_ee_averaged`.
 
 If an AO candidate exists but performs below seeing in EE, `best_*` may remain
-the seeing baseline while `winner_*` still records the selected AO asterism.
+the seeing baseline while `winner_asterism_id` still records the selected AO
+asterism. Persisted `winner_ee_resolved` and `winner_ee_averaged` are floored at
+the seeing baseline, so a recovered or regularized AO winner does not create a
+lower-than-seeing discontinuity in winner-EE maps.
 
 ### Top-K State
 
@@ -395,7 +398,8 @@ Tie-breakers are:
 2. smaller stable candidate key
 
 After regularization, `winner_ee_resolved` is filled from the chosen label's
-resolved predicted EE for that pixel.
+resolved predicted EE for that pixel, floored at the existing seeing-baseline
+fallback value.
 
 ### Averaged Winners
 
@@ -408,7 +412,8 @@ For final regularized winners:
 2. Rebuild NGS payloads from retained candidate member coordinates and the
    selected internal pointing centers.
 3. Run the averaged model in batches.
-4. Fill `winner_ee_averaged`.
+4. Fill `winner_ee_averaged`, floored at the existing seeing-baseline fallback
+   value.
 5. Compute averaged coverage.
 
 This avoids storing Python NGS payload objects during candidate streaming.

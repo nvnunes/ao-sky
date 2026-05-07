@@ -2918,10 +2918,13 @@ def _fill_regularized_winner_fields(
         has_match = valid & np.any(matches, axis=1)
         match_positions = np.argmax(matches, axis=1)
         row_indexes = np.arange(len(label_array), dtype=np.int64)
-        winner_ee_resolved[has_match] = top_ee[
-            row_indexes[has_match],
-            match_positions[has_match],
-        ]
+        winner_ee_resolved[has_match] = np.fmax(
+            winner_ee_resolved[has_match],
+            top_ee[
+                row_indexes[has_match],
+                match_positions[has_match],
+            ],
+        )
         winner_pointing_x[has_match] = top_pointing_x[
             row_indexes[has_match],
             match_positions[has_match],
@@ -3106,7 +3109,7 @@ def _update_regularized_winner_averaged_ee(
                 ],
             )
             prediction_telemetry = _new_prediction_telemetry(profile, structure_profile)
-            inner["winner_ee_averaged"][batch_pixel_idxs] = predict_field_mean_arrays(
+            predicted_ee_averaged = predict_field_mean_arrays(
                 runtime,
                 num_stars=num_stars,
                 model=model,
@@ -3121,6 +3124,14 @@ def _update_regularized_winner_averaged_ee(
                     execution_config.averaged_backend_buckets,
                 ),
                 prediction_telemetry=prediction_telemetry,
+            )
+            current_ee_averaged = np.asarray(
+                inner["winner_ee_averaged"],
+                dtype=np.float64,
+            )[batch_pixel_idxs]
+            inner["winner_ee_averaged"][batch_pixel_idxs] = np.fmax(
+                current_ee_averaged,
+                predicted_ee_averaged,
             )
             _record_prediction_telemetry(
                 prediction_telemetry,
