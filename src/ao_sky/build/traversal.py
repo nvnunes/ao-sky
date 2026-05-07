@@ -48,6 +48,7 @@ from .runtime_gaia import RUNTIME_HPX_COLUMN, RUNTIME_HPX_LEVEL
 ASTERISM_BOUNDARY_RINGS = 2
 WINNER_TOP_K = 3
 WINNER_REGULARIZATION_PASSES = 3
+ASTERISM_CENTER_TOLERANCE_ARCSEC = 1e-6
 DEFAULT_PREDICTION_BATCH_SIZE = _DEFAULT_PREDICTION_BATCH_SIZE
 DEFAULT_BACKEND_BUCKETS = _DEFAULT_BACKEND_BUCKETS
 
@@ -436,6 +437,15 @@ class _RegionalCandidateStats:
     exact_combination_work: int
     final_resolved_inferences: int
     incomplete_for_regions: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateCenter:
+    """Minimum circular FOV center for one 1-3 star candidate."""
+
+    ra_deg: float
+    dec_deg: float
+    radius_arcsec: float
 
 
 def _sample_memory(
@@ -871,6 +881,81 @@ def _get_plane_offsets_arcsec(reference_coord: SkyCoord, skycoords: SkyCoord) ->
     return lon_offset.to(u.arcsec).value, lat_offset.to(u.arcsec).value
 
 
+def _candidate_enclosing_fov_center(
+    ra_deg: np.ndarray,
+    dec_deg: np.ndarray,
+) -> _CandidateCenter:
+    """Return the minimum circular FOV center for 1-3 tangent-plane points."""
+
+    ra_deg = np.asarray(ra_deg, dtype=np.float64)
+    dec_deg = np.asarray(dec_deg, dtype=np.float64)
+    count = int(len(ra_deg))
+    if count < 1 or count > 3:
+        raise BuildError("asterism center requires 1-3 member positions")
+
+    ra_rad = np.unwrap(np.deg2rad(ra_deg))
+    dec_rad = np.deg2rad(dec_deg)
+    ra0 = float(np.mean(ra_rad))
+    dec0 = float(np.mean(dec_rad))
+    cos_dec0 = float(np.cos(dec0))
+    if abs(cos_dec0) < 1e-12:
+        raise BuildError("asterism center is undefined at the celestial pole")
+
+    points = np.column_stack(((ra_rad - ra0) * cos_dec0, dec_rad - dec0))
+
+    if count == 1:
+        center_xy = points[0]
+    elif count == 2:
+        center_xy = np.mean(points[:2], axis=0)
+    else:
+        pairs = ((0, 1), (1, 2), (2, 0))
+        side_lengths_sq = np.asarray(
+            [
+                float(np.sum((points[first] - points[second]) ** 2))
+                for first, second in pairs
+            ],
+            dtype=np.float64,
+        )
+        longest = int(np.argmax(side_lengths_sq))
+        other_lengths_sq = float(np.sum(side_lengths_sq) - side_lengths_sq[longest])
+        if side_lengths_sq[longest] >= other_lengths_sq:
+            first, second = pairs[longest]
+            center_xy = (points[first] + points[second]) / 2.0
+        else:
+            (ax, ay), (bx, by), (cx, cy) = points
+            determinant = 2.0 * (
+                ax * (by - cy)
+                + bx * (cy - ay)
+                + cx * (ay - by)
+            )
+            if abs(determinant) < 1e-18:
+                first, second = pairs[longest]
+                center_xy = (points[first] + points[second]) / 2.0
+            else:
+                ux = (
+                    (ax * ax + ay * ay) * (by - cy)
+                    + (bx * bx + by * by) * (cy - ay)
+                    + (cx * cx + cy * cy) * (ay - by)
+                ) / determinant
+                uy = (
+                    (ax * ax + ay * ay) * (cx - bx)
+                    + (bx * bx + by * by) * (ax - cx)
+                    + (cx * cx + cy * cy) * (bx - ax)
+                ) / determinant
+                center_xy = np.asarray((ux, uy), dtype=np.float64)
+
+    radius_rad = float(np.max(np.linalg.norm(points - center_xy, axis=1)))
+    center_ra = float(np.rad2deg(center_xy[0] / cos_dec0 + ra0) % 360.0)
+    if center_ra >= 360.0 - 1e-12:
+        center_ra = 0.0
+    center_dec = float(np.rad2deg(center_xy[1] + dec0))
+    return _CandidateCenter(
+        ra_deg=center_ra,
+        dec_deg=center_dec,
+        radius_arcsec=float(np.rad2deg(radius_rad) * 3600.0),
+    )
+
+
 def _combination_count(n: int, k: int) -> int:
     if n < k:
         return 0
@@ -946,16 +1031,29 @@ def _build_graph_triangles(adjacency: np.ndarray) -> np.ndarray:
     return np.asarray(triangles, dtype=np.int64)
 
 
-def _triangle_cumulative_count_by_max_index(adjacency: np.ndarray) -> np.ndarray:
-    size = adjacency.shape[0]
-    counts = np.zeros((size + 1,), dtype=np.int64)
-    for third in range(2, size):
-        neighbours = np.flatnonzero(adjacency[:third, third])
-        if len(neighbours) < 2:
-            continue
-        neighbour_edges = adjacency[np.ix_(neighbours, neighbours)]
-        counts[third + 1] = int(np.count_nonzero(np.triu(neighbour_edges, 1)))
-    return np.cumsum(counts, dtype=np.int64)
+def _filter_fov_valid_triangles(
+    stars: Table,
+    triangles: np.ndarray,
+    runtime: PredictRuntime,
+) -> np.ndarray:
+    if len(triangles) == 0:
+        return np.empty((0, 3), dtype=np.int64)
+    star_ra = np.asarray(stars["ra"], dtype=np.float64)
+    star_dec = np.asarray(stars["dec"], dtype=np.float64)
+    max_radius_arcsec = (
+        runtime.ao_system.fov.to_value(u.arcsec) / 2.0
+        + ASTERISM_CENTER_TOLERANCE_ARCSEC
+    )
+    keep = np.zeros((len(triangles),), dtype=np.bool_)
+    for row, triangle in enumerate(np.asarray(triangles, dtype=np.int64)):
+        center = _candidate_enclosing_fov_center(
+            star_ra[triangle],
+            star_dec[triangle],
+        )
+        keep[row] = center.radius_arcsec <= max_radius_arcsec
+    if not np.any(keep):
+        return np.empty((0, 3), dtype=np.int64)
+    return np.asarray(triangles[keep], dtype=np.int64)
 
 
 def _build_candidate_graph_from_ngs(
@@ -987,7 +1085,11 @@ def _build_candidate_graph_from_ngs(
         else np.zeros((final_count, final_count), dtype=np.bool_)
     )
     triangles = (
-        _build_graph_triangles(adjacency)
+        _filter_fov_valid_triangles(
+            sorted_ngs,
+            _build_graph_triangles(adjacency),
+            runtime,
+        )
         if 3 in enabled
         else np.empty((0, 3), dtype=np.int64)
     )
@@ -1090,6 +1192,7 @@ def _build_candidate_graph_from_source_keys(
         if triangle_set
         else np.empty((0, 3), dtype=np.int64)
     )
+    triangles = _filter_fov_valid_triangles(sorted_ngs, triangles, runtime)
     enabled = set(_enabled_candidate_orders(runtime))
     candidate_count = (
         (len(sorted_ngs) if 1 in enabled else 0)
@@ -1164,17 +1267,10 @@ def _count_candidate_identities(stars: Table, runtime: PredictRuntime) -> _Candi
     """Return geometry-constrained one-, two-, and three-star candidate counts."""
 
     enabled = set(_enabled_candidate_orders(runtime))
-    singles = len(stars) if 1 in enabled else 0
-    edges = (
-        _build_close_pair_edges(stars, runtime)
-        if (2 in enabled or 3 in enabled)
-        else np.empty((0, 2), dtype=np.int64)
-    )
-    pairs = len(edges) if 2 in enabled else 0
-    triples = 0
-    if 3 in enabled and len(stars) >= 3:
-        adjacency = _build_adjacency(len(stars), edges)
-        triples = int(_triangle_cumulative_count_by_max_index(adjacency)[-1])
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    singles = graph.final_count if 1 in enabled else 0
+    pairs = len(graph.edges) if 2 in enabled else 0
+    triples = len(graph.triangles) if 3 in enabled else 0
     return _CandidateCount(
         total=int(singles + pairs + triples),
         singles=int(singles),
@@ -2314,22 +2410,11 @@ def _build_retained_asterism_table(
         members = np.asarray(members[members >= 0], dtype=np.int64)
         member_ra = star_ra[members]
         member_dec = star_dec[members]
-        ra_rad = np.deg2rad(member_ra)
-        dec_rad = np.deg2rad(member_dec)
-        x = np.mean(np.cos(dec_rad) * np.cos(ra_rad))
-        y = np.mean(np.cos(dec_rad) * np.sin(ra_rad))
-        z = np.mean(np.sin(dec_rad))
-        norm = float(np.sqrt(x * x + y * y + z * z))
-        centre_ra = float(np.rad2deg(np.arctan2(y, x)) % 360.0)
-        centre_dec = (
-            float(np.rad2deg(np.arcsin(z / norm)))
-            if norm > 0
-            else float(np.mean(member_dec))
-        )
+        center = _candidate_enclosing_fov_center(member_ra, member_dec)
 
         rows["asterism_id"].append(row_id)
-        rows["ra"].append(centre_ra)
-        rows["dec"].append(centre_dec)
+        rows["ra"].append(center.ra_deg)
+        rows["dec"].append(center.dec_deg)
         rows["num_stars"].append(int(len(members)))
         for slot in range(3):
             prefix = f"star{slot + 1}"

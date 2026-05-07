@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import yaml
 import astropy.units as u
+from astropy.coordinates import SkyCoord
 from astropy.table import Table
 
 from ao_sky.build import init_build as real_init_build
@@ -32,7 +33,9 @@ from ao_sky.build.traversal import (
     _backend_row_count,
     _build_candidate_graph_from_ngs,
     _build_candidate_set,
+    _build_retained_asterism_table,
     _build_regional_candidate_graph,
+    _candidate_enclosing_fov_center,
     _MulticoverSelection,
     _StarForCoverage,
     _local_neighbor_index_matrix,
@@ -52,7 +55,7 @@ from ao_sky.predict import backend as predict_backend
 from ao_sky.predict import service as predict_service
 from ao_sky.predict.service import build_model_x_from_ngs_arrays
 from ao_sky.predict._models import AOSystemRuntime, PointPredictionBatch, PredictRuntime
-from ao_sky.spatial import get_parent_pixel, get_pixel_skycoord
+from ao_sky.spatial import get_parent_pixel, get_pixel_from_skycoord, get_pixel_skycoord
 
 
 def _write_legacy_config(
@@ -584,6 +587,46 @@ def _make_predict_runtime(
     )
 
 
+def test_candidate_enclosing_fov_center_handles_single_and_pair() -> None:
+    single = _candidate_enclosing_fov_center(
+        np.asarray([12.0], dtype=np.float64),
+        np.asarray([-3.0], dtype=np.float64),
+    )
+    assert single.ra_deg == pytest.approx(12.0)
+    assert single.dec_deg == pytest.approx(-3.0)
+    assert single.radius_arcsec == pytest.approx(0.0)
+
+    pair = _candidate_enclosing_fov_center(
+        np.asarray([0.0, 10.0 / 3600.0], dtype=np.float64),
+        np.asarray([0.0, 0.0], dtype=np.float64),
+    )
+    assert pair.ra_deg == pytest.approx(5.0 / 3600.0)
+    assert pair.dec_deg == pytest.approx(0.0)
+    assert pair.radius_arcsec == pytest.approx(5.0)
+
+
+def test_candidate_enclosing_fov_center_uses_circumcenter_for_acute_triangle() -> None:
+    center = _candidate_enclosing_fov_center(
+        np.asarray([0.0, 100.0 / 3600.0, 10.0 / 3600.0], dtype=np.float64),
+        np.asarray([0.0, 0.0, 80.0 / 3600.0], dtype=np.float64),
+    )
+
+    assert center.ra_deg == pytest.approx(50.0 / 3600.0)
+    assert center.dec_deg == pytest.approx(34.375 / 3600.0)
+    assert center.radius_arcsec == pytest.approx(np.hypot(50.0, 34.375))
+
+
+def test_candidate_enclosing_fov_center_uses_longest_side_for_obtuse_triangle() -> None:
+    center = _candidate_enclosing_fov_center(
+        np.asarray([-10.0 / 3600.0, 10.0 / 3600.0, 5.0 / 3600.0], dtype=np.float64),
+        np.asarray([0.0, 0.0, 1.0 / 3600.0], dtype=np.float64),
+    )
+
+    assert center.ra_deg == pytest.approx(0.0)
+    assert center.dec_deg == pytest.approx(0.0)
+    assert center.radius_arcsec == pytest.approx(10.0)
+
+
 def test_candidate_members_are_emitted_in_sensing_magnitude_order(
     tmp_path: Path,
 ) -> None:
@@ -650,6 +693,113 @@ def test_unbounded_candidate_graph_counts_geometry_limited_candidates(
         30,
         40,
     ]
+
+
+def test_candidate_graph_filters_pairwise_valid_fov_invalid_triangle(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        fov=20.0 * u.arcsec,
+        min_wfs=1,
+        max_wfs=3,
+    )
+    side_arcsec = 19.0
+    stars = Table()
+    stars["source_id"] = np.array([10, 20, 30], dtype=np.int64)
+    stars["ra"] = np.array(
+        [0.0, side_arcsec / 3600.0, side_arcsec / 2.0 / 3600.0],
+        dtype=np.float64,
+    )
+    stars["dec"] = np.array(
+        [0.0, 0.0, np.sqrt(3.0) / 2.0 * side_arcsec / 3600.0],
+        dtype=np.float64,
+    )
+    stars["R"] = np.array([10.0, 11.0, 12.0], dtype=np.float64)
+
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+
+    assert len(graph.edges) == 3
+    assert len(graph.triangles) == 0
+    assert graph.candidate_count == 6
+    assert len(candidate_set.members) == 6
+
+
+def test_candidate_graph_keeps_near_boundary_valid_triangle(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        fov=20.0 * u.arcsec,
+        min_wfs=1,
+        max_wfs=3,
+    )
+    side_arcsec = np.sqrt(3.0) * 10.0
+    stars = Table()
+    stars["source_id"] = np.array([10, 20, 30], dtype=np.int64)
+    stars["ra"] = np.array(
+        [0.0, side_arcsec / 3600.0, side_arcsec / 2.0 / 3600.0],
+        dtype=np.float64,
+    )
+    stars["dec"] = np.array(
+        [0.0, 0.0, np.sqrt(3.0) / 2.0 * side_arcsec / 3600.0],
+        dtype=np.float64,
+    )
+    stars["R"] = np.array([10.0, 11.0, 12.0], dtype=np.float64)
+
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+
+    assert len(graph.edges) == 3
+    assert len(graph.triangles) == 1
+    assert graph.candidate_count == 7
+    assert len(candidate_set.members) == 7
+
+
+def test_retained_asterism_table_uses_enclosing_fov_center(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        fov=200.0 * u.arcsec,
+        min_wfs=1,
+        max_wfs=3,
+    )
+    stars = Table()
+    stars["source_id"] = np.array([1, 2, 3], dtype=np.int64)
+    stars["ra"] = np.array([0.0, 100.0 / 3600.0, 10.0 / 3600.0], dtype=np.float64)
+    stars["dec"] = np.array([0.0, 0.0, 80.0 / 3600.0], dtype=np.float64)
+    stars["R"] = np.array([10.0, 11.0, 12.0], dtype=np.float64)
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+    candidate_id = np.flatnonzero(
+        np.all(candidate_set.source_keys == np.asarray([1, 2, 3]), axis=1),
+    )[0]
+    expected = _candidate_enclosing_fov_center(
+        np.asarray(stars["ra"], dtype=np.float64),
+        np.asarray(stars["dec"], dtype=np.float64),
+    )
+
+    retained = _build_retained_asterism_table(
+        candidate_set,
+        np.asarray([candidate_id], dtype=np.int64),
+        graph.sorted_ngs,
+        runtime,
+    )
+
+    assert float(retained["ra"][0]) == pytest.approx(expected.ra_deg)
+    assert float(retained["dec"][0]) == pytest.approx(expected.dec_deg)
+    assert float(retained["ra"][0]) != pytest.approx(float(np.mean(stars["ra"])))
+    expected_pix = get_pixel_from_skycoord(
+        runtime.inner_level,
+        SkyCoord(
+            ra=[expected.ra_deg],
+            dec=[expected.dec_deg],
+            unit=(u.degree, u.degree),
+        ),
+    )
+    assert int(retained["pix"][0]) == int(np.asarray(expected_pix)[0])
 
 
 def test_regional_candidate_graph_keeps_exact_tractable_region(
