@@ -295,6 +295,31 @@ within `gaia.max_bright_star_exclusion_arcsec`.
 Candidate-pixel rows with an empty eligibility bitset are skipped without
 model inference.
 
+### Off-Center Geometric Recovery
+
+Candidate eligibility follows one geometric rule. For a candidate asterism and
+science inner pixel, choose the pointing center closest to the inner-pixel
+center while keeping every guide star inside `ao_system.fov / 2`. The candidate
+is usable for that pixel only when the chosen pointing center also keeps the
+science inner pixel inside the same circular FOV.
+
+Traversal executes this rule in two paths:
+
+1. Fast path: field-of-regard bitset intersection handles pixels whose centers
+   are already valid pointing centers.
+2. Recovery path: after the fast path, only pixels with no candidate winner are
+   tested against the candidate set. A wide-FOV bitset prefilter first requires
+   every guide star to be within `ao_system.fov` of the science pixel center,
+   which is necessary for any shared pointing center to exist. The recovery
+   path then projects each surviving no-winner pixel center onto the candidate's
+   feasible pointing-center region, the intersection of 1-3 guide-star disks,
+   and runs one additional resolved-prediction phase for recovered
+   candidate-pixel rows.
+
+The optimized pointing center is internal top-K state. It is used for recovered
+resolved prediction and later averaged prediction, but it is not a persisted
+inner-table field.
+
 ### Resolved Best Fields
 
 Resolved predicted EE drives selection. `best_*` is the continuous
@@ -328,11 +353,14 @@ top_candidate_refs[P, K]
 top_ee[P, K]
 top_sr[P, K]
 top_fwhm[P, K]
+top_pointing_xy[P, K]
 ```
 
-The shortlist is ranked by predicted EE. Candidate payloads are retained only
-when they appear in at least one pixel shortlist; a later implementation may
-drop zero-reference payloads during streaming.
+The shortlist is ranked by predicted EE. The pointing-center offsets are
+internal state used to preserve the model-input center for normal and recovered
+rows. Candidate payloads are retained only when they appear in at least one
+pixel shortlist; a later implementation may drop zero-reference payloads during
+streaming.
 
 After streaming, each pixel's shortlist is filtered by
 `winner_ee_epsilon`. Regularization can only choose candidates that remain in
@@ -377,8 +405,8 @@ after regularization, for final winner-pixel pairs.
 For final regularized winners:
 
 1. Group winner-pixel pairs by star count.
-2. Rebuild NGS payloads from retained candidate member coordinates and inner
-   pixel centers.
+2. Rebuild NGS payloads from retained candidate member coordinates and the
+   selected internal pointing centers.
 3. Run the averaged model in batches.
 4. Fill `winner_ee_averaged`.
 5. Compute averaged coverage.

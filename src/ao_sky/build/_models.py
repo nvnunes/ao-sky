@@ -176,6 +176,8 @@ class TraversalStructureStats:
     winner_payload_rows: int = 0
     point_prediction_batches: int = 0
     point_prediction_rows: int = 0
+    recovered_point_prediction_rows: int = 0
+    recovered_winner_pixels: int = 0
     point_prediction_batch_rows_peak: int = 0
     point_prediction_backend_rows: int = 0
     point_prediction_backend_batch_rows_peak: int = 0

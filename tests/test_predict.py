@@ -37,13 +37,17 @@ from ao_sky.build.traversal import (
     _build_regional_candidate_graph,
     _candidate_enclosing_fov_center,
     _MulticoverSelection,
+    _nearest_feasible_pointing,
+    _nearest_feasible_pointing_generic,
     _StarForCoverage,
     _local_neighbor_index_matrix,
     _max_regional_combination_work,
     _regularize_winner_labels,
     _regional_selector_max_depth,
     _select_ngs_for_multicover,
+    _stream_recovered_candidate_predictions,
     _stream_batch_size,
+    _update_regularized_winner_averaged_ee,
     build_base_inner_table,
     prepare_search_inputs,
     build_traversal_products,
@@ -627,6 +631,100 @@ def test_candidate_enclosing_fov_center_uses_longest_side_for_obtuse_triangle() 
     assert center.radius_arcsec == pytest.approx(10.0)
 
 
+def test_nearest_feasible_pointing_keeps_feasible_pixel_center() -> None:
+    pointing_x, pointing_y, feasible = _nearest_feasible_pointing(
+        np.asarray([5.0], dtype=np.float64),
+        np.asarray([0.0], dtype=np.float64),
+        np.asarray([[0.0, 10.0]], dtype=np.float64),
+        np.asarray([[0.0, 0.0]], dtype=np.float64),
+        10.0,
+    )
+
+    assert bool(feasible[0])
+    assert float(pointing_x[0]) == pytest.approx(5.0)
+    assert float(pointing_y[0]) == pytest.approx(0.0)
+
+
+def test_nearest_feasible_pointing_projects_to_two_star_lens() -> None:
+    pointing_x, pointing_y, feasible = _nearest_feasible_pointing(
+        np.asarray([0.0], dtype=np.float64),
+        np.asarray([30.0], dtype=np.float64),
+        np.asarray([[-58.0, 58.0]], dtype=np.float64),
+        np.asarray([[0.0, 0.0]], dtype=np.float64),
+        60.0,
+    )
+
+    assert bool(feasible[0])
+    assert float(pointing_x[0]) == pytest.approx(0.0)
+    assert float(pointing_y[0]) == pytest.approx(np.sqrt(60.0**2 - 58.0**2))
+
+
+def test_nearest_feasible_pointing_projects_to_three_star_intersection() -> None:
+    pointing_x, pointing_y, feasible = _nearest_feasible_pointing(
+        np.asarray([5.0], dtype=np.float64),
+        np.asarray([14.0], dtype=np.float64),
+        np.asarray([[0.0, 10.0, 5.0]], dtype=np.float64),
+        np.asarray([[0.0, 0.0, 8.0]], dtype=np.float64),
+        10.0,
+    )
+
+    assert bool(feasible[0])
+    assert float(pointing_x[0]) == pytest.approx(5.0)
+    assert float(pointing_y[0]) == pytest.approx(np.sqrt(10.0**2 - 5.0**2))
+
+
+def test_nearest_feasible_pointing_can_fail_to_cover_science_pixel() -> None:
+    pointing_x, pointing_y, feasible = _nearest_feasible_pointing(
+        np.asarray([0.0], dtype=np.float64),
+        np.asarray([80.0], dtype=np.float64),
+        np.asarray([[-58.0, 58.0]], dtype=np.float64),
+        np.asarray([[0.0, 0.0]], dtype=np.float64),
+        60.0,
+    )
+    science_distance = np.hypot(pointing_x[0], pointing_y[0] - 80.0)
+
+    assert bool(feasible[0])
+    assert float(science_distance) > 60.0
+
+
+@pytest.mark.parametrize("star_count", [1, 2, 3])
+def test_nearest_feasible_pointing_matches_generic_solver(star_count: int) -> None:
+    rng = np.random.default_rng(1024 + star_count)
+    row_count = 64
+    radius = 60.0
+    target_x = rng.uniform(-75.0, 75.0, size=row_count)
+    target_y = rng.uniform(-75.0, 75.0, size=row_count)
+    disk_x = np.zeros((row_count, star_count), dtype=np.float64)
+    disk_y = np.zeros((row_count, star_count), dtype=np.float64)
+
+    disk_x[:, 0] = rng.uniform(-15.0, 15.0, size=row_count)
+    disk_y[:, 0] = rng.uniform(-15.0, 15.0, size=row_count)
+    for disk_index in range(1, star_count):
+        angle = rng.uniform(0.0, 2.0 * np.pi, size=row_count)
+        separation = rng.uniform(0.0, 1.8 * radius, size=row_count)
+        disk_x[:, disk_index] = disk_x[:, 0] + separation * np.cos(angle)
+        disk_y[:, disk_index] = disk_y[:, 0] + separation * np.sin(angle)
+
+    pointing_x, pointing_y, feasible = _nearest_feasible_pointing(
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        radius,
+    )
+    expected_x, expected_y, expected_feasible = _nearest_feasible_pointing_generic(
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        radius,
+    )
+
+    np.testing.assert_array_equal(feasible, expected_feasible)
+    np.testing.assert_allclose(pointing_x, expected_x, equal_nan=True)
+    np.testing.assert_allclose(pointing_y, expected_y, equal_nan=True)
+
+
 def test_candidate_members_are_emitted_in_sensing_magnitude_order(
     tmp_path: Path,
 ) -> None:
@@ -800,6 +898,247 @@ def test_retained_asterism_table_uses_enclosing_fov_center(
         ),
     )
     assert int(retained["pix"][0]) == int(np.asarray(expected_pix)[0])
+
+
+def test_recovered_prediction_uses_nearest_valid_pointing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        fov=120.0 * u.arcsec,
+        min_wfs=2,
+        max_wfs=2,
+    )
+    stars = Table()
+    stars["source_id"] = np.array([10, 20], dtype=np.int64)
+    stars["ra"] = np.array([-58.0 / 3600.0, 58.0 / 3600.0], dtype=np.float64)
+    stars["dec"] = np.array([0.0, 0.0], dtype=np.float64)
+    stars["R"] = np.array([10.0, 11.0], dtype=np.float64)
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+    seen: dict[str, np.ndarray] = {}
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.get_point_model",
+        lambda runtime, num_stars, **kwargs: object(),
+    )
+
+    def fake_predict_point_arrays(
+        runtime,
+        num_stars,
+        model,
+        ngs_zd,
+        ngs_az_deg,
+        ngs_mag,
+        backend_row_count=None,
+        feature_buffer_row_count=None,
+        prediction_telemetry=None,
+    ):
+        seen["ngs_zd"] = np.asarray(ngs_zd, dtype=np.float64)
+        if prediction_telemetry is not None:
+            prediction_telemetry.record_feature_batch(
+                np.zeros((len(ngs_zd), 1), dtype=np.float64),
+                0.0,
+                row_count=len(ngs_zd),
+            )
+        return PointPredictionBatch(
+            sr=np.asarray([0.5], dtype=np.float64),
+            ee=np.asarray([0.7], dtype=np.float64),
+            fwhm=np.asarray([100.0], dtype=np.float64),
+            ee_angle=np.asarray([0.0], dtype=np.float64),
+        )
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.predict_point_arrays",
+        fake_predict_point_arrays,
+    )
+
+    best_ee = np.full(2, np.nan, dtype=np.float64)
+    best_sr = np.full(2, np.nan, dtype=np.float64)
+    best_fwhm = np.full(2, np.nan, dtype=np.float64)
+    top_refs = np.full((2, 3), -1, dtype=np.int64)
+    top_ee = np.full((2, 3), -np.inf, dtype=np.float64)
+    top_sr = np.full((2, 3), np.nan, dtype=np.float64)
+    top_fwhm = np.full((2, 3), np.nan, dtype=np.float64)
+    top_pointing_x = np.full((2, 3), np.nan, dtype=np.float64)
+    top_pointing_y = np.full((2, 3), np.nan, dtype=np.float64)
+    structure_profile = TraversalStructureProfile()
+
+    recovered_rows = _stream_recovered_candidate_predictions(
+        runtime,
+        TraversalExecutionConfig(resolved_backend_buckets=()),
+        candidate_set,
+        np.asarray([[1], [1]], dtype=np.uint64),
+        np.asarray([1], dtype=np.uint64),
+        star_x=np.asarray([-58.0, 58.0], dtype=np.float64),
+        star_y=np.asarray([0.0, 0.0], dtype=np.float64),
+        inner_x=np.asarray([1000.0, 0.0], dtype=np.float64),
+        inner_y=np.asarray([1000.0, 30.0], dtype=np.float64),
+        star_mags=np.asarray([10.0, 11.0], dtype=np.float64),
+        best_ee=best_ee,
+        best_sr=best_sr,
+        best_fwhm=best_fwhm,
+        top_refs=top_refs,
+        top_ee=top_ee,
+        top_sr=top_sr,
+        top_fwhm=top_fwhm,
+        top_pointing_x=top_pointing_x,
+        top_pointing_y=top_pointing_y,
+        recovery_pixel_index_map=np.asarray([1], dtype=np.int64),
+        structure_profile=structure_profile,
+    )
+
+    assert recovered_rows == 1
+    assert structure_profile.to_stats().recovered_point_prediction_rows == 1
+    assert int(top_refs[0, 0]) == -1
+    assert int(top_refs[1, 0]) == 0
+    assert float(top_pointing_x[1, 0]) == pytest.approx(0.0)
+    assert float(top_pointing_y[1, 0]) == pytest.approx(np.sqrt(60.0**2 - 58.0**2))
+    assert seen["ngs_zd"][0].tolist() == pytest.approx([60.0, 60.0])
+
+
+def test_recovery_skips_candidates_failing_wide_fov_prefilter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        fov=120.0 * u.arcsec,
+        min_wfs=2,
+        max_wfs=2,
+    )
+    stars = Table()
+    stars["source_id"] = np.array([10, 20], dtype=np.int64)
+    stars["ra"] = np.array([-58.0 / 3600.0, 58.0 / 3600.0], dtype=np.float64)
+    stars["dec"] = np.array([0.0, 0.0], dtype=np.float64)
+    stars["R"] = np.array([10.0, 11.0], dtype=np.float64)
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.predict_point_arrays",
+        lambda *args, **kwargs: pytest.fail("recovery should not run prediction"),
+    )
+
+    recovered_rows = _stream_recovered_candidate_predictions(
+        runtime,
+        TraversalExecutionConfig(resolved_backend_buckets=()),
+        candidate_set,
+        np.asarray([[1], [0]], dtype=np.uint64),
+        np.asarray([1], dtype=np.uint64),
+        star_x=np.asarray([-58.0, 58.0], dtype=np.float64),
+        star_y=np.asarray([0.0, 0.0], dtype=np.float64),
+        inner_x=np.asarray([0.0], dtype=np.float64),
+        inner_y=np.asarray([30.0], dtype=np.float64),
+        star_mags=np.asarray([10.0, 11.0], dtype=np.float64),
+        best_ee=np.full(1, np.nan, dtype=np.float64),
+        best_sr=np.full(1, np.nan, dtype=np.float64),
+        best_fwhm=np.full(1, np.nan, dtype=np.float64),
+        top_refs=np.full((1, 3), -1, dtype=np.int64),
+        top_ee=np.full((1, 3), -np.inf, dtype=np.float64),
+        top_sr=np.full((1, 3), np.nan, dtype=np.float64),
+        top_fwhm=np.full((1, 3), np.nan, dtype=np.float64),
+        top_pointing_x=np.full((1, 3), np.nan, dtype=np.float64),
+        top_pointing_y=np.full((1, 3), np.nan, dtype=np.float64),
+    )
+
+    assert recovered_rows == 0
+
+
+def test_averaged_prediction_uses_selected_pointing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        fov=120.0 * u.arcsec,
+        min_wfs=2,
+        max_wfs=2,
+    )
+    stars = Table()
+    stars["source_id"] = np.array([10, 20], dtype=np.int64)
+    stars["ra"] = np.array([-58.0 / 3600.0, 58.0 / 3600.0], dtype=np.float64)
+    stars["dec"] = np.array([0.0, 0.0], dtype=np.float64)
+    stars["R"] = np.array([10.0, 11.0], dtype=np.float64)
+    graph = _build_candidate_graph_from_ngs(stars, runtime)
+    candidate_set = _build_candidate_set(graph, runtime)
+    inner = Table(
+        [
+            np.asarray([0], dtype=np.int64),
+            np.zeros(1, dtype=np.int64),
+            np.zeros(1, dtype=np.int64),
+            np.full(1, np.nan, dtype=np.float64),
+            np.full(1, np.nan, dtype=np.float64),
+            np.full(1, np.nan, dtype=np.float64),
+            np.asarray([1], dtype=np.int64),
+            np.full(1, np.nan, dtype=np.float64),
+            np.full(1, np.nan, dtype=np.float64),
+            np.zeros(1, dtype=np.bool_),
+            np.zeros(1, dtype=np.bool_),
+        ],
+        names=(
+            "pix",
+            "star_count",
+            "ngs_count",
+            "best_ee",
+            "best_sr",
+            "best_fwhm",
+            "winner_asterism_id",
+            "winner_ee_resolved",
+            "winner_ee_averaged",
+            "coverage_resolved",
+            "coverage_averaged",
+        ),
+    )
+    seen: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.get_mean_model",
+        lambda runtime, num_stars, **kwargs: object(),
+    )
+
+    def fake_predict_field_mean_arrays(
+        runtime,
+        num_stars,
+        model,
+        ngs_zd,
+        ngs_az_deg,
+        ngs_mag,
+        backend_row_count=None,
+        feature_buffer_row_count=None,
+        prediction_telemetry=None,
+    ):
+        seen["ngs_zd"] = np.asarray(ngs_zd, dtype=np.float64)
+        if prediction_telemetry is not None:
+            prediction_telemetry.record_feature_batch(
+                np.zeros((len(ngs_zd), 1), dtype=np.float64),
+                0.0,
+                row_count=len(ngs_zd),
+            )
+        return np.asarray([0.6], dtype=np.float64)
+
+    monkeypatch.setattr(
+        "ao_sky.build.traversal.predict_field_mean_arrays",
+        fake_predict_field_mean_arrays,
+    )
+    pointing_y = np.sqrt(60.0**2 - 58.0**2)
+
+    _update_regularized_winner_averaged_ee(
+        runtime,
+        TraversalExecutionConfig(averaged_backend_buckets=()),
+        inner,
+        np.asarray([0], dtype=np.int64),
+        candidate_set,
+        star_x=np.asarray([-58.0, 58.0], dtype=np.float64),
+        star_y=np.asarray([0.0, 0.0], dtype=np.float64),
+        inner_x=np.asarray([0.0], dtype=np.float64),
+        inner_y=np.asarray([30.0], dtype=np.float64),
+        winner_pointing_x=np.asarray([0.0], dtype=np.float64),
+        winner_pointing_y=np.asarray([pointing_y], dtype=np.float64),
+        star_mags=np.asarray([10.0, 11.0], dtype=np.float64),
+    )
+
+    assert seen["ngs_zd"][0].tolist() == pytest.approx([60.0, 60.0])
+    assert float(inner["winner_ee_averaged"][0]) == pytest.approx(0.6)
 
 
 def test_regional_candidate_graph_keeps_exact_tractable_region(

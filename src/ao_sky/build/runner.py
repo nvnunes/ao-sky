@@ -476,6 +476,8 @@ class _TraversalStructureTelemetry:
     winner_payload_rows: int = 0
     point_prediction_batches: int = 0
     point_prediction_rows: int = 0
+    recovered_point_prediction_rows: int = 0
+    recovered_winner_pixels: int = 0
     point_prediction_batch_rows_peak: int = 0
     point_prediction_backend_rows: int = 0
     point_prediction_backend_batch_rows_peak: int = 0
@@ -519,6 +521,10 @@ class _TraversalStructureTelemetry:
         self.winner_payload_rows += int(stats.winner_payload_rows)
         self.point_prediction_batches += int(stats.point_prediction_batches)
         self.point_prediction_rows += int(stats.point_prediction_rows)
+        self.recovered_point_prediction_rows += int(
+            stats.recovered_point_prediction_rows
+        )
+        self.recovered_winner_pixels += int(stats.recovered_winner_pixels)
         self.point_prediction_batch_rows_peak = max(
             self.point_prediction_batch_rows_peak,
             int(stats.point_prediction_batch_rows_peak),
@@ -631,6 +637,8 @@ class _TraversalStructureTelemetry:
             winner_payload_rows=self.winner_payload_rows,
             point_prediction_batches=self.point_prediction_batches,
             point_prediction_rows=self.point_prediction_rows,
+            recovered_point_prediction_rows=self.recovered_point_prediction_rows,
+            recovered_winner_pixels=self.recovered_winner_pixels,
             point_prediction_batch_rows_peak=self.point_prediction_batch_rows_peak,
             point_prediction_backend_rows=self.point_prediction_backend_rows,
             point_prediction_backend_batch_rows_peak=(
@@ -3079,6 +3087,8 @@ def _handle_regional_worker_message(
             f"winner_payload_rows={structure_stats.winner_payload_rows} "
             f"point_prediction_batches={structure_stats.point_prediction_batches} "
             f"point_prediction_rows={structure_stats.point_prediction_rows} "
+            f"recovered_point_prediction_rows={structure_stats.recovered_point_prediction_rows} "
+            f"recovered_winner_pixels={structure_stats.recovered_winner_pixels} "
             f"point_prediction_batch_rows_peak={structure_stats.point_prediction_batch_rows_peak} "
             f"point_prediction_backend_rows={structure_stats.point_prediction_backend_rows} "
             f"point_prediction_backend_batch_rows_peak={structure_stats.point_prediction_backend_batch_rows_peak} "

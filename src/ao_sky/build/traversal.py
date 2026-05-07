@@ -93,17 +93,41 @@ class _PredictionRowBuffer:
 
     pixel_idxs: np.ndarray
     candidate_ids: np.ndarray
+    pointing_x: np.ndarray | None = None
+    pointing_y: np.ndarray | None = None
     size: int = 0
 
     @classmethod
-    def create(cls, capacity: int) -> "_PredictionRowBuffer":
+    def create(
+        cls,
+        capacity: int,
+        *,
+        with_pointing: bool = False,
+    ) -> "_PredictionRowBuffer":
         resolved_capacity = max(1, int(capacity))
         return cls(
             pixel_idxs=np.empty((resolved_capacity,), dtype=np.int64),
             candidate_ids=np.empty((resolved_capacity,), dtype=np.int64),
+            pointing_x=(
+                np.empty((resolved_capacity,), dtype=np.float64)
+                if with_pointing
+                else None
+            ),
+            pointing_y=(
+                np.empty((resolved_capacity,), dtype=np.float64)
+                if with_pointing
+                else None
+            ),
         )
 
-    def append(self, pixel_idxs: np.ndarray, candidate_id: int) -> None:
+    def append(
+        self,
+        pixel_idxs: np.ndarray,
+        candidate_id: int,
+        *,
+        pointing_x: np.ndarray | None = None,
+        pointing_y: np.ndarray | None = None,
+    ) -> None:
         rows = int(len(pixel_idxs))
         if rows == 0:
             return
@@ -111,14 +135,34 @@ class _PredictionRowBuffer:
         end = self.size + rows
         self.pixel_idxs[self.size : end] = np.asarray(pixel_idxs, dtype=np.int64)
         self.candidate_ids[self.size : end] = int(candidate_id)
+        if self.pointing_x is not None:
+            if pointing_x is None or pointing_y is None:
+                raise BuildError("pointing buffer append requires pointing coordinates")
+            self.pointing_x[self.size : end] = np.asarray(pointing_x, dtype=np.float64)
+            self.pointing_y[self.size : end] = np.asarray(pointing_y, dtype=np.float64)
         self.size = end
 
-    def arrays(self) -> tuple[np.ndarray, np.ndarray]:
-        return self.pixel_idxs[: self.size], self.candidate_ids[: self.size]
+    def arrays(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+        return (
+            self.pixel_idxs[: self.size],
+            self.candidate_ids[: self.size],
+            None if self.pointing_x is None else self.pointing_x[: self.size],
+            None if self.pointing_y is None else self.pointing_y[: self.size],
+        )
 
-    def head(self, rows: int) -> tuple[np.ndarray, np.ndarray]:
+    def head(
+        self,
+        rows: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
         resolved_rows = min(max(0, int(rows)), self.size)
-        return self.pixel_idxs[:resolved_rows], self.candidate_ids[:resolved_rows]
+        return (
+            self.pixel_idxs[:resolved_rows],
+            self.candidate_ids[:resolved_rows],
+            None if self.pointing_x is None else self.pointing_x[:resolved_rows],
+            None if self.pointing_y is None else self.pointing_y[:resolved_rows],
+        )
 
     def discard(self, rows: int) -> None:
         resolved_rows = min(max(0, int(rows)), self.size)
@@ -130,6 +174,13 @@ class _PredictionRowBuffer:
             self.candidate_ids[:remaining] = self.candidate_ids[
                 resolved_rows : self.size
             ]
+            if self.pointing_x is not None:
+                self.pointing_x[:remaining] = self.pointing_x[
+                    resolved_rows : self.size
+                ]
+                self.pointing_y[:remaining] = self.pointing_y[
+                    resolved_rows : self.size
+                ]
         self.size = remaining
 
     def clear(self) -> None:
@@ -145,6 +196,13 @@ class _PredictionRowBuffer:
         new_candidates[: self.size] = self.candidate_ids[: self.size]
         self.pixel_idxs = new_pixels
         self.candidate_ids = new_candidates
+        if self.pointing_x is not None:
+            new_pointing_x = np.empty((new_capacity,), dtype=np.float64)
+            new_pointing_y = np.empty((new_capacity,), dtype=np.float64)
+            new_pointing_x[: self.size] = self.pointing_x[: self.size]
+            new_pointing_y[: self.size] = self.pointing_y[: self.size]
+            self.pointing_x = new_pointing_x
+            self.pointing_y = new_pointing_y
 
 
 @dataclass(slots=True)
@@ -253,6 +311,8 @@ class TraversalStructureProfile:
     winner_payload_rows: int = 0
     point_prediction_batches: int = 0
     point_prediction_rows: int = 0
+    recovered_point_prediction_rows: int = 0
+    recovered_winner_pixels: int = 0
     point_prediction_batch_rows_peak: int = 0
     point_prediction_backend_rows: int = 0
     point_prediction_backend_batch_rows_peak: int = 0
@@ -297,6 +357,8 @@ class TraversalStructureProfile:
             winner_payload_rows=self.winner_payload_rows,
             point_prediction_batches=self.point_prediction_batches,
             point_prediction_rows=self.point_prediction_rows,
+            recovered_point_prediction_rows=self.recovered_point_prediction_rows,
+            recovered_winner_pixels=self.recovered_winner_pixels,
             point_prediction_batch_rows_peak=self.point_prediction_batch_rows_peak,
             point_prediction_backend_rows=self.point_prediction_backend_rows,
             point_prediction_backend_batch_rows_peak=(
@@ -956,6 +1018,260 @@ def _candidate_enclosing_fov_center(
     )
 
 
+def _coerce_recovery_projection_inputs(
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    disk_x: np.ndarray,
+    disk_y: np.ndarray,
+    radius_arcsec: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, float, float]:
+    target_x = np.asarray(target_x, dtype=np.float64)
+    target_y = np.asarray(target_y, dtype=np.float64)
+    disk_x = np.asarray(disk_x, dtype=np.float64)
+    disk_y = np.asarray(disk_y, dtype=np.float64)
+    if disk_x.ndim != 2 or disk_y.shape != disk_x.shape:
+        raise BuildError("recovery disk coordinates must have shape (rows, stars)")
+    if disk_x.shape[1] < 1 or disk_x.shape[1] > 3:
+        raise BuildError("recovery projection requires 1-3 guide-star disks")
+    if len(target_x) != len(target_y) or len(target_x) != disk_x.shape[0]:
+        raise BuildError("recovery target and disk row counts do not match")
+
+    row_count, disk_count = disk_x.shape
+    radius = float(radius_arcsec)
+    allowed_radius_sq = (radius + ASTERISM_CENTER_TOLERANCE_ARCSEC) ** 2
+    return (
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        row_count,
+        disk_count,
+        radius,
+        allowed_radius_sq,
+    )
+
+
+def _nearest_feasible_pointing_one_star(
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    disk_x: np.ndarray,
+    disk_y: np.ndarray,
+    radius: float,
+    allowed_radius_sq: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    center_x = disk_x[:, 0]
+    center_y = disk_y[:, 0]
+    dx = target_x - center_x
+    dy = target_y - center_y
+    distance = np.hypot(dx, dy)
+    inside = distance * distance <= allowed_radius_sq
+    valid_direction = distance > 0.0
+    safe_distance = np.where(valid_direction, distance, 1.0)
+    projected_x = center_x + radius * dx / safe_distance
+    projected_y = center_y + radius * dy / safe_distance
+    pointing_x = np.where(inside, target_x, projected_x)
+    pointing_y = np.where(inside, target_y, projected_y)
+    return pointing_x, pointing_y, np.ones((len(target_x),), dtype=np.bool_)
+
+
+def _nearest_feasible_pointing_two_star(
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    disk_x: np.ndarray,
+    disk_y: np.ndarray,
+    radius: float,
+    allowed_radius_sq: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    row_count = len(target_x)
+    best_x = np.full((row_count,), np.nan, dtype=np.float64)
+    best_y = np.full((row_count,), np.nan, dtype=np.float64)
+    best_dist_sq = np.full((row_count,), np.inf, dtype=np.float64)
+
+    def consider(qx: np.ndarray, qy: np.ndarray, valid: np.ndarray) -> None:
+        nonlocal best_x, best_y, best_dist_sq
+        first_dist_sq = (qx - disk_x[:, 0]) ** 2 + (qy - disk_y[:, 0]) ** 2
+        second_dist_sq = (qx - disk_x[:, 1]) ** 2 + (qy - disk_y[:, 1]) ** 2
+        inside = (
+            np.asarray(valid, dtype=np.bool_)
+            & (first_dist_sq <= allowed_radius_sq)
+            & (second_dist_sq <= allowed_radius_sq)
+        )
+        dist_to_target_sq = (qx - target_x) ** 2 + (qy - target_y) ** 2
+        update = inside & (dist_to_target_sq < best_dist_sq)
+        best_x[update] = qx[update]
+        best_y[update] = qy[update]
+        best_dist_sq[update] = dist_to_target_sq[update]
+
+    consider(target_x, target_y, np.ones((row_count,), dtype=np.bool_))
+
+    for disk_index in range(2):
+        dx = target_x - disk_x[:, disk_index]
+        dy = target_y - disk_y[:, disk_index]
+        distance = np.hypot(dx, dy)
+        valid = distance > 0.0
+        safe_distance = np.where(valid, distance, 1.0)
+        qx = disk_x[:, disk_index] + radius * dx / safe_distance
+        qy = disk_y[:, disk_index] + radius * dy / safe_distance
+        consider(qx, qy, valid)
+
+    dx = disk_x[:, 1] - disk_x[:, 0]
+    dy = disk_y[:, 1] - disk_y[:, 0]
+    separation = np.hypot(dx, dy)
+    valid = (separation > 0.0) & (separation <= 2.0 * radius)
+    safe_separation = np.where(valid, separation, 1.0)
+    midpoint_x = (disk_x[:, 0] + disk_x[:, 1]) / 2.0
+    midpoint_y = (disk_y[:, 0] + disk_y[:, 1]) / 2.0
+    half_chord = np.sqrt(
+        np.maximum(0.0, radius * radius - (safe_separation / 2.0) ** 2)
+    )
+    perp_x = -dy / safe_separation
+    perp_y = dx / safe_separation
+    consider(
+        midpoint_x + half_chord * perp_x,
+        midpoint_y + half_chord * perp_y,
+        valid,
+    )
+    consider(
+        midpoint_x - half_chord * perp_x,
+        midpoint_y - half_chord * perp_y,
+        valid,
+    )
+
+    return best_x, best_y, np.isfinite(best_dist_sq)
+
+
+def _nearest_feasible_pointing_generic(
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    disk_x: np.ndarray,
+    disk_y: np.ndarray,
+    radius_arcsec: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    (
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        row_count,
+        disk_count,
+        radius,
+        allowed_radius_sq,
+    ) = _coerce_recovery_projection_inputs(
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        radius_arcsec,
+    )
+    best_x = np.full((row_count,), np.nan, dtype=np.float64)
+    best_y = np.full((row_count,), np.nan, dtype=np.float64)
+    best_dist_sq = np.full((row_count,), np.inf, dtype=np.float64)
+
+    def consider(qx: np.ndarray, qy: np.ndarray, valid: np.ndarray) -> None:
+        nonlocal best_x, best_y, best_dist_sq
+        dist_to_stars_sq = (qx[:, None] - disk_x) ** 2 + (qy[:, None] - disk_y) ** 2
+        inside = np.asarray(valid, dtype=np.bool_) & np.all(
+            dist_to_stars_sq <= allowed_radius_sq,
+            axis=1,
+        )
+        dist_to_target_sq = (qx - target_x) ** 2 + (qy - target_y) ** 2
+        update = inside & (dist_to_target_sq < best_dist_sq)
+        best_x[update] = qx[update]
+        best_y[update] = qy[update]
+        best_dist_sq[update] = dist_to_target_sq[update]
+
+    consider(target_x, target_y, np.ones((row_count,), dtype=np.bool_))
+
+    for disk_index in range(disk_count):
+        dx = target_x - disk_x[:, disk_index]
+        dy = target_y - disk_y[:, disk_index]
+        distance = np.hypot(dx, dy)
+        valid = distance > 0.0
+        safe_distance = np.where(valid, distance, 1.0)
+        qx = disk_x[:, disk_index] + radius * dx / safe_distance
+        qy = disk_y[:, disk_index] + radius * dy / safe_distance
+        consider(qx, qy, valid)
+
+    for first in range(disk_count):
+        for second in range(first + 1, disk_count):
+            dx = disk_x[:, second] - disk_x[:, first]
+            dy = disk_y[:, second] - disk_y[:, first]
+            separation = np.hypot(dx, dy)
+            valid = (separation > 0.0) & (separation <= 2.0 * radius)
+            safe_separation = np.where(valid, separation, 1.0)
+            midpoint_x = (disk_x[:, first] + disk_x[:, second]) / 2.0
+            midpoint_y = (disk_y[:, first] + disk_y[:, second]) / 2.0
+            half_chord = np.sqrt(
+                np.maximum(0.0, radius * radius - (safe_separation / 2.0) ** 2)
+            )
+            perp_x = -dy / safe_separation
+            perp_y = dx / safe_separation
+            consider(
+                midpoint_x + half_chord * perp_x,
+                midpoint_y + half_chord * perp_y,
+                valid,
+            )
+            consider(
+                midpoint_x - half_chord * perp_x,
+                midpoint_y - half_chord * perp_y,
+                valid,
+            )
+
+    return best_x, best_y, np.isfinite(best_dist_sq)
+
+
+def _nearest_feasible_pointing(
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    disk_x: np.ndarray,
+    disk_y: np.ndarray,
+    radius_arcsec: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project target points onto the intersection of 1-3 equal-radius disks."""
+
+    (
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        _row_count,
+        disk_count,
+        radius,
+        allowed_radius_sq,
+    ) = _coerce_recovery_projection_inputs(
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        radius_arcsec,
+    )
+    if disk_count == 1:
+        return _nearest_feasible_pointing_one_star(
+            target_x,
+            target_y,
+            disk_x,
+            disk_y,
+            radius,
+            allowed_radius_sq,
+        )
+    if disk_count == 2:
+        return _nearest_feasible_pointing_two_star(
+            target_x,
+            target_y,
+            disk_x,
+            disk_y,
+            radius,
+            allowed_radius_sq,
+        )
+    return _nearest_feasible_pointing_generic(
+        target_x,
+        target_y,
+        disk_x,
+        disk_y,
+        radius,
+    )
+
+
 def _combination_count(n: int, k: int) -> int:
     if n < k:
         return 0
@@ -1324,6 +1640,8 @@ def _build_star_pixel_bitsets(
     stars: Table,
     inner_centres: SkyCoord,
     runtime: PredictRuntime,
+    *,
+    radius_arcsec: float | None = None,
 ) -> np.ndarray:
     inner_count = len(inner_centres)
     words = int(math.ceil(inner_count / 64))
@@ -1334,7 +1652,11 @@ def _build_star_pixel_bitsets(
     pixel_idxs, star_idxs, _, _ = search_around_sky(
         inner_centres,
         star_coords,
-        runtime.ao_system.fov / 2.0,
+        (
+            runtime.ao_system.fov / 2.0
+            if radius_arcsec is None
+            else float(radius_arcsec) * u.arcsec
+        ),
     )
     if len(pixel_idxs) == 0:
         return bitsets
@@ -1849,11 +2171,21 @@ def _build_ngs_feature_arrays(
     inner_x: np.ndarray,
     inner_y: np.ndarray,
     star_mags: np.ndarray,
+    pointing_x: np.ndarray | None = None,
+    pointing_y: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     members = candidate_set.members[np.asarray(candidate_ids, dtype=np.int64), : int(num_stars)]
     pixels = np.asarray(pixel_idxs, dtype=np.int64)
-    dx = star_x[members] - inner_x[pixels, None]
-    dy = star_y[members] - inner_y[pixels, None]
+    if pointing_x is None:
+        center_x = inner_x[pixels]
+    else:
+        center_x = np.asarray(pointing_x, dtype=np.float64)
+    if pointing_y is None:
+        center_y = inner_y[pixels]
+    else:
+        center_y = np.asarray(pointing_y, dtype=np.float64)
+    dx = star_x[members] - center_x[:, None]
+    dy = star_y[members] - center_y[:, None]
     return (
         np.hypot(dx, dy),
         np.rad2deg(np.arctan2(dx, dy)),
@@ -1918,6 +2250,8 @@ def _scatter_top_candidates(
     pixel_idxs: np.ndarray,
     candidate_ids: np.ndarray,
     *,
+    pointing_x: np.ndarray,
+    pointing_y: np.ndarray,
     sr: np.ndarray,
     ee: np.ndarray,
     fwhm: np.ndarray,
@@ -1928,6 +2262,8 @@ def _scatter_top_candidates(
     top_ee: np.ndarray,
     top_sr: np.ndarray,
     top_fwhm: np.ndarray,
+    top_pointing_x: np.ndarray,
+    top_pointing_y: np.ndarray,
     profile: TraversalStageProfile | None = None,
 ) -> None:
     started = time.perf_counter()
@@ -1944,6 +2280,8 @@ def _scatter_top_candidates(
     batch_ee = np.asarray(ee, dtype=np.float64)[finite]
     batch_sr = np.asarray(sr, dtype=np.float64)[finite]
     batch_fwhm = np.asarray(fwhm, dtype=np.float64)[finite]
+    batch_pointing_x = np.asarray(pointing_x, dtype=np.float64)[finite]
+    batch_pointing_y = np.asarray(pointing_y, dtype=np.float64)[finite]
     if profile is not None:
         profile.point_prediction_scatter_filter_seconds += (
             time.perf_counter() - started
@@ -1956,6 +2294,8 @@ def _scatter_top_candidates(
     existing_ee = top_ee[affected_pixels].reshape(-1)
     existing_sr = top_sr[affected_pixels].reshape(-1)
     existing_fwhm = top_fwhm[affected_pixels].reshape(-1)
+    existing_pointing_x = top_pointing_x[affected_pixels].reshape(-1)
+    existing_pointing_y = top_pointing_y[affected_pixels].reshape(-1)
     existing_valid = (existing_refs >= 0) & np.isfinite(existing_ee)
 
     combined_pixels = np.concatenate((existing_pixels[existing_valid], batch_pixels))
@@ -1963,6 +2303,12 @@ def _scatter_top_candidates(
     combined_ee = np.concatenate((existing_ee[existing_valid], batch_ee))
     combined_sr = np.concatenate((existing_sr[existing_valid], batch_sr))
     combined_fwhm = np.concatenate((existing_fwhm[existing_valid], batch_fwhm))
+    combined_pointing_x = np.concatenate(
+        (existing_pointing_x[existing_valid], batch_pointing_x)
+    )
+    combined_pointing_y = np.concatenate(
+        (existing_pointing_y[existing_valid], batch_pointing_y)
+    )
     if profile is not None:
         profile.point_prediction_scatter_merge_seconds += (
             time.perf_counter() - started
@@ -1986,6 +2332,8 @@ def _scatter_top_candidates(
     top_ee[affected_pixels] = -np.inf
     top_sr[affected_pixels] = np.nan
     top_fwhm[affected_pixels] = np.nan
+    top_pointing_x[affected_pixels] = np.nan
+    top_pointing_y[affected_pixels] = np.nan
 
     kept_order = order[keep]
     kept_pixels = sorted_pixels[keep]
@@ -1994,6 +2342,8 @@ def _scatter_top_candidates(
     top_ee[kept_pixels, kept_ranks] = combined_ee[kept_order]
     top_sr[kept_pixels, kept_ranks] = combined_sr[kept_order]
     top_fwhm[kept_pixels, kept_ranks] = combined_fwhm[kept_order]
+    top_pointing_x[kept_pixels, kept_ranks] = combined_pointing_x[kept_order]
+    top_pointing_y[kept_pixels, kept_ranks] = combined_pointing_y[kept_order]
 
     best_candidate_ee = top_ee[affected_pixels, 0]
     improved = np.isfinite(best_candidate_ee) & (
@@ -2027,6 +2377,11 @@ def _flush_resolved_prediction_rows(
     top_ee: np.ndarray,
     top_sr: np.ndarray,
     top_fwhm: np.ndarray,
+    top_pointing_x: np.ndarray,
+    top_pointing_y: np.ndarray,
+    pointing_x: np.ndarray | None = None,
+    pointing_y: np.ndarray | None = None,
+    recovered: bool = False,
     profile: TraversalStageProfile | None = None,
     structure_profile: TraversalStructureProfile | None = None,
 ) -> None:
@@ -2034,6 +2389,16 @@ def _flush_resolved_prediction_rows(
         return
     pixel_array = np.asarray(pixel_idxs, dtype=np.int64)
     candidate_array = np.asarray(candidate_ids, dtype=np.int64)
+    pointing_x_array = (
+        inner_x[pixel_array]
+        if pointing_x is None
+        else np.asarray(pointing_x, dtype=np.float64)
+    )
+    pointing_y_array = (
+        inner_y[pixel_array]
+        if pointing_y is None
+        else np.asarray(pointing_y, dtype=np.float64)
+    )
     started = time.perf_counter()
     ngs_zd, ngs_az, ngs_mag = _build_ngs_feature_arrays(
         pixel_idxs=pixel_array,
@@ -2045,6 +2410,8 @@ def _flush_resolved_prediction_rows(
         inner_x=inner_x,
         inner_y=inner_y,
         star_mags=star_mags,
+        pointing_x=pointing_x_array,
+        pointing_y=pointing_y_array,
     )
     if profile is not None:
         profile.point_prediction_ngs_array_seconds += time.perf_counter() - started
@@ -2079,10 +2446,16 @@ def _flush_resolved_prediction_rows(
         profile=profile,
         structure_profile=structure_profile,
     )
+    if recovered and structure_profile is not None and prediction_telemetry is not None:
+        structure_profile.recovered_point_prediction_rows += int(
+            prediction_telemetry.rows
+        )
     started = time.perf_counter()
     _scatter_top_candidates(
         pixel_array,
         candidate_array,
+        pointing_x=pointing_x_array,
+        pointing_y=pointing_y_array,
         sr=np.asarray(metrics.sr, dtype=np.float64),
         ee=np.asarray(metrics.ee, dtype=np.float64),
         fwhm=np.asarray(metrics.fwhm, dtype=np.float64),
@@ -2093,6 +2466,8 @@ def _flush_resolved_prediction_rows(
         top_ee=top_ee,
         top_sr=top_sr,
         top_fwhm=top_fwhm,
+        top_pointing_x=top_pointing_x,
+        top_pointing_y=top_pointing_y,
         profile=profile,
     )
     if profile is not None:
@@ -2118,6 +2493,8 @@ def _stream_resolved_candidate_predictions(
     top_ee: np.ndarray,
     top_sr: np.ndarray,
     top_fwhm: np.ndarray,
+    top_pointing_x: np.ndarray,
+    top_pointing_y: np.ndarray,
     profile: TraversalStageProfile | None = None,
     structure_profile: TraversalStructureProfile | None = None,
     memory_pressure_callback: Callable[[], None] | None = None,
@@ -2173,7 +2550,9 @@ def _stream_resolved_candidate_predictions(
             profile.point_prediction_buffer_seconds += time.perf_counter() - started
         evaluated_rows += int(len(pixel_idxs))
         while buffer.size >= stream_batch_size:
-            batch_pixel_idxs, batch_candidate_ids = buffer.head(stream_batch_size)
+            batch_pixel_idxs, batch_candidate_ids, _, _ = buffer.head(
+                stream_batch_size
+            )
             _flush_resolved_prediction_rows(
                 runtime,
                 execution_config,
@@ -2193,6 +2572,8 @@ def _stream_resolved_candidate_predictions(
                 top_ee=top_ee,
                 top_sr=top_sr,
                 top_fwhm=top_fwhm,
+                top_pointing_x=top_pointing_x,
+                top_pointing_y=top_pointing_y,
                 profile=profile,
                 structure_profile=structure_profile,
             )
@@ -2202,7 +2583,7 @@ def _stream_resolved_candidate_predictions(
             if memory_pressure_callback is not None:
                 memory_pressure_callback()
     for num_stars, buffer in buffers.items():
-        batch_pixel_idxs, batch_candidate_ids = buffer.arrays()
+        batch_pixel_idxs, batch_candidate_ids, _, _ = buffer.arrays()
         _flush_resolved_prediction_rows(
             runtime,
             execution_config,
@@ -2222,6 +2603,8 @@ def _stream_resolved_candidate_predictions(
             top_ee=top_ee,
             top_sr=top_sr,
             top_fwhm=top_fwhm,
+            top_pointing_x=top_pointing_x,
+            top_pointing_y=top_pointing_y,
             profile=profile,
             structure_profile=structure_profile,
         )
@@ -2236,6 +2619,167 @@ def _stream_resolved_candidate_predictions(
         structure_profile.context_pair_rows = int(evaluated_rows)
         structure_profile.post_bright_asterism_rows = int(empty_footprints)
     return evaluated_rows
+
+
+def _stream_recovered_candidate_predictions(
+    runtime: PredictRuntime,
+    execution_config: TraversalExecutionConfig,
+    candidate_set: _CandidateSet,
+    recovery_pixel_bits: np.ndarray,
+    recovery_allowed_bits: np.ndarray,
+    *,
+    star_x: np.ndarray,
+    star_y: np.ndarray,
+    inner_x: np.ndarray,
+    inner_y: np.ndarray,
+    star_mags: np.ndarray,
+    best_ee: np.ndarray,
+    best_sr: np.ndarray,
+    best_fwhm: np.ndarray,
+    top_refs: np.ndarray,
+    top_ee: np.ndarray,
+    top_sr: np.ndarray,
+    top_fwhm: np.ndarray,
+    top_pointing_x: np.ndarray,
+    top_pointing_y: np.ndarray,
+    recovery_pixel_index_map: np.ndarray | None = None,
+    profile: TraversalStageProfile | None = None,
+    structure_profile: TraversalStructureProfile | None = None,
+    memory_pressure_callback: Callable[[], None] | None = None,
+) -> int:
+    pixel_index_map = (
+        None
+        if recovery_pixel_index_map is None
+        else np.asarray(recovery_pixel_index_map, dtype=np.int64)
+    )
+    inner_count = len(inner_x) if pixel_index_map is None else len(pixel_index_map)
+    if (
+        len(candidate_set.members) == 0
+        or len(recovery_allowed_bits) == 0
+        or not np.any(recovery_allowed_bits)
+    ):
+        return 0
+
+    radius_arcsec = runtime.ao_system.fov.to_value(u.arcsec) / 2.0
+    max_science_distance_sq = (
+        radius_arcsec + ASTERISM_CENTER_TOLERANCE_ARCSEC
+    ) ** 2
+    stream_batch_size = _stream_batch_size(
+        execution_config.prediction_batch_size,
+        execution_config.resolved_backend_buckets,
+    )
+    buffer_capacity = stream_batch_size
+    buffers: dict[int, _PredictionRowBuffer] = {
+        order: _PredictionRowBuffer.create(buffer_capacity, with_pointing=True)
+        for order in _enabled_candidate_orders(runtime)
+    }
+    recovered_rows = 0
+    prediction_flushes = 0
+
+    def maybe_clear_cache() -> None:
+        if execution_config.resolved_cache_clear_every < 1:
+            return
+        if prediction_flushes % execution_config.resolved_cache_clear_every == 0:
+            _clear_backend_cache_with_profile(profile)
+
+    def flush_buffer(num_stars: int, rows: int | None = None) -> None:
+        nonlocal prediction_flushes
+        buffer = buffers[int(num_stars)]
+        if buffer.size == 0:
+            return
+        batch_size = buffer.size if rows is None else int(rows)
+        batch_pixel_idxs, batch_candidate_ids, batch_pointing_x, batch_pointing_y = (
+            buffer.head(batch_size)
+        )
+        if len(batch_pixel_idxs) == 0:
+            return
+        _flush_resolved_prediction_rows(
+            runtime,
+            execution_config,
+            num_stars=num_stars,
+            pixel_idxs=batch_pixel_idxs,
+            candidate_ids=batch_candidate_ids,
+            candidate_set=candidate_set,
+            star_x=star_x,
+            star_y=star_y,
+            inner_x=inner_x,
+            inner_y=inner_y,
+            star_mags=star_mags,
+            best_ee=best_ee,
+            best_sr=best_sr,
+            best_fwhm=best_fwhm,
+            top_refs=top_refs,
+            top_ee=top_ee,
+            top_sr=top_sr,
+            top_fwhm=top_fwhm,
+            top_pointing_x=top_pointing_x,
+            top_pointing_y=top_pointing_y,
+            pointing_x=batch_pointing_x,
+            pointing_y=batch_pointing_y,
+            recovered=True,
+            profile=profile,
+            structure_profile=structure_profile,
+        )
+        prediction_flushes += 1
+        buffer.discard(len(batch_pixel_idxs))
+        maybe_clear_cache()
+        if memory_pressure_callback is not None:
+            memory_pressure_callback()
+
+    for num_stars in _enabled_candidate_orders(runtime):
+        order_candidate_ids = np.flatnonzero(
+            np.asarray(candidate_set.star_counts, dtype=np.int64) == int(num_stars)
+        )
+        for candidate_id in order_candidate_ids:
+            members = candidate_set.members[int(candidate_id), : int(num_stars)]
+            eligible_words = np.asarray(recovery_allowed_bits, dtype=np.uint64).copy()
+            for member in members:
+                eligible_words &= recovery_pixel_bits[int(member)]
+            recovery_pixel_idxs = _bitset_to_indices(eligible_words, inner_count)
+            if len(recovery_pixel_idxs) == 0:
+                continue
+            pixel_idxs = (
+                recovery_pixel_idxs
+                if pixel_index_map is None
+                else pixel_index_map[recovery_pixel_idxs]
+            )
+            target_x = inner_x[pixel_idxs]
+            target_y = inner_y[pixel_idxs]
+            pointing_x, pointing_y, feasible = _nearest_feasible_pointing(
+                target_x,
+                target_y,
+                np.broadcast_to(
+                    star_x[members],
+                    (len(recovery_pixel_idxs), int(num_stars)),
+                ),
+                np.broadcast_to(
+                    star_y[members],
+                    (len(recovery_pixel_idxs), int(num_stars)),
+                ),
+                radius_arcsec,
+            )
+            science_distance_sq = (
+                (pointing_x - target_x) ** 2 + (pointing_y - target_y) ** 2
+            )
+            valid = feasible & (science_distance_sq <= max_science_distance_sq)
+            valid_positions = np.flatnonzero(valid)
+            recovered_rows += int(len(valid_positions))
+            if len(valid_positions) == 0:
+                continue
+            buffer = buffers[int(num_stars)]
+            buffer.append(
+                pixel_idxs[valid_positions],
+                int(candidate_id),
+                pointing_x=pointing_x[valid_positions],
+                pointing_y=pointing_y[valid_positions],
+            )
+            while buffer.size >= stream_batch_size:
+                flush_buffer(num_stars, stream_batch_size)
+    for num_stars in _enabled_candidate_orders(runtime):
+        flush_buffer(num_stars)
+    if prediction_flushes > 0 and execution_config.resolved_cache_clear_every > 0:
+        _clear_backend_cache_with_profile(profile)
+    return recovered_rows
 
 
 def _local_neighbor_index_matrix(inner_pixs: np.ndarray, inner_level: int) -> np.ndarray:
@@ -2347,14 +2891,18 @@ def _fill_regularized_winner_fields(
     labels: np.ndarray,
     top_refs: np.ndarray,
     top_ee: np.ndarray,
+    top_pointing_x: np.ndarray,
+    top_pointing_y: np.ndarray,
     retained_candidate_ids: np.ndarray,
-) -> dict[int, int]:
+) -> tuple[dict[int, int], np.ndarray, np.ndarray]:
     candidate_to_asterism_id = {
         int(candidate_id): index + 1
         for index, candidate_id in enumerate(np.asarray(retained_candidate_ids, dtype=np.int64))
     }
     winner_ids = np.full((len(inner),), -1, dtype=np.int64)
     winner_ee_resolved = np.asarray(inner["winner_ee_resolved"], dtype=np.float64).copy()
+    winner_pointing_x = np.full((len(inner),), np.nan, dtype=np.float64)
+    winner_pointing_y = np.full((len(inner),), np.nan, dtype=np.float64)
     label_array = np.asarray(labels, dtype=np.int64)
     retained = np.asarray(retained_candidate_ids, dtype=np.int64)
     if len(retained) > 0:
@@ -2374,9 +2922,17 @@ def _fill_regularized_winner_fields(
             row_indexes[has_match],
             match_positions[has_match],
         ]
+        winner_pointing_x[has_match] = top_pointing_x[
+            row_indexes[has_match],
+            match_positions[has_match],
+        ]
+        winner_pointing_y[has_match] = top_pointing_y[
+            row_indexes[has_match],
+            match_positions[has_match],
+        ]
     inner["winner_asterism_id"] = winner_ids
     inner["winner_ee_resolved"] = winner_ee_resolved
-    return candidate_to_asterism_id
+    return candidate_to_asterism_id, winner_pointing_x, winner_pointing_y
 
 
 def _build_retained_asterism_table(
@@ -2486,6 +3042,8 @@ def _update_regularized_winner_averaged_ee(
     star_y: np.ndarray,
     inner_x: np.ndarray,
     inner_y: np.ndarray,
+    winner_pointing_x: np.ndarray,
+    winner_pointing_y: np.ndarray,
     star_mags: np.ndarray,
     profile: TraversalStageProfile | None = None,
     structure_profile: TraversalStructureProfile | None = None,
@@ -2540,6 +3098,12 @@ def _update_regularized_winner_averaged_ee(
                 inner_x=inner_x,
                 inner_y=inner_y,
                 star_mags=star_mags,
+                pointing_x=np.asarray(winner_pointing_x, dtype=np.float64)[
+                    batch_pixel_idxs
+                ],
+                pointing_y=np.asarray(winner_pointing_y, dtype=np.float64)[
+                    batch_pixel_idxs
+                ],
             )
             prediction_telemetry = _new_prediction_telemetry(profile, structure_profile)
             inner["winner_ee_averaged"][batch_pixel_idxs] = predict_field_mean_arrays(
@@ -2696,6 +3260,8 @@ def build_traversal_products(
         top_ee = np.full((len(inner), WINNER_TOP_K), -np.inf, dtype=np.float64)
         top_sr = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
         top_fwhm = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
+        top_pointing_x = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
+        top_pointing_y = np.full((len(inner), WINNER_TOP_K), np.nan, dtype=np.float64)
 
         started = time.perf_counter()
         _stream_resolved_candidate_predictions(
@@ -2716,10 +3282,53 @@ def build_traversal_products(
             top_ee=top_ee,
             top_sr=top_sr,
             top_fwhm=top_fwhm,
+            top_pointing_x=top_pointing_x,
+            top_pointing_y=top_pointing_y,
             profile=profile,
             structure_profile=structure_profile,
             memory_pressure_callback=memory_pressure_callback,
         )
+        no_winner_pixel_idxs = np.flatnonzero(top_refs[:, 0] < 0)
+        if len(no_winner_pixel_idxs) > 0:
+            recovery_inner_centres = inner_centres[no_winner_pixel_idxs]
+            recovery_pixel_bits = _build_star_pixel_bitsets(
+                candidate_ngs,
+                recovery_inner_centres,
+                runtime,
+                radius_arcsec=runtime.ao_system.fov.to_value(u.arcsec),
+            )
+            recovery_allowed_pixel_idxs = np.flatnonzero(
+                bright_allowed_pixels[no_winner_pixel_idxs]
+            )
+            recovery_allowed_bits = _pack_pixel_indices(
+                recovery_allowed_pixel_idxs,
+                len(recovery_inner_centres),
+            )
+            _stream_recovered_candidate_predictions(
+                runtime,
+                execution_config,
+                candidate_set,
+                recovery_pixel_bits,
+                recovery_allowed_bits,
+                star_x=star_x,
+                star_y=star_y,
+                inner_x=inner_x,
+                inner_y=inner_y,
+                star_mags=star_mags,
+                best_ee=best_ee,
+                best_sr=best_sr,
+                best_fwhm=best_fwhm,
+                top_refs=top_refs,
+                top_ee=top_ee,
+                top_sr=top_sr,
+                top_fwhm=top_fwhm,
+                top_pointing_x=top_pointing_x,
+                top_pointing_y=top_pointing_y,
+                recovery_pixel_index_map=no_winner_pixel_idxs,
+                profile=profile,
+                structure_profile=structure_profile,
+                memory_pressure_callback=memory_pressure_callback,
+            )
         inner["best_ee"] = best_ee
         inner["best_sr"] = best_sr
         inner["best_fwhm"] = best_fwhm
@@ -2748,13 +3357,26 @@ def build_traversal_products(
             top_ee,
         )
         retained_candidate_ids = np.unique(labels[labels >= 0])
-        _fill_regularized_winner_fields(
-            inner,
-            labels,
-            top_refs,
-            top_ee,
-            retained_candidate_ids,
+        _candidate_to_asterism_id, winner_pointing_x, winner_pointing_y = (
+            _fill_regularized_winner_fields(
+                inner,
+                labels,
+                top_refs,
+                top_ee,
+                top_pointing_x,
+                top_pointing_y,
+                retained_candidate_ids,
+            )
         )
+        if structure_profile is not None:
+            recovered_winners = (labels >= 0) & np.isfinite(winner_pointing_x)
+            recovered_winners &= (
+                (np.abs(winner_pointing_x - inner_x) > ASTERISM_CENTER_TOLERANCE_ARCSEC)
+                | (np.abs(winner_pointing_y - inner_y) > ASTERISM_CENTER_TOLERANCE_ARCSEC)
+            )
+            structure_profile.recovered_winner_pixels = int(
+                np.count_nonzero(recovered_winners)
+            )
         retained_asterisms = _build_retained_asterism_table(
             candidate_set,
             retained_candidate_ids,
@@ -2779,6 +3401,8 @@ def build_traversal_products(
             star_y=star_y,
             inner_x=inner_x,
             inner_y=inner_y,
+            winner_pointing_x=winner_pointing_x,
+            winner_pointing_y=winner_pointing_y,
             star_mags=star_mags,
             profile=profile,
             structure_profile=structure_profile,
