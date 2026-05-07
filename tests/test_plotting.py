@@ -8,7 +8,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-from astropy.table import Table
+from astropy.table import Table, vstack
 from matplotlib import pyplot as plt
 import numpy as np
 import pytest
@@ -20,8 +20,13 @@ from ao_sky.gaia._constants import HDF5_DATASET_NAME
 from ao_sky.plotting import (
     PlottingError,
     configure_matplotlib_cache,
+    plot_asterism,
     plot_asterisms,
     plot_build_asterisms,
+    plot_build_winner_ee,
+    plot_winner_ee,
+    read_build_asterisms,
+    read_build_winner_ee,
 )
 from ao_sky.plotting.fields import FIELD_CONVENTIONS, prepare_field_values
 from ao_sky.plotting.healpix import _remap_dense_values_to_mapcoord, get_healpix_from_skycoord, get_pixel_skycoord
@@ -47,6 +52,7 @@ def test_best_metric_field_conventions_use_validation_ranges() -> None:
     assert FIELD_CONVENTIONS["best_sr"].vmax == 0.4
     assert FIELD_CONVENTIONS["best_fwhm"].vmin == 50.0
     assert FIELD_CONVENTIONS["best_fwhm"].vmax == 350.0
+    assert FIELD_CONVENTIONS["best_fwhm"].unit == "FWHM [mas]"
 
 
 def test_winner_ee_field_conventions_match_best_ee_range() -> None:
@@ -181,6 +187,40 @@ def test_plot_map_artifact_field_renders_png(tmp_path: Path) -> None:
     assert output_path.stat().st_size > 0
 
 
+def test_plot_map_artifact_field_adds_build_wavelength_to_ao_metric_title(tmp_path: Path) -> None:
+    _write_synthetic_maps(tmp_path, level=0)
+    (tmp_path / "build.yaml").write_text(
+        "prediction:\n  wavelength_micron: 1.654\n",
+        encoding="utf-8",
+    )
+
+    fig = plot_map_artifact_field(tmp_path, field="best_ee", level=0)
+
+    try:
+        assert fig.axes[0].get_title() == r"Best EE [$\lambda = 1.654\,\mu\mathrm{m}$]"
+    finally:
+        plt.close(fig)
+
+
+def test_plot_map_artifact_field_reads_wavelength_from_build_h5_metadata(tmp_path: Path) -> None:
+    _write_synthetic_maps(tmp_path, level=0)
+    with h5py.File(tmp_path / "build.h5", "w") as handle:
+        metadata = handle.create_group("metadata")
+        metadata.create_dataset(
+            "config_yaml",
+            data="prediction:\n  wavelength_micron: 1.234\n",
+        )
+
+    fig = plot_map_artifact_field(tmp_path, field="best_sr", level=0)
+
+    try:
+        assert fig.axes[0].get_title() == (
+            r"Best Strehl Ratio [$\lambda = 1.234\,\mu\mathrm{m}$]"
+        )
+    finally:
+        plt.close(fig)
+
+
 def test_plot_map_artifact_field_renders_contours(tmp_path: Path) -> None:
     artifact = _write_synthetic_maps(tmp_path, level=1)
     output_path = tmp_path / "plots" / "coverage_mean-dust-contours-hpx1.png"
@@ -245,6 +285,56 @@ def test_plot_asterisms_renders_stars_fov_and_connections(tmp_path: Path) -> Non
         assert ax.lines
     finally:
         plt.close(fig)
+
+
+def test_plot_asterism_renders_centered_fov_and_feasible_regions() -> None:
+    center = SkyCoord(150.0 * u.deg, 2.0 * u.deg, frame="icrs")
+    asterism = _single_asterism_table(center)
+    stars = _single_asterism_background_stars(center)
+
+    fig = plot_asterism(asterism[0], fov=120.0 * u.arcsec, stars=stars)
+
+    try:
+        ax = fig.axes[0]
+        assert len(ax.collections) >= 2
+        assert ax.patches
+        assert ax.lines
+    finally:
+        plt.close(fig)
+
+
+def test_plot_asterism_supports_hide_options() -> None:
+    center = SkyCoord(150.0 * u.deg, 2.0 * u.deg, frame="icrs")
+    asterism = _single_asterism_table(center)
+
+    fig = plot_asterism(
+        asterism,
+        fov=120.0 * u.arcsec,
+        hide_stars=True,
+        hide_centered_fov=True,
+        hide_connections=True,
+        hide_valid_fov_centers=True,
+        hide_coverable_region=True,
+    )
+
+    try:
+        ax = fig.axes[0]
+        assert not ax.collections
+        assert not ax.patches
+        assert not ax.lines
+    finally:
+        plt.close(fig)
+
+
+def test_plot_asterism_validates_single_row_and_fov() -> None:
+    center = SkyCoord(150.0 * u.deg, 2.0 * u.deg, frame="icrs")
+    asterism = _single_asterism_table(center)
+
+    with pytest.raises(PlottingError, match="exactly one row"):
+        plot_asterism(vstack([asterism, asterism]), fov=120.0 * u.arcsec)
+
+    with pytest.raises(PlottingError, match="fov must be a positive"):
+        plot_asterism(asterism, fov=0.0 * u.arcsec)
 
 
 def test_plot_asterisms_supports_hide_options(tmp_path: Path) -> None:
@@ -358,6 +448,160 @@ def test_plot_asterisms_renders_normalized_tables(tmp_path: Path) -> None:
         plt.close(fig)
 
 
+def test_plot_asterisms_can_draw_coverable_region_mask(tmp_path: Path) -> None:
+    center = _write_synthetic_asterism_build(tmp_path)
+    asterisms = Table(np.zeros(1, dtype=ASTERISMS_DTYPE))
+    asterisms["asterism_id"] = [1]
+    asterisms["num_stars"] = [2]
+    asterisms["pix"] = [0]
+    asterisms["ra"], asterisms["dec"] = _offset_position(center, 0.0, 0.0)
+    asterisms["star1_source_id"] = [10]
+    asterisms["star1_ra"], asterisms["star1_dec"] = _offset_position(center, -0.01, 0.0)
+    asterisms["star1_mag"] = [12.0]
+    asterisms["star2_source_id"] = [20]
+    asterisms["star2_ra"], asterisms["star2_dec"] = _offset_position(center, 0.01, 0.0)
+    asterisms["star2_mag"] = [13.0]
+
+    fig = plot_asterisms(
+        asterisms,
+        center=center,
+        width=1.0 * u.deg,
+        fov=120.0 * u.arcsec,
+        hide_stars=True,
+        hide_fov=True,
+        hide_connections=True,
+        coverable_region_mask=True,
+    )
+
+    try:
+        ax = fig.axes[0]
+        assert ax.patches
+        assert not ax.lines
+    finally:
+        plt.close(fig)
+
+
+def test_read_build_asterisms_supports_field_margin(tmp_path: Path) -> None:
+    center = _write_synthetic_asterism_build(tmp_path)
+
+    field_asterisms = read_build_asterisms(tmp_path, center=center, width=1.0 * u.deg)
+    expanded_asterisms = read_build_asterisms(
+        tmp_path,
+        center=center,
+        width=1.0 * u.deg,
+        margin=0.1 * u.deg,
+    )
+
+    assert len(field_asterisms) == 3
+    assert len(expanded_asterisms) == 4
+
+
+def test_plot_asterisms_can_use_expanded_coverable_region_table(tmp_path: Path) -> None:
+    center = _write_synthetic_asterism_build(tmp_path)
+    field_asterisms = read_build_asterisms(tmp_path, center=center, width=1.0 * u.deg)
+    expanded_asterisms = read_build_asterisms(
+        tmp_path,
+        center=center,
+        width=1.0 * u.deg,
+        margin=0.1 * u.deg,
+    )
+
+    fig = plot_asterisms(
+        field_asterisms,
+        center=center,
+        width=1.0 * u.deg,
+        fov=120.0 * u.arcsec,
+        hide_stars=True,
+        hide_fov=True,
+        hide_connections=True,
+        coverable_region_mask=True,
+        coverable_region_asterisms=expanded_asterisms,
+    )
+
+    try:
+        ax = fig.axes[0]
+        assert ax.patches
+    finally:
+        plt.close(fig)
+
+
+def test_plot_winner_ee_renders_smoothed_field(tmp_path: Path) -> None:
+    center = _write_synthetic_asterism_build(tmp_path)
+    inner_pixels = read_build_winner_ee(tmp_path, center=center, width=120.0 * u.deg)
+
+    fig = plot_winner_ee(inner_pixels, center=center, width=120.0 * u.deg, add_colorbar=False)
+
+    try:
+        ax = fig.axes[0]
+        assert ax.images
+    finally:
+        plt.close(fig)
+
+
+def test_plot_build_winner_ee_renders_smoothed_field(tmp_path: Path) -> None:
+    center = _write_synthetic_asterism_build(tmp_path)
+
+    fig = plot_build_winner_ee(tmp_path, center=center, width=120.0 * u.deg, ee_kind="averaged")
+
+    try:
+        ax = fig.axes[0]
+        assert ax.images
+        assert len(fig.axes) == 2
+    finally:
+        plt.close(fig)
+
+
+def test_plot_winner_ee_validates_kind_and_columns() -> None:
+    center = SkyCoord(150.0 * u.deg, 2.0 * u.deg, frame="icrs")
+    inner_pixels = Table()
+    inner_pixels["ra"] = [150.0]
+    inner_pixels["dec"] = [2.0]
+    inner_pixels["winner_ee_resolved"] = [0.2]
+
+    with pytest.raises(PlottingError, match="ee_kind"):
+        plot_winner_ee(inner_pixels, center=center, width=1.0 * u.deg, ee_kind="bad")
+
+    with pytest.raises(PlottingError, match="missing required columns"):
+        plot_winner_ee(inner_pixels, center=center, width=1.0 * u.deg, ee_kind="averaged")
+
+
+def _single_asterism_table(center: SkyCoord) -> Table:
+    asterism = Table(np.zeros(1, dtype=ASTERISMS_DTYPE))
+    asterism["asterism_id"] = [1]
+    asterism["num_stars"] = [2]
+    asterism["pix"] = [0]
+    asterism["star1_source_id"] = [10]
+    asterism["star2_source_id"] = [20]
+    asterism["star1_ra"], asterism["star1_dec"] = _offset_position(
+        center,
+        -20.0 / 3600.0,
+        0.0,
+    )
+    asterism["star2_ra"], asterism["star2_dec"] = _offset_position(
+        center,
+        20.0 / 3600.0,
+        0.0,
+    )
+    asterism["star1_mag"] = [12.0]
+    asterism["star2_mag"] = [13.0]
+    asterism["ra"], asterism["dec"] = _offset_position(center, 0.0, 0.0)
+    return asterism
+
+
+def _single_asterism_background_stars(center: SkyCoord) -> Table:
+    stars = Table()
+    stars["source_id"] = [1, 2, 3]
+    positions = [
+        _offset_position(center, -0.01, 0.0),
+        _offset_position(center, 0.01, 0.0),
+        _offset_position(center, 0.0, 0.012),
+    ]
+    stars["ra"] = [position[0] for position in positions]
+    stars["dec"] = [position[1] for position in positions]
+    stars["R"] = [12.0, 13.0, 14.0]
+    return stars
+
+
 def _write_synthetic_maps(root: Path, *, level: int) -> Path:
     npix = 12 * (4**level)
     maps = np.zeros(npix, dtype=MAPS_DTYPE)
@@ -426,18 +670,22 @@ def _write_synthetic_asterism_outer(
     outer_file = root / "hpx0-1" / get_outer_pixel_bucket_path(0, outer_pix) / "outer.h5"
     inner = Table(np.zeros(4, dtype=INNER_DTYPE))
     inner["pix"] = np.arange(4, dtype=np.int64)
+    inner["winner_asterism_id"] = [1, 1, 2, 3]
+    inner["winner_ee_resolved"] = [0.22, 0.30, 0.38, 0.44]
+    inner["winner_ee_averaged"] = [0.20, 0.28, 0.34, 0.40]
     if empty:
         asterisms = Table(np.zeros(0, dtype=ASTERISMS_DTYPE))
     else:
-        asterisms = Table(np.zeros(3, dtype=ASTERISMS_DTYPE))
-        asterisms["asterism_id"] = [1, 2, 3]
-        asterisms["num_stars"] = [1, 2, 3]
-        asterisms["pix"] = [0, 0, 0]
+        asterisms = Table(np.zeros(4, dtype=ASTERISMS_DTYPE))
+        asterisms["asterism_id"] = [1, 2, 3, 4]
+        asterisms["num_stars"] = [1, 2, 3, 1]
+        asterisms["pix"] = [0, 0, 0, 0]
         for row, offsets in enumerate(
             (
                 ((0.02, 0.00),),
                 ((-0.10, -0.04), (-0.04, -0.01)),
                 ((0.05, 0.05), (0.12, 0.06), (0.08, 0.12)),
+                ((0.56, 0.00),),
             ),
             start=0,
         ):

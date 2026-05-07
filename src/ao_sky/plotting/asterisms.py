@@ -8,16 +8,19 @@ from typing import Any
 
 from astropy.coordinates import SkyCoord
 from astropy.table import Table, unique, vstack
+from astropy.table.row import Row
 import astropy.units as u
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, PathPatch
+from matplotlib.path import Path as MplPath
 import numpy as np
+from scipy.interpolate import griddata
 import yaml
 
 from ao_sky.build._constants import RUNTIME_CONFIG_FILENAME
-from ao_sky.spatial import get_pixel_from_skycoord, get_pixel_neighbours
+from ao_sky.spatial import get_pixel_from_skycoord, get_pixel_neighbours, get_pixel_skycoord
 
 from ._exceptions import PlottingError
 
@@ -33,6 +36,119 @@ class _AsterismPlotConfig:
     min_mag: float
 
 
+def plot_asterism(
+    asterism: Row | Table,
+    *,
+    fov: u.Quantity,
+    stars: Table | None = None,
+    center: SkyCoord | None = None,
+    band: str = "R",
+    min_mag: float = 8.0,
+    ax: Axes | None = None,
+    hide_stars: bool = False,
+    hide_centered_fov: bool = False,
+    hide_connections: bool = False,
+    hide_valid_fov_centers: bool = False,
+    hide_coverable_region: bool = False,
+) -> Figure:
+    """Plot one retained asterism as a local FoV geometry diagnostic.
+
+    Args:
+        asterism: One normalized retained-asterism row, or a one-row table,
+            with `ra`, `dec`, `num_stars`, and `starN_*` member columns.
+        fov: Asterism field-of-view diameter.
+        stars: Optional normalized Gaia-star table to draw behind the asterism
+            member stars.
+        center: Optional scalar sky coordinate used as the plot origin. When
+            omitted, the retained asterism `ra`/`dec` center is used.
+        band: Magnitude column suffix used for member-star marker sizing.
+            Retained asterism rows currently store member magnitudes in
+            `starN_mag`, so this is reserved for API symmetry with
+            `plot_asterisms`.
+        min_mag: Bright-star threshold for member-star highlighting.
+        ax: Optional Matplotlib axes to draw into. When omitted, a new figure
+            and axes are created.
+        hide_stars: Do not draw background stars or member-star markers.
+        hide_centered_fov: Do not draw the retained asterism-centered FoV.
+        hide_connections: Do not draw member-star connection lines.
+        hide_valid_fov_centers: Do not draw the region where an FoV center can
+            be placed while keeping all guide stars inside the FoV.
+        hide_coverable_region: Do not draw the science-pixel region coverable
+            by at least one valid FoV center.
+
+    Returns:
+        Matplotlib figure containing the single-asterism diagnostic plot.
+
+    Raises:
+        PlottingError: If the plot inputs are invalid.
+    """
+
+    table = _as_single_asterism_table(asterism)
+    fov_radius_arcsec = _as_fov_radius_arcsec(fov)
+    if center is None:
+        row = table[0]
+        center = SkyCoord(float(row["ra"]) * u.deg, float(row["dec"]) * u.deg, frame="icrs")
+    center = _as_scalar_icrs(center)
+    if stars is not None and not isinstance(stars, Table):
+        raise PlottingError("stars must be an astropy.table.Table")
+    extent_arcsec = _single_asterism_extent_arcsec(
+        table[0],
+        center=center,
+        fov_radius_arcsec=fov_radius_arcsec,
+    )
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.0, 5.0))
+    else:
+        fig = ax.figure
+
+    if not hide_coverable_region or not hide_valid_fov_centers:
+        valid_centers, coverable_region = _asterism_feasible_geometries(
+            table[0],
+            center=center,
+            fov_radius_arcsec=fov_radius_arcsec,
+        )
+        if not hide_coverable_region:
+            _draw_geometry(
+                ax,
+                coverable_region,
+                facecolor="#2a9d8f",
+                edgecolor="#087f73",
+                alpha=0.14,
+                linewidth=1.8,
+                zorder=0,
+            )
+        if not hide_valid_fov_centers:
+            _draw_geometry(
+                ax,
+                valid_centers,
+                facecolor="#6c757d",
+                edgecolor="#495057",
+                alpha=0.18,
+                linewidth=1.2,
+                zorder=1,
+            )
+
+    if not hide_centered_fov:
+        _draw_single_centered_fov(ax, table[0], center=center, fov_radius_arcsec=fov_radius_arcsec)
+    if not hide_connections:
+        _draw_connections_arcsec(ax, table, center)
+    if not hide_stars:
+        if stars is not None:
+            _draw_background_stars_arcsec(
+                ax,
+                stars,
+                center,
+                extent_arcsec=extent_arcsec,
+                band=band,
+                min_mag=min_mag,
+            )
+        _draw_member_stars(ax, table[0], center=center, min_mag=min_mag, band=band)
+
+    _style_single_asterism_axis(ax, extent_arcsec=extent_arcsec)
+    return fig
+
+
 def plot_asterisms(
     asterisms: Table,
     *,
@@ -46,6 +162,8 @@ def plot_asterisms(
     hide_stars: bool = False,
     hide_fov: bool = False,
     hide_connections: bool = False,
+    coverable_region_mask: bool = False,
+    coverable_region_asterisms: Table | None = None,
 ) -> Figure:
     """Plot a normalized retained-asterism table in a local square field.
 
@@ -67,6 +185,13 @@ def plot_asterisms(
         hide_stars: Do not draw Gaia stars.
         hide_fov: Do not draw asterism field-of-view circles.
         hide_connections: Do not draw member-star connection lines.
+        coverable_region_mask: Draw a semi-transparent union mask of the
+            science-pixel region coverable by at least one valid FoV center for
+            each retained asterism.
+        coverable_region_asterisms: Optional expanded retained-asterism table
+            to use for the coverable-region mask. This lets build-backed
+            callers include asterisms whose centers are just outside the
+            plotted field but whose coverable regions enter it.
 
     Returns:
         Matplotlib figure containing the asterism diagnostic plot.
@@ -79,12 +204,17 @@ def plot_asterisms(
     width_deg = _as_width_deg(width)
     if not isinstance(asterisms, Table):
         raise PlottingError("asterisms must be an astropy.table.Table")
+    if coverable_region_asterisms is not None and not isinstance(
+        coverable_region_asterisms,
+        Table,
+    ):
+        raise PlottingError("coverable_region_asterisms must be an astropy.table.Table")
     if not hide_stars and stars is None:
         raise PlottingError("stars are required unless hide_stars=True")
     if not hide_stars and not isinstance(stars, Table):
         raise PlottingError("stars must be an astropy.table.Table")
-    if not hide_fov and fov is None:
-        raise PlottingError("fov is required unless hide_fov=True")
+    if (not hide_fov or coverable_region_mask) and fov is None:
+        raise PlottingError("fov is required unless hide_fov=True and coverable_region_mask=False")
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(5.0, 5.0))
@@ -92,6 +222,20 @@ def plot_asterisms(
         fig = ax.figure
 
     half_width = width_deg / 2.0
+    if coverable_region_mask:
+        fov_radius_deg = float(fov.to_value(u.deg)) / 2.0
+        mask_asterisms = (
+            coverable_region_asterisms
+            if coverable_region_asterisms is not None
+            else asterisms
+        )
+        _draw_coverable_region_mask(
+            ax,
+            mask_asterisms,
+            center=center,
+            fov_radius_deg=fov_radius_deg,
+            half_width_deg=half_width,
+        )
     if not hide_fov:
         fov_radius_deg = float(fov.to_value(u.deg)) / 2.0
         _draw_fov_circles(ax, asterisms, center, fov_radius_deg)
@@ -114,6 +258,7 @@ def plot_build_asterisms(
     hide_stars: bool = False,
     hide_fov: bool = False,
     hide_connections: bool = False,
+    coverable_region_mask: bool = False,
     max_asterisms: int | None = None,
 ) -> Figure:
     """Plot retained asterisms in a square field from one build root.
@@ -131,6 +276,7 @@ def plot_build_asterisms(
         hide_stars: Do not draw Gaia stars.
         hide_fov: Do not draw asterism field-of-view circles.
         hide_connections: Do not draw member-star connection lines.
+        coverable_region_mask: Draw the coverable science-region mask.
         max_asterisms: Optional cap on plotted asterism rows after field
             filtering.
 
@@ -158,6 +304,17 @@ def plot_build_asterisms(
         width=width,
         max_asterisms=max_asterisms,
     )
+    coverable_asterisms = (
+        read_build_asterisms(
+            build_root,
+            center=center,
+            width=width,
+            margin=config.fov,
+            max_asterisms=max_asterisms,
+        )
+        if coverable_region_mask
+        else None
+    )
     stars = (
         Table()
         if hide_stars
@@ -184,6 +341,135 @@ def plot_build_asterisms(
         hide_stars=hide_stars,
         hide_fov=hide_fov,
         hide_connections=hide_connections,
+        coverable_region_mask=coverable_region_mask,
+        coverable_region_asterisms=coverable_asterisms,
+    )
+
+
+def plot_winner_ee(
+    inner_pixels: Table,
+    *,
+    center: SkyCoord,
+    width: u.Quantity,
+    ee_kind: str = "resolved",
+    ax: Axes | None = None,
+    cmap: str = "plasma",
+    vmin: float = 0.0,
+    vmax: float = 0.6,
+    grid_resolution: int = 300,
+    add_colorbar: bool = True,
+) -> Figure:
+    """Plot a smoothed local winner-EE field from normalized inner pixels.
+
+    Args:
+        inner_pixels: Table with `ra`, `dec`, `winner_ee_resolved`, and
+            `winner_ee_averaged` columns. Values are interpreted as inner-pixel
+            centers and the winner performance assigned to each center.
+        center: Scalar sky coordinate at the centre of the plotted field. The
+            coordinate is interpreted in ICRS after any frame transform.
+        width: Angular side length of the square field.
+        ee_kind: Winner EE field to plot. Accepted values are `resolved`,
+            `averaged`, `winner_ee_resolved`, and `winner_ee_averaged`.
+        ax: Optional Matplotlib axes to draw into. When omitted, a new figure
+            and axes are created.
+        cmap: Matplotlib colormap name.
+        vmin: Lower plotted EE value.
+        vmax: Upper plotted EE value.
+        grid_resolution: Number of interpolation samples along each plot axis.
+        add_colorbar: Add an EE colorbar to the figure.
+
+    Returns:
+        Matplotlib figure containing the winner-EE field plot.
+
+    Raises:
+        PlottingError: If the plot inputs are invalid.
+    """
+
+    center = _as_scalar_icrs(center)
+    width_deg = _as_width_deg(width)
+    field = _winner_ee_field_name(ee_kind)
+    if not isinstance(inner_pixels, Table):
+        raise PlottingError("inner_pixels must be an astropy.table.Table")
+    _require_winner_ee_columns(inner_pixels, field)
+    grid_resolution = int(grid_resolution)
+    if grid_resolution < 2:
+        raise PlottingError("grid_resolution must be at least 2")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.0, 5.0))
+    else:
+        fig = ax.figure
+
+    half_width = width_deg / 2.0
+    image = _draw_winner_ee_field(
+        ax,
+        inner_pixels,
+        center=center,
+        half_width_deg=half_width,
+        field=field,
+        cmap=cmap,
+        vmin=float(vmin),
+        vmax=float(vmax),
+        grid_resolution=grid_resolution,
+    )
+    if add_colorbar and image is not None:
+        colorbar = fig.colorbar(image, ax=ax)
+        colorbar.set_label(r"Winner EE [100 mas]")
+
+    _style_axis(ax, half_width)
+    return fig
+
+
+def plot_build_winner_ee(
+    build_path: Path | str,
+    *,
+    center: SkyCoord,
+    width: u.Quantity,
+    ee_kind: str = "resolved",
+    ax: Axes | None = None,
+    cmap: str = "plasma",
+    vmin: float = 0.0,
+    vmax: float = 0.6,
+    grid_resolution: int = 300,
+    add_colorbar: bool = True,
+) -> Figure:
+    """Plot a local winner-EE field from one build root.
+
+    Args:
+        build_path: Persisted `ao-sky` build root.
+        center: Scalar sky coordinate at the centre of the plotted field. The
+            coordinate is interpreted in ICRS after any frame transform.
+        width: Angular side length of the square field.
+        ee_kind: Winner EE field to plot. Accepted values are `resolved`,
+            `averaged`, `winner_ee_resolved`, and `winner_ee_averaged`.
+        ax: Optional Matplotlib axes to draw into. When omitted, a new figure
+            and axes are created.
+        cmap: Matplotlib colormap name.
+        vmin: Lower plotted EE value.
+        vmax: Upper plotted EE value.
+        grid_resolution: Number of interpolation samples along each plot axis.
+        add_colorbar: Add an EE colorbar to the figure.
+
+    Returns:
+        Matplotlib figure containing the winner-EE field plot.
+
+    Raises:
+        PlottingError: If the build plotting metadata or location inputs are
+            invalid.
+    """
+
+    inner_pixels = read_build_winner_ee(build_path, center=center, width=width)
+    return plot_winner_ee(
+        inner_pixels,
+        center=center,
+        width=width,
+        ee_kind=ee_kind,
+        ax=ax,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        grid_resolution=grid_resolution,
+        add_colorbar=add_colorbar,
     )
 
 
@@ -192,12 +478,23 @@ def read_build_asterisms(
     *,
     center: SkyCoord,
     width: u.Quantity,
+    margin: u.Quantity | None = None,
     max_asterisms: int | None = None,
 ) -> Table:
-    """Read normalized retained asterisms from one current build root."""
+    """Read normalized retained asterisms from one current build root.
+
+    Args:
+        build_path: Persisted `ao-sky` build root.
+        center: Scalar sky coordinate at the centre of the selected field.
+        width: Angular side length of the selected square field.
+        margin: Optional angular margin added to all sides of the selected
+            field before filtering asterism centers.
+        max_asterisms: Optional cap on returned rows after field filtering.
+    """
 
     center = _as_scalar_icrs(center)
     width_deg = _as_width_deg(width)
+    margin_deg = 0.0 if margin is None else _as_margin_deg(margin)
     if max_asterisms is not None and int(max_asterisms) < 0:
         raise PlottingError("max_asterisms must be non-negative")
 
@@ -210,8 +507,31 @@ def read_build_asterisms(
         config=config,
         outer_pixs=outer_pixs,
         center=center,
-        width_deg=width_deg,
+        width_deg=width_deg + 2.0 * margin_deg,
         max_asterisms=max_asterisms,
+    )
+
+
+def read_build_winner_ee(
+    build_path: Path | str,
+    *,
+    center: SkyCoord,
+    width: u.Quantity,
+) -> Table:
+    """Read normalized winner-EE inner pixels from one current build root."""
+
+    center = _as_scalar_icrs(center)
+    width_deg = _as_width_deg(width)
+    build_root = Path(build_path)
+    config = _load_plot_config(build_root)
+    outer_pixs = _candidate_outer_pixels(config.outer_level, center)
+    _require_center_outer_artifact(build_root, config=config, center_outer_pix=outer_pixs[0])
+    return _load_field_winner_ee(
+        build_root,
+        config=config,
+        outer_pixs=outer_pixs,
+        center=center,
+        width_deg=width_deg,
     )
 
 
@@ -316,6 +636,52 @@ def _as_width_deg(width: u.Quantity) -> float:
     if not np.isfinite(width_deg) or width_deg <= 0.0:
         raise PlottingError("width must be a positive angular quantity")
     return width_deg
+
+
+def _as_margin_deg(margin: u.Quantity) -> float:
+    if not isinstance(margin, u.Quantity):
+        raise PlottingError("margin must be an astropy.units.Quantity")
+    margin_deg = float(margin.to_value(u.deg))
+    if not np.isfinite(margin_deg) or margin_deg < 0.0:
+        raise PlottingError("margin must be a non-negative angular quantity")
+    return margin_deg
+
+
+def _as_fov_radius_arcsec(fov: u.Quantity) -> float:
+    if not isinstance(fov, u.Quantity):
+        raise PlottingError("fov must be an astropy.units.Quantity")
+    fov_arcsec = float(fov.to_value(u.arcsec))
+    if not np.isfinite(fov_arcsec) or fov_arcsec <= 0.0:
+        raise PlottingError("fov must be a positive angular quantity")
+    return fov_arcsec / 2.0
+
+
+def _as_single_asterism_table(asterism: Row | Table) -> Table:
+    if isinstance(asterism, Row):
+        table = Table(asterism)
+    elif isinstance(asterism, Table):
+        table = asterism
+    else:
+        raise PlottingError("asterism must be an astropy Row or one-row Table")
+    if len(table) != 1:
+        raise PlottingError("asterism must contain exactly one row")
+    _require_asterism_columns(table)
+    return table
+
+
+def _require_asterism_columns(asterism: Table) -> None:
+    required = {"ra", "dec", "num_stars"}
+    missing = required - set(asterism.colnames)
+    if missing:
+        raise PlottingError(f"asterism is missing required columns: {', '.join(sorted(missing))}")
+    num_stars = int(asterism["num_stars"][0])
+    if num_stars < 1 or num_stars > 3:
+        raise PlottingError("asterism num_stars must be between 1 and 3")
+    for index in range(1, num_stars + 1):
+        for suffix in ("ra", "dec"):
+            column = f"star{index}_{suffix}"
+            if column not in asterism.colnames:
+                raise PlottingError(f"asterism is missing required column: {column}")
 
 
 def _candidate_outer_pixels(outer_level: int, center: SkyCoord) -> tuple[int, ...]:
@@ -445,6 +811,47 @@ def _load_field_asterisms(
     return asterisms
 
 
+def _load_field_winner_ee(
+    build_path: Path,
+    *,
+    config: _AsterismPlotConfig,
+    outer_pixs: tuple[int, ...],
+    center: SkyCoord,
+    width_deg: float,
+) -> Table:
+    from ao_sky.artifacts import AoSkyArtifactStore
+
+    store = AoSkyArtifactStore(build_path)
+    tables = []
+    for outer_pix in outer_pixs:
+        filename = store.outer_path(
+            outer_pix,
+            outer_level=config.outer_level,
+            inner_level=config.inner_level,
+        )
+        if not filename.is_file():
+            continue
+        inner = store.inner(outer_pix, outer_level=config.outer_level, inner_level=config.inner_level)
+        if len(inner) == 0:
+            continue
+        pixs = np.asarray(inner["pix"], dtype=np.int64)
+        coords = get_pixel_skycoord(config.inner_level, pixs)
+        mask = _local_square_mask(coords.ra.deg, coords.dec.deg, center, width_deg / 2.0)
+        if not np.any(mask):
+            continue
+        selected = inner[mask].copy()
+        selected["ra"] = coords.ra.deg[mask]
+        selected["dec"] = coords.dec.deg[mask]
+        tables.append(selected)
+    if not tables:
+        return Table()
+
+    inner_pixels = vstack(tables)
+    _, keep = np.unique(np.asarray(inner_pixels["pix"], dtype=np.int64), return_index=True)
+    keep.sort()
+    return inner_pixels[keep]
+
+
 def _deduplicate_physical_asterisms(asterisms: Table) -> Table:
     seen: set[tuple[int, ...]] = set()
     keep = np.zeros(len(asterisms), dtype=bool)
@@ -465,6 +872,75 @@ def _physical_asterism_key(row) -> tuple[int, ...]:  # noqa: ANN001
         if int(row[f"star{index}_source_id"]) >= 0
     ]
     return tuple(sorted(source_ids))
+
+
+def _winner_ee_field_name(ee_kind: str) -> str:
+    value = str(ee_kind).strip().lower()
+    if value in {"resolved", "winner_ee_resolved"}:
+        return "winner_ee_resolved"
+    if value in {"averaged", "winner_ee_averaged"}:
+        return "winner_ee_averaged"
+    raise PlottingError(
+        "ee_kind must be one of: resolved, averaged, winner_ee_resolved, winner_ee_averaged"
+    )
+
+
+def _require_winner_ee_columns(inner_pixels: Table, field: str) -> None:
+    required = {"ra", "dec", field}
+    missing = required - set(inner_pixels.colnames)
+    if missing:
+        raise PlottingError(f"inner_pixels is missing required columns: {', '.join(sorted(missing))}")
+
+
+def _draw_winner_ee_field(
+    ax: Axes,
+    inner_pixels: Table,
+    *,
+    center: SkyCoord,
+    half_width_deg: float,
+    field: str,
+    cmap: str,
+    vmin: float,
+    vmax: float,
+    grid_resolution: int,
+):  # noqa: ANN202
+    if len(inner_pixels) == 0:
+        return None
+
+    mask = _local_square_mask(inner_pixels["ra"], inner_pixels["dec"], center, half_width_deg)
+    if not np.any(mask):
+        return None
+
+    values = np.asarray(inner_pixels[field], dtype=float)[mask]
+    x_deg, y_deg = _local_offsets_deg(
+        np.asarray(inner_pixels["ra"], dtype=float)[mask],
+        np.asarray(inner_pixels["dec"], dtype=float)[mask],
+        center,
+    )
+    valid = np.isfinite(values) & (values > 0.0)
+    if np.count_nonzero(valid) < 3:
+        return None
+
+    xi = np.linspace(-half_width_deg, half_width_deg, grid_resolution)
+    yi = np.linspace(-half_width_deg, half_width_deg, grid_resolution)
+    grid_x, grid_y = np.meshgrid(xi, yi)
+    grid_z = griddata(
+        np.column_stack((x_deg[valid], y_deg[valid])),
+        values[valid],
+        (grid_x, grid_y),
+        method="cubic",
+    )
+
+    return ax.imshow(
+        grid_z,
+        extent=(-half_width_deg, half_width_deg, -half_width_deg, half_width_deg),
+        origin="lower",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="bilinear",
+        zorder=0,
+    )
 
 
 def _draw_stars(
@@ -515,6 +991,109 @@ def _draw_stars(
         )
 
 
+def _draw_member_stars(
+    ax: Axes,
+    row: Row,
+    *,
+    center: SkyCoord,
+    min_mag: float,
+    band: str,
+) -> None:
+    points = _asterism_member_offsets_arcsec(row, center)
+    if not points:
+        return
+    x_arcsec = np.asarray([point[0] for point in points], dtype=float)
+    y_arcsec = np.asarray([point[1] for point in points], dtype=float)
+    magnitudes = _asterism_member_magnitudes(row, band=band)
+    sizes = _linear_marker_sizes(
+        magnitudes,
+        min_mag=7.0,
+        max_mag=19.0,
+        min_size=28.0,
+        max_size=95.0,
+    )
+    bright = np.isfinite(magnitudes) & (magnitudes < float(min_mag))
+    normal = ~bright
+    if np.any(normal):
+        ax.scatter(
+            x_arcsec[normal],
+            y_arcsec[normal],
+            s=sizes[normal],
+            facecolors="#f4a261",
+            edgecolors="black",
+            linewidths=0.8,
+            zorder=5,
+        )
+    if np.any(bright):
+        ax.scatter(
+            x_arcsec[bright],
+            y_arcsec[bright],
+            s=sizes[bright],
+            facecolors="#e76f51",
+            edgecolors="black",
+            linewidths=0.8,
+            zorder=6,
+        )
+
+
+def _draw_background_stars_arcsec(
+    ax: Axes,
+    stars: Table,
+    center: SkyCoord,
+    *,
+    extent_arcsec: float,
+    band: str,
+    min_mag: float,
+) -> None:
+    if len(stars) == 0:
+        return
+    x_deg, y_deg = _local_offsets_deg(stars["ra"], stars["dec"], center)
+    x_arcsec = x_deg * 3600.0
+    y_arcsec = y_deg * 3600.0
+    mask = (np.abs(x_arcsec) <= extent_arcsec) & (np.abs(y_arcsec) <= extent_arcsec)
+    if not np.any(mask):
+        return
+
+    magnitudes = (
+        np.asarray(stars[band], dtype=float)
+        if band in stars.colnames
+        else np.full(len(stars), np.nan)
+    )
+    sizes = _linear_marker_sizes(
+        magnitudes,
+        min_mag=7.0,
+        max_mag=19.0,
+        min_size=5.0,
+        max_size=32.0,
+    )
+    bright = np.isfinite(magnitudes) & (magnitudes < float(min_mag))
+    normal = ~bright
+    draw_mask = mask & normal
+    if np.any(draw_mask):
+        ax.scatter(
+            x_arcsec[draw_mask],
+            y_arcsec[draw_mask],
+            s=sizes[draw_mask],
+            facecolors="white",
+            edgecolors="#343a40",
+            linewidths=0.45,
+            alpha=0.82,
+            zorder=2,
+        )
+    draw_mask = mask & bright
+    if np.any(draw_mask):
+        ax.scatter(
+            x_arcsec[draw_mask],
+            y_arcsec[draw_mask],
+            s=sizes[draw_mask],
+            facecolors="#ffe8cc",
+            edgecolors="#343a40",
+            linewidths=0.5,
+            alpha=0.9,
+            zorder=2,
+        )
+
+
 def _draw_fov_circles(
     ax: Axes,
     asterisms: Table,
@@ -537,6 +1116,73 @@ def _draw_fov_circles(
                 zorder=1,
             )
         )
+
+
+def _draw_coverable_region_mask(
+    ax: Axes,
+    asterisms: Table,
+    *,
+    center: SkyCoord,
+    fov_radius_deg: float,
+    half_width_deg: float,
+) -> None:
+    if len(asterisms) == 0:
+        return
+    try:
+        from shapely.geometry import Point, box
+        from shapely.ops import unary_union
+    except ImportError as exc:
+        raise PlottingError("shapely is required to draw coverable-region masks") from exc
+
+    regions = []
+    for row in asterisms:
+        points = _asterism_member_offsets_deg(row, center)
+        if not points:
+            continue
+        valid_centers = Point(points[0]).buffer(fov_radius_deg, quad_segs=96)
+        for point in points[1:]:
+            valid_centers = valid_centers.intersection(
+                Point(point).buffer(fov_radius_deg, quad_segs=96)
+            )
+        if valid_centers.is_empty:
+            continue
+        regions.append(valid_centers.buffer(fov_radius_deg, quad_segs=96))
+    if not regions:
+        return
+
+    field = box(-half_width_deg, -half_width_deg, half_width_deg, half_width_deg)
+    mask = unary_union(regions).intersection(field)
+    _draw_geometry(
+        ax,
+        mask,
+        facecolor="#2a9d8f",
+        edgecolor="#087f73",
+        alpha=0.18,
+        linewidth=0.8,
+        zorder=0,
+    )
+
+
+def _draw_single_centered_fov(
+    ax: Axes,
+    row: Row,
+    *,
+    center: SkyCoord,
+    fov_radius_arcsec: float,
+) -> None:
+    x_deg, y_deg = _local_offsets_deg([row["ra"]], [row["dec"]], center)
+    ax.add_patch(
+        Circle(
+            (float(x_deg[0]) * 3600.0, float(y_deg[0]) * 3600.0),
+            fov_radius_arcsec,
+            facecolor="none",
+            edgecolor="#e76f51",
+            linestyle="--",
+            linewidth=1.8,
+            alpha=0.9,
+            zorder=3,
+        )
+    )
 
 
 def _draw_connections(ax: Axes, asterisms: Table, center: SkyCoord) -> None:
@@ -574,6 +1220,144 @@ def _draw_connections(ax: Axes, asterisms: Table, center: SkyCoord) -> None:
             )
 
 
+def _draw_connections_arcsec(ax: Axes, asterisms: Table, center: SkyCoord) -> None:
+    if len(asterisms) == 0:
+        return
+    for row in asterisms:
+        points = _asterism_member_offsets_arcsec(row, center)
+        if len(points) < 2:
+            continue
+        for start, stop in zip(points, points[1:], strict=False):
+            ax.plot(
+                [start[0], stop[0]],
+                [start[1], stop[1]],
+                color="#6c757d",
+                linewidth=1.1,
+                alpha=0.75,
+                zorder=4,
+            )
+        if len(points) == 3:
+            ax.plot(
+                [points[2][0], points[0][0]],
+                [points[2][1], points[0][1]],
+                color="#6c757d",
+                linewidth=1.1,
+                alpha=0.75,
+                zorder=4,
+            )
+
+
+def _asterism_feasible_geometries(
+    row: Row,
+    *,
+    center: SkyCoord,
+    fov_radius_arcsec: float,
+):  # noqa: ANN202
+    try:
+        from shapely.geometry import Point
+    except ImportError as exc:
+        raise PlottingError(
+            "shapely is required to draw asterism feasible-region overlays"
+        ) from exc
+
+    points = _asterism_member_offsets_arcsec(row, center)
+    if not points:
+        raise PlottingError("asterism has no member-star positions")
+
+    valid_centers = Point(points[0]).buffer(fov_radius_arcsec, quad_segs=192)
+    for point in points[1:]:
+        valid_centers = valid_centers.intersection(
+            Point(point).buffer(fov_radius_arcsec, quad_segs=192)
+        )
+    if valid_centers.is_empty:
+        raise PlottingError("asterism guide stars do not fit inside one FoV")
+    coverable_region = valid_centers.buffer(fov_radius_arcsec, quad_segs=192)
+    return valid_centers, coverable_region
+
+
+def _draw_geometry(
+    ax: Axes,
+    geometry,  # noqa: ANN001
+    *,
+    facecolor: str,
+    edgecolor: str,
+    alpha: float,
+    linewidth: float,
+    zorder: int,
+) -> None:
+    geometries = list(geometry.geoms) if hasattr(geometry, "geoms") else [geometry]
+    for geom in geometries:
+        if geom.is_empty:
+            continue
+        ax.add_patch(
+            PathPatch(
+                _polygon_path_with_holes(geom),
+                facecolor=facecolor,
+                edgecolor=edgecolor,
+                alpha=alpha,
+                linewidth=linewidth,
+                zorder=zorder,
+            )
+        )
+
+
+def _polygon_path_with_holes(polygon) -> MplPath:  # noqa: ANN001
+    from shapely.geometry.polygon import orient
+
+    polygon = orient(polygon, sign=1.0)
+    vertices = []
+    codes = []
+    for ring in [polygon.exterior, *polygon.interiors]:
+        coords = np.asarray(ring.coords, dtype=float)
+        if len(coords) < 2:
+            continue
+        vertices.extend(coords)
+        codes.extend(
+            [MplPath.MOVETO]
+            + [MplPath.LINETO] * (len(coords) - 2)
+            + [MplPath.CLOSEPOLY]
+        )
+    return MplPath(np.asarray(vertices, dtype=float), np.asarray(codes, dtype=np.uint8))
+
+
+def _asterism_member_offsets_arcsec(row: Row, center: SkyCoord) -> list[tuple[float, float]]:
+    points = []
+    for index in range(1, min(3, int(row["num_stars"])) + 1):
+        x_deg, y_deg = _local_offsets_deg(
+            [row[f"star{index}_ra"]],
+            [row[f"star{index}_dec"]],
+            center,
+        )
+        points.append((float(x_deg[0]) * 3600.0, float(y_deg[0]) * 3600.0))
+    return points
+
+
+def _asterism_member_offsets_deg(row: Row, center: SkyCoord) -> list[tuple[float, float]]:
+    points = []
+    for index in range(1, min(3, int(row["num_stars"])) + 1):
+        x_deg, y_deg = _local_offsets_deg(
+            [row[f"star{index}_ra"]],
+            [row[f"star{index}_dec"]],
+            center,
+        )
+        points.append((float(x_deg[0]), float(y_deg[0])))
+    return points
+
+
+def _asterism_member_magnitudes(row: Row, *, band: str) -> np.ndarray:
+    values = []
+    for index in range(1, min(3, int(row["num_stars"])) + 1):
+        band_column = f"star{index}_{band}"
+        mag_column = f"star{index}_mag"
+        if band_column in row.colnames:
+            values.append(float(row[band_column]))
+        elif mag_column in row.colnames:
+            values.append(float(row[mag_column]))
+        else:
+            values.append(np.nan)
+    return np.asarray(values, dtype=float)
+
+
 def _linear_marker_sizes(
     magnitudes: np.ndarray,
     *,
@@ -596,6 +1380,38 @@ def _style_axis(ax: Axes, half_width_deg: float) -> None:
     ax.set_ylim(-half_width_deg, half_width_deg)
     ax.set_xlabel(r"$\Delta \mathrm{RA}\cos\delta\ [\mathrm{deg}]$")
     ax.set_ylabel(r"$\Delta \mathrm{Dec}\ [\mathrm{deg}]$")
+    ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.5)
+
+
+def _single_asterism_extent_arcsec(
+    row: Row,
+    *,
+    center: SkyCoord,
+    fov_radius_arcsec: float,
+) -> float:
+    points = _asterism_member_offsets_arcsec(row, center)
+    x_deg, y_deg = _local_offsets_deg([row["ra"]], [row["dec"]], center)
+    x_values = [point[0] for point in points]
+    y_values = [point[1] for point in points]
+    x_values.append(float(x_deg[0]) * 3600.0)
+    y_values.append(float(y_deg[0]) * 3600.0)
+    return max(
+        fov_radius_arcsec * 2.3,
+        max(abs(value) for value in x_values) + fov_radius_arcsec * 2.1,
+        max(abs(value) for value in y_values) + fov_radius_arcsec * 2.1,
+    )
+
+
+def _style_single_asterism_axis(
+    ax: Axes,
+    *,
+    extent_arcsec: float,
+) -> None:
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-extent_arcsec, extent_arcsec)
+    ax.set_ylim(-extent_arcsec, extent_arcsec)
+    ax.set_xlabel(r"$\Delta \mathrm{RA}\cos\delta\ [\mathrm{arcsec}]$")
+    ax.set_ylabel(r"$\Delta \mathrm{Dec}\ [\mathrm{arcsec}]$")
     ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.5)
 
 
@@ -623,8 +1439,12 @@ def _local_square_mask(
 
 
 __all__ = [
+    "plot_asterism",
     "plot_asterisms",
     "plot_build_asterisms",
+    "plot_build_winner_ee",
+    "plot_winner_ee",
     "read_asterism_stars",
     "read_build_asterisms",
+    "read_build_winner_ee",
 ]

@@ -12,6 +12,7 @@ The supported public surface currently centers on:
 - `ao_sky.build` for persisted build roots, build state, and per-outer-pixel
   derived artifacts
 - `ao_sky.artifacts` for read-only access to existing build artifacts
+- `ao_sky.plotting` for artifact-backed map and local asterism diagnostics
 
 ## Current Public Surface
 
@@ -191,6 +192,87 @@ The current package-supported artifact-reader API exposes:
 loads build-local runtime configuration, dense map fields, per-outer `inner`
 and `asterisms` datasets, and pinned Gaia tables. It does not run build steps,
 materialize missing artifacts, or provide paper-specific compatibility columns.
+
+### `ao_sky.plotting`
+
+The current package-supported plotting API exposes:
+
+- `PlottingError`
+- `configure_matplotlib_cache`
+- `plot_asterism`
+- `plot_asterisms`
+- `plot_build_asterisms`
+- `plot_winner_ee`
+- `plot_build_winner_ee`
+- `read_asterism_stars`
+- `read_build_asterisms`
+- `read_build_winner_ee`
+
+`plot_asterism(asterism, *, fov, stars=None, center=None, band="R",
+min_mag=8.0, ax=None, hide_stars=False, hide_centered_fov=False,
+hide_connections=False, hide_valid_fov_centers=False,
+hide_coverable_region=False)` draws one normalized retained-asterism row as a
+local geometry diagnostic. The plot uses arcsecond offsets and can show the
+background stars, highlighted member stars, member-star connections, the
+retained asterism-centered FoV, the valid FoV-center region, and the full
+science-pixel region coverable by at least one valid FoV center. The
+feasible-region overlays require `shapely`, which is a package dependency.
+
+`plot_asterisms(asterisms, *, center, width, stars=None, fov=None, band="R",
+min_mag=8.0, ax=None, hide_stars=False, hide_fov=False,
+hide_connections=False, coverable_region_mask=False,
+coverable_region_asterisms=None)` draws a normalized retained-asterism table in
+a local square sky field. It is the low-level renderer and does not know about
+build roots, Gaia roots, or legacy file layouts. When
+`coverable_region_mask=True`, it overlays a semi-transparent green union of the
+science-pixel regions coverable by the retained asterisms. Pass
+`coverable_region_asterisms` when the mask should include an expanded
+asterism-center selection while the visible asterism circles remain limited to
+the plotted field.
+
+`plot_build_asterisms(build_path, *, gaia_root=None, center, width, ax=None,
+hide_stars=False, hide_fov=False, hide_connections=False,
+coverable_region_mask=False,
+max_asterisms=None)` reads one current `ao-sky` build root and delegates to
+`plot_asterisms`. When stars are shown, `gaia_root` is required and stars are
+read from the canonical Gaia cache. Use `hide_stars=True` for asterism-only
+plots that do not need Gaia data.
+
+`plot_winner_ee(inner_pixels, *, center, width, ee_kind="resolved", ax=None,
+cmap="plasma", vmin=0.0, vmax=0.6, grid_resolution=300,
+add_colorbar=True)` draws a smoothed local winner-EE field from normalized
+inner pixels. The input table must include `ra`, `dec`, and the requested
+winner-EE field. `ee_kind` accepts `resolved`, `averaged`,
+`winner_ee_resolved`, or `winner_ee_averaged`. The plotted field is interpolated
+onto a regular grid with cubic `scipy.interpolate.griddata`.
+
+`plot_build_winner_ee(build_path, *, center, width, ee_kind="resolved",
+ax=None, cmap="plasma", vmin=0.0, vmax=0.6, grid_resolution=300,
+add_colorbar=True)` reads one current `ao-sky` build root and delegates to
+`plot_winner_ee`.
+
+`read_build_asterisms(build_path, *, center, width, margin=None,
+max_asterisms=None)` reads
+and filters retained asterisms from the center outer-pixel artifact and
+available neighbouring artifacts. Missing neighbouring artifacts are skipped,
+but the center outer-pixel artifact must exist. Pass `margin` to expand the
+asterism-center filter on every side of the local field, which is useful for
+coverable-region masks because an asterism centered just outside the plotted
+field can still cover science positions inside it.
+
+`read_build_winner_ee(build_path, *, center, width)` reads and filters
+inner-pixel winner-EE rows from the same local field and adds `ra`/`dec`
+columns for plotting.
+
+`read_asterism_stars(*, gaia_root, release, outer_level, epoch, band, center,
+width)` reads and filters Gaia stars for the same local field.
+
+All local field plotting functions require `center` to be a scalar Astropy
+`SkyCoord` and `width` to be an angular Astropy quantity. The singular
+`plot_asterism` function can infer its plot origin from the retained
+asterism's `ra`/`dec` center when `center` is omitted. Plotting functions return
+a Matplotlib figure and do not save files. Callers own figure saving and
+composition.
 
 ## Core Read And Search Paths
 
