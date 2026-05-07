@@ -353,13 +353,13 @@ def dynamic_outer_pixel_seconds(star_count: int) -> float:
     transition_start = DYNAMIC_RUNTIME_TRANSITION_START_STARS / 1000.0
     transition_end = DYNAMIC_RUNTIME_TRANSITION_END_STARS / 1000.0
     if u <= transition_start:
-        seconds = 0.571526 - 0.182845 * u + 0.0725123 * u * u
+        seconds = 0.331 - 0.0914 * u + 0.0670 * u * u
     elif u <= transition_end:
         v = u - transition_start
-        seconds = 25.9196 - 1.45735 * v + 0.0445096 * v * v
+        seconds = 25.293 - 1.368 * v + 0.0436 * v * v
     else:
         v = u - transition_end
-        seconds = 14.4961 + 0.00559679 * v + 0.00000504397 * v * v
+        seconds = 14.885 + 0.00394 * v + 0.00000707 * v * v
     return max(float(seconds), 0.1)
 
 

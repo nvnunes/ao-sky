@@ -23,6 +23,7 @@ class FieldConvention:
     cbar_format: str = "%g"
     cbar_ticks: tuple[float, ...] | None = None
     mask_nonpositive_for_log: bool = False
+    title_uses_prediction_wavelength: bool = False
 
 
 FIELD_CONVENTIONS: dict[str, FieldConvention] = {
@@ -77,6 +78,7 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
     ),
     "best_sr": FieldConvention(
         title="Best Strehl Ratio",
+        title_uses_prediction_wavelength=True,
         unit="SR",
         cmap="viridis",
         norm="linear",
@@ -86,6 +88,7 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
     ),
     "best_ee": FieldConvention(
         title="Best EE",
+        title_uses_prediction_wavelength=True,
         unit="EE",
         cmap="viridis",
         norm="linear",
@@ -95,7 +98,8 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
     ),
     "best_fwhm": FieldConvention(
         title="Best FWHM",
-        unit="FWHM",
+        title_uses_prediction_wavelength=True,
+        unit="FWHM [mas]",
         cmap="magma_r",
         norm="linear",
         vmin=50.0,
@@ -104,6 +108,7 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
     ),
     "winner_ee_resolved": FieldConvention(
         title="Winner EE Resolved",
+        title_uses_prediction_wavelength=True,
         unit="EE",
         cmap="viridis",
         norm="linear",
@@ -113,6 +118,7 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
     ),
     "winner_ee_averaged": FieldConvention(
         title="Winner EE Averaged",
+        title_uses_prediction_wavelength=True,
         unit="EE",
         cmap="viridis",
         norm="linear",

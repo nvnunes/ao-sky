@@ -9,10 +9,17 @@ from typing import Any
 
 from astropy.table import Table
 import astropy.units as u
+import h5py
 from matplotlib import pyplot as plt
 import numpy as np
+import yaml
 
-from ao_sky.build._constants import MAPS_DATASET, MAPS_FILENAME_TEMPLATE
+from ao_sky.build._constants import (
+    BUILD_FILENAME,
+    MAPS_DATASET,
+    MAPS_FILENAME_TEMPLATE,
+    RUNTIME_CONFIG_FILENAME,
+)
 from ao_sky.build.artifacts import read_maps_dataset
 from ao_sky.spatial import get_pixel_area
 
@@ -299,6 +306,12 @@ def plot_map_artifact_field(
         level=level,
         field_overrides=field_overrides,
     )
+    if layer.convention.title_uses_prediction_wavelength:
+        options = _with_prediction_wavelength_title(
+            source,
+            options=options,
+            convention=layer.convention,
+        )
     contour_layer = None
     if contour_field is not None:
         contour_layer = read_map_layer(
@@ -313,6 +326,82 @@ def plot_map_artifact_field(
         contour_layer=contour_layer,
         output_path=output_path,
     )
+
+
+def _with_prediction_wavelength_title(
+    source: Path,
+    *,
+    options: MapPlotOptions | None,
+    convention: FieldConvention,
+) -> MapPlotOptions | None:
+    if options is not None and options.title is not None:
+        return options
+    wavelength_micron = _read_prediction_wavelength_micron(source)
+    if wavelength_micron is None:
+        return options
+    options = MapPlotOptions() if options is None else options
+    return replace(
+        options,
+        title=_format_prediction_wavelength_title(convention.title, wavelength_micron),
+    )
+
+
+def _read_prediction_wavelength_micron(source: Path) -> float | None:
+    build_root = _build_root_for_map_source(source)
+    runtime_config_path = build_root / RUNTIME_CONFIG_FILENAME
+    if runtime_config_path.is_file():
+        return _prediction_wavelength_from_yaml(
+            runtime_config_path.read_text(encoding="utf-8"),
+            source=runtime_config_path,
+        )
+
+    build_metadata_path = build_root / BUILD_FILENAME
+    if build_metadata_path.is_file():
+        with h5py.File(build_metadata_path, "r") as handle:
+            if "metadata/config_yaml" not in handle:
+                return None
+            return _prediction_wavelength_from_yaml(
+                _decode_hdf5_scalar(handle["metadata/config_yaml"][()]),
+                source=build_metadata_path,
+            )
+    return None
+
+
+def _build_root_for_map_source(source: Path) -> Path:
+    source = Path(source)
+    if source.is_file():
+        return source.parent
+    return source
+
+
+def _decode_hdf5_scalar(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _prediction_wavelength_from_yaml(raw_yaml: str, *, source: Path) -> float | None:
+    payload = yaml.safe_load(raw_yaml) or {}
+    if not isinstance(payload, dict):
+        return None
+    prediction = payload.get("prediction")
+    if not isinstance(prediction, dict) or "wavelength_micron" not in prediction:
+        return None
+    try:
+        wavelength_micron = float(prediction["wavelength_micron"])
+    except (TypeError, ValueError) as exc:
+        raise PlottingError(
+            f"Runtime config prediction.wavelength_micron in {source} must be numeric"
+        ) from exc
+    if wavelength_micron <= 0.0:
+        raise PlottingError(
+            f"Runtime config prediction.wavelength_micron in {source} must be positive"
+        )
+    return wavelength_micron
+
+
+def _format_prediction_wavelength_title(title: str, wavelength_micron: float) -> str:
+    return f"{title} [$\\lambda = {wavelength_micron:.3f}\\,\\mu\\mathrm{{m}}$]"
 
 
 def _merge_field_options(options: MapPlotOptions, convention: FieldConvention) -> MapPlotOptions:

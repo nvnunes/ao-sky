@@ -12,15 +12,15 @@ the earlier "FOV-mean" language. Rotation or orientation of the guide-star
 configuration is not part of the algorithm.
 
 Use [`architecture.md`](architecture.md) for package boundaries and persisted
-artifact ownership, [`plan.md`](plan.md) for migration phase context, and
+artifact ownership, [`plan.md`](plan.md) for migration sequencing, and
 `docs/benchmarking.md` for measured runtime and memory evidence.
 
 ## Legacy Compatible Algorithm
 
-The legacy-compatible Traversal path is the known-good behavior from before
-the Phase 14 winner-selection and dense-field candidate-control changes. It is
-retained here as design context for comparisons against saved legacy products,
-not as the active schema-version-2 algorithm.
+The legacy-compatible Traversal path is the known-good behavior from before the
+winner-map asterism selection and NGS pre-selection replacement. It is retained
+here as design context for comparisons against saved legacy products, not as
+the active schema-version-2 algorithm.
 
 For each outer pixel, legacy Traversal:
 
@@ -28,7 +28,8 @@ For each outer pixel, legacy Traversal:
 2. Prepares runtime Gaia rows with build-epoch coordinates, empirical `R`, and
    `hpx14`.
 3. Filters NGS rows by configured magnitude and coarse density policy.
-4. Generates candidate asterisms through `find_asterisms()`.
+4. Generates candidate asterisms through an internal exact in-memory
+   enumeration helper retained only for legacy regression coverage.
 5. Applies bright-star exclusion to candidate centers.
 6. Applies legacy-style overlap pruning by ranking candidates with predicted
    mean EE and greedily dropping lower-ranked candidates whose center circles
@@ -56,11 +57,16 @@ The legacy path has known weaknesses that motivated replacement:
 
 ## Replacement Algorithm
 
-The Phase 14 replacement combines winner-map-first asterism selection with
-regional FOR-optimized NGS selection. The goal is to preserve exact all-NGS
-candidate enumeration where the resulting outer-pixel resolved-inference work
-is tractable, and to use FOR-optimized NGS selection only in locally dense
-regions where exact enumeration is too expensive.
+The replacement combines NGS pre-selection in dense regions with winner-map
+asterism selection. NGS pre-selection is the dense-region input-control step:
+before winner-map asterism selection runs, it reduces the supplied guide-star
+set when the full configured NGS set would make asterism enumeration too
+expensive. Winner-map asterism selection then fully enumerates asterisms from
+the supplied NGS set, predicts candidate performance before retained-asterism
+reduction, selects per-inner-pixel winners from the predicted candidates,
+regularizes the per-inner-pixel winner map, and retains the asterisms that win
+somewhere after regularization. It replaces the legacy overlap-based
+retained-asterism pruning path.
 
 The replacement algorithm is:
 
@@ -72,8 +78,8 @@ The replacement algorithm is:
 5. Partition the outer pixel into working regions. Use all configured NGS in
    regions whose exact candidate graph keeps cumulative outer-pixel
    resolved-inference work tractable, subdivide regions that are too dense, and
-   apply FOR-optimized NGS selection only in regions that remain too dense at
-   the minimum working scale.
+   apply NGS pre-selection only in regions that remain too dense at the minimum
+   working scale.
 6. Deduplicate regional candidate identities by exact Gaia source-id set.
 7. Build per-star field-of-regard bitsets for the NGS that appear in retained
    candidate identities.
@@ -148,11 +154,12 @@ outer-pixel cap on candidate identities or resolved inference rows. Prediction
 batch sizing should use the model/traversal default rather than a new public
 setting.
 
-### Regional FOR-Optimized NGS Selection
+### NGS Pre-Selection in Dense Regions
 
-Dense-field control happens before asterism combinations are generated. For
-each outer pixel, Traversal first computes which inner pixels not excluded by
-the bright-star mask are inside each configured NGS star's field of regard.
+NGS pre-selection in dense regions happens before asterism combinations are
+generated. For each outer pixel, Traversal first computes which inner pixels
+not excluded by the bright-star mask are inside each configured NGS star's
+field of regard.
 
 For each inner pixel `p` not excluded by the bright-star mask, define:
 
@@ -172,7 +179,7 @@ inner pixel that is still below `target_availability`. Selection stops once
 every inner pixel not excluded by the bright-star mask has `ao_system.max_wfs`
 NGS within a FOR centered on it, or all available NGS if fewer are available.
 
-Regional selection applies this FOR-optimized selector only after complete
+NGS pre-selection applies this FOR-optimized selector only after complete
 regional enumeration is judged too expensive. Starting from the whole outer
 pixel, Traversal collects the NGS stars whose FOR covers at least one target
 inner pixel in the current region. If the complete regional candidate graph is
@@ -391,9 +398,10 @@ The retained asterism catalog keeps the existing center and member-star fields.
 Catalog `pix` remains the inner pixel that contains the asterism center; it is
 metadata for the asterism table, not the rule used to assign winners.
 
-Additional retained-footprint metadata, such as winner-pixel counts or median
-winner performance, is deferred until after the core replacement algorithm is
-implemented and benchmarked.
+Retained-footprint metadata is exposed through derived products rather than the
+core retained `asterisms` rows. Aggregated maps include
+`winner_asterism_count`, and asterism lookup can report winner support counts
+and mean winner fields for returned retained asterisms.
 
 ## Derived Coverage And Physical Statistics
 
@@ -402,7 +410,7 @@ inner pixel represents one candidate pointing center and stores the best
 resolved performance field plus the regularized winning asterism and its
 resolved and averaged EE values.
 
-The first-class coverage metric for Phase 15 validation should be averaged EE
+The first-class coverage metric for physical validation should be averaged EE
 from the final regularized winner:
 
 ```text
@@ -432,8 +440,8 @@ These booleans are computed from the final regularized winner fields:
 `winner_ee_averaged`. They are not computed from raw `best_ee`.
 
 Coverage curves are cumulative coverage evaluated across a range of thresholds.
-They should be a Phase 15 validation and reporting product, not a requirement
-for the Phase 14 traversal artifact. For observatory-specific comparisons,
+They should be a validation and reporting product, not a requirement for the
+traversal artifact. For observatory-specific comparisons,
 coverage curves should be computed only over the declination band satisfying a
 maximum transit airmass cut. For observatory latitude `lat` and transit
 airmass limit `X0`, the reporting layer should convert `X0` to a minimum
@@ -466,8 +474,8 @@ rho(theta) = mean((M_i - mean(M)) * (M_j - mean(M))) / var(M)
 
 The coherence scale is the separation where `rho(theta)` falls to `0.5`.
 Coherence is expected to be more expensive and more sensitive to sampling than
-coverage or uniformity, so it belongs first as a Phase 15 prototype/reporting
-statistic rather than a Phase 14 persisted product.
+coverage or uniformity, so it belongs first as a prototype/reporting statistic
+rather than a persisted traversal product.
 
 Outer-pixel statistics should be derived from the contained inner pixels. For
 science fields whose footprint is comparable to, or not aligned with, outer
@@ -517,7 +525,7 @@ replacement Traversal artifact layout/schema should be version 2 so old and new
 ## Dense Fields
 
 Traversal does not apply a Galactic latitude cut or `gaia.max_star_density`.
-Regional FOR-optimized NGS selection controls dense-field combinatorics directly
+NGS pre-selection in dense regions controls dense-field combinatorics directly
 before full asterism enumeration. Future dust or stellar-density cuts should be
 treated as field-selection policy, not as Traversal tractability guards.
 
@@ -555,16 +563,16 @@ for algorithm debugging and benchmark work.
 
 ## Verification Expectations
 
-The replacement algorithm intentionally diverges from the legacy overlap and
-winner-selection path. Legacy comparison tooling may remain useful as a
-diagnostic, but it is no longer the acceptance authority for Phase 14. Legacy
-comparisons after the replacement should use saved legacy data rather than
-running the live `survey_tools` implementation.
+The replacement algorithm intentionally diverges from the legacy overlap-pruned
+retained-catalog path. Legacy comparison tooling may remain useful as a
+diagnostic, but it is no longer the acceptance authority for the replacement.
+Legacy comparisons after the replacement should use saved legacy data rather
+than running the live `survey_tools` implementation.
 
 Core repo-native tests should cover:
 
-- FOR-optimized NGS selection, including pixels with only partially achievable
-  FOR availability
+- NGS pre-selection in dense regions, including pixels with only partially
+  achievable FOR availability
 - validation for `winner_ee_epsilon`, `max_bright_star_exclusion_arcsec`, and
   legacy-only `max_overlap`
 - exact 1-, 2-, and 3-star candidate generation

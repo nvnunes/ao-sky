@@ -244,9 +244,9 @@ Build execution is organized around restartable outer-pixel work.
 - Build creation depends on a shared Gaia summary for the configured Gaia
   release and outer level.
 - Build state should record:
-  - the current build phase
-  - explicit per-phase outer-pixel status for `gaia_loading` and `traversal`
-  - per-phase attempt count and last error message
+  - the current build stage
+  - explicit per-stage outer-pixel status for `gaia_loading` and `traversal`
+  - per-stage attempt count and last error message
 - Aggregation is build-global rather than outer-pixel-local.
 - `winner_asterism_count` in aggregated maps is a center-owned
   retained-catalog-derived count layer, not a normal inner-pixel reducer.
