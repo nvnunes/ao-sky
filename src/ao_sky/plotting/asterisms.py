@@ -1,0 +1,630 @@
+"""Local asterism diagnostic plotting helpers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from astropy.coordinates import SkyCoord
+from astropy.table import Table, unique, vstack
+import astropy.units as u
+from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from matplotlib.patches import Circle
+import numpy as np
+import yaml
+
+from ao_sky.build._constants import RUNTIME_CONFIG_FILENAME
+from ao_sky.spatial import get_pixel_from_skycoord, get_pixel_neighbours
+
+from ._exceptions import PlottingError
+
+
+@dataclass(frozen=True, slots=True)
+class _AsterismPlotConfig:
+    outer_level: int
+    inner_level: int
+    epoch: float
+    release: str
+    band: str
+    fov: u.Quantity
+    min_mag: float
+
+
+def plot_asterisms(
+    asterisms: Table,
+    *,
+    center: SkyCoord,
+    width: u.Quantity,
+    stars: Table | None = None,
+    fov: u.Quantity | None = None,
+    band: str = "R",
+    min_mag: float = 8.0,
+    ax: Axes | None = None,
+    hide_stars: bool = False,
+    hide_fov: bool = False,
+    hide_connections: bool = False,
+) -> Figure:
+    """Plot a normalized retained-asterism table in a local square field.
+
+    Args:
+        asterisms: Normalized retained-asterism table with `ra`, `dec`,
+            `num_stars`, and `starN_*` member columns.
+        center: Scalar sky coordinate at the centre of the plotted field. The
+            coordinate is interpreted in ICRS after any frame transform.
+        width: Angular side length of the square field.
+        stars: Optional normalized Gaia-star table to draw behind the retained
+            asterisms. Required unless `hide_stars` is true.
+        fov: Asterism field-of-view diameter. Required unless `hide_fov` is
+            true.
+        band: Magnitude column used for star marker sizing and bright-star
+            highlighting.
+        min_mag: Bright-star threshold in `band`.
+        ax: Optional Matplotlib axes to draw into. When omitted, a new figure
+            and axes are created.
+        hide_stars: Do not draw Gaia stars.
+        hide_fov: Do not draw asterism field-of-view circles.
+        hide_connections: Do not draw member-star connection lines.
+
+    Returns:
+        Matplotlib figure containing the asterism diagnostic plot.
+
+    Raises:
+        PlottingError: If the plot inputs are invalid.
+    """
+
+    center = _as_scalar_icrs(center)
+    width_deg = _as_width_deg(width)
+    if not isinstance(asterisms, Table):
+        raise PlottingError("asterisms must be an astropy.table.Table")
+    if not hide_stars and stars is None:
+        raise PlottingError("stars are required unless hide_stars=True")
+    if not hide_stars and not isinstance(stars, Table):
+        raise PlottingError("stars must be an astropy.table.Table")
+    if not hide_fov and fov is None:
+        raise PlottingError("fov is required unless hide_fov=True")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.0, 5.0))
+    else:
+        fig = ax.figure
+
+    half_width = width_deg / 2.0
+    if not hide_fov:
+        fov_radius_deg = float(fov.to_value(u.deg)) / 2.0
+        _draw_fov_circles(ax, asterisms, center, fov_radius_deg)
+    if not hide_connections:
+        _draw_connections(ax, asterisms, center)
+    if not hide_stars:
+        _draw_stars(ax, stars, center, band=band, min_mag=min_mag)
+
+    _style_axis(ax, half_width)
+    return fig
+
+
+def plot_build_asterisms(
+    build_path: Path | str,
+    *,
+    gaia_root: Path | str | None = None,
+    center: SkyCoord,
+    width: u.Quantity,
+    ax: Axes | None = None,
+    hide_stars: bool = False,
+    hide_fov: bool = False,
+    hide_connections: bool = False,
+    max_asterisms: int | None = None,
+) -> Figure:
+    """Plot retained asterisms in a square field from one build root.
+
+    Args:
+        build_path: Persisted `ao-sky` build root.
+        gaia_root: Canonical Gaia store root. Required unless `hide_stars` is
+            true. Stars are loaded from
+            `<gaia_root>/gaia-<release>-hpx<outer_level>`.
+        center: Scalar sky coordinate at the centre of the plotted field. The
+            coordinate is interpreted in ICRS after any frame transform.
+        width: Angular side length of the square field.
+        ax: Optional Matplotlib axes to draw into. When omitted, a new figure
+            and axes are created.
+        hide_stars: Do not draw Gaia stars.
+        hide_fov: Do not draw asterism field-of-view circles.
+        hide_connections: Do not draw member-star connection lines.
+        max_asterisms: Optional cap on plotted asterism rows after field
+            filtering.
+
+    Returns:
+        Matplotlib figure containing the asterism diagnostic plot.
+
+    Raises:
+        PlottingError: If the build plotting metadata or location inputs are
+            invalid.
+    """
+
+    center = _as_scalar_icrs(center)
+    _as_width_deg(width)
+    if max_asterisms is not None and int(max_asterisms) < 0:
+        raise PlottingError("max_asterisms must be non-negative")
+
+    if not hide_stars and gaia_root is None:
+        raise PlottingError("gaia_root is required unless hide_stars=True")
+    build_root = Path(build_path)
+    gaia_root = None if gaia_root is None else Path(gaia_root)
+    config = _load_plot_config(build_root)
+    asterisms = read_build_asterisms(
+        build_root,
+        center=center,
+        width=width,
+        max_asterisms=max_asterisms,
+    )
+    stars = (
+        Table()
+        if hide_stars
+        else read_asterism_stars(
+            gaia_root=gaia_root,
+            release=config.release,
+            outer_level=config.outer_level,
+            epoch=config.epoch,
+            band=config.band,
+            center=center,
+            width=width,
+        )
+    )
+
+    return plot_asterisms(
+        asterisms,
+        center=center,
+        width=width,
+        stars=stars,
+        fov=config.fov,
+        band=config.band,
+        min_mag=config.min_mag,
+        ax=ax,
+        hide_stars=hide_stars,
+        hide_fov=hide_fov,
+        hide_connections=hide_connections,
+    )
+
+
+def read_build_asterisms(
+    build_path: Path | str,
+    *,
+    center: SkyCoord,
+    width: u.Quantity,
+    max_asterisms: int | None = None,
+) -> Table:
+    """Read normalized retained asterisms from one current build root."""
+
+    center = _as_scalar_icrs(center)
+    width_deg = _as_width_deg(width)
+    if max_asterisms is not None and int(max_asterisms) < 0:
+        raise PlottingError("max_asterisms must be non-negative")
+
+    build_root = Path(build_path)
+    config = _load_plot_config(build_root)
+    outer_pixs = _candidate_outer_pixels(config.outer_level, center)
+    _require_center_outer_artifact(build_root, config=config, center_outer_pix=outer_pixs[0])
+    return _load_field_asterisms(
+        build_root,
+        config=config,
+        outer_pixs=outer_pixs,
+        center=center,
+        width_deg=width_deg,
+        max_asterisms=max_asterisms,
+    )
+
+
+def read_asterism_stars(
+    *,
+    gaia_root: Path | str,
+    release: str,
+    outer_level: int,
+    epoch: float,
+    band: str,
+    center: SkyCoord,
+    width: u.Quantity,
+) -> Table:
+    """Read normalized Gaia stars for a local asterism diagnostic field."""
+
+    center = _as_scalar_icrs(center)
+    width_deg = _as_width_deg(width)
+    return _load_field_stars(
+        gaia_root=Path(gaia_root),
+        release=release,
+        outer_level=outer_level,
+        epoch=epoch,
+        band=band,
+        outer_pixs=_candidate_outer_pixels(outer_level, center),
+        center=center,
+        width_deg=width_deg,
+    )
+
+
+def _load_plot_config(build_path: Path) -> _AsterismPlotConfig:
+    config_path = build_path / RUNTIME_CONFIG_FILENAME
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = yaml.safe_load(handle) or {}
+    except OSError as exc:
+        raise PlottingError(f"Build runtime config not found: {config_path}") from exc
+
+    try:
+        ao_system = _required_mapping(payload, "ao_system", config_path)
+        traversal = _required_mapping(payload, "traversal", config_path)
+        gaia = _required_mapping(payload, "gaia", config_path)
+        return _AsterismPlotConfig(
+            outer_level=_required_int(traversal, "outer_level", config_path),
+            inner_level=_required_int(traversal, "inner_level", config_path),
+            epoch=_required_float(gaia, "epoch", config_path),
+            release=_optional_str(gaia, "release", default="dr3"),
+            band=_required_str(ao_system, "band", config_path),
+            fov=_required_float(ao_system, "fov_arcsec", config_path) * u.arcsec,
+            min_mag=_required_float(ao_system, "min_mag", config_path),
+        )
+    except PlottingError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise PlottingError(f"Invalid asterism plotting metadata in {config_path}") from exc
+
+
+def _required_mapping(payload: dict[str, Any], key: str, filename: Path) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise PlottingError(f"{filename} is missing required section: {key}")
+    return value
+
+
+def _required_str(payload: dict[str, Any], key: str, filename: Path) -> str:
+    if key not in payload:
+        raise PlottingError(f"{filename} is missing required field: {key}")
+    value = str(payload[key]).strip()
+    if not value:
+        raise PlottingError(f"{filename}.{key} must be non-empty")
+    return value
+
+
+def _optional_str(payload: dict[str, Any], key: str, *, default: str) -> str:
+    value = str(payload.get(key, default)).strip()
+    return value if value else default
+
+
+def _required_int(payload: dict[str, Any], key: str, filename: Path) -> int:
+    if key not in payload:
+        raise PlottingError(f"{filename} is missing required field: {key}")
+    return int(payload[key])
+
+
+def _required_float(payload: dict[str, Any], key: str, filename: Path) -> float:
+    if key not in payload:
+        raise PlottingError(f"{filename} is missing required field: {key}")
+    return float(payload[key])
+
+
+def _as_scalar_icrs(center: SkyCoord) -> SkyCoord:
+    if not isinstance(center, SkyCoord):
+        raise PlottingError("center must be an astropy.coordinates.SkyCoord")
+    if not center.isscalar:
+        raise PlottingError("center must be a scalar SkyCoord")
+    return center.icrs
+
+
+def _as_width_deg(width: u.Quantity) -> float:
+    if not isinstance(width, u.Quantity):
+        raise PlottingError("width must be an astropy.units.Quantity")
+    width_deg = float(width.to_value(u.deg))
+    if not np.isfinite(width_deg) or width_deg <= 0.0:
+        raise PlottingError("width must be a positive angular quantity")
+    return width_deg
+
+
+def _candidate_outer_pixels(outer_level: int, center: SkyCoord) -> tuple[int, ...]:
+    center_pix = int(get_pixel_from_skycoord(int(outer_level), center))
+    neighbours = get_pixel_neighbours(int(outer_level), center_pix)
+    values = [center_pix]
+    values.extend(int(pixel) for pixel in neighbours)
+    return tuple(dict.fromkeys(values))
+
+
+def _require_center_outer_artifact(
+    build_path: Path,
+    *,
+    config: _AsterismPlotConfig,
+    center_outer_pix: int,
+) -> None:
+    from ao_sky.artifacts import AoSkyArtifactStore
+
+    store = AoSkyArtifactStore(build_path)
+    filename = store.outer_path(
+        center_outer_pix,
+        outer_level=config.outer_level,
+        inner_level=config.inner_level,
+    )
+    if not filename.is_file():
+        raise PlottingError(
+            "Center outer-pixel artifact is missing for asterism plot: "
+            f"outer_pix={center_outer_pix}, path={filename}"
+        )
+
+
+def _load_field_stars(
+    *,
+    gaia_root: Path,
+    release: str,
+    outer_level: int,
+    epoch: float,
+    band: str,
+    outer_pixs: tuple[int, ...],
+    center: SkyCoord,
+    width_deg: float,
+) -> Table:
+    tables = []
+    for outer_pix in outer_pixs:
+        stars = _load_outer_stars(
+            gaia_root,
+            outer_pix,
+            release=release,
+            outer_level=outer_level,
+            epoch=epoch,
+            band=band,
+        )
+        if stars is None:
+            continue
+        if len(stars) == 0:
+            continue
+        mask = _local_square_mask(stars["ra"], stars["dec"], center, width_deg / 2.0)
+        if np.any(mask):
+            tables.append(stars[mask])
+    if not tables:
+        return Table()
+    return unique(vstack(tables), keys="source_id")
+
+
+def _load_outer_stars(
+    gaia_root: Path,
+    outer_pix: int,
+    *,
+    release: str,
+    outer_level: int,
+    epoch: float,
+    band: str,
+) -> Table | None:
+    from ao_sky.gaia.store import GaiaHealpixStore, GaiaStoreConfig
+    from ao_sky.gaia.transform import apply_proper_motion, compute_r_magnitude
+
+    store = GaiaHealpixStore(
+        GaiaStoreConfig(
+            root=gaia_root,
+            release=release,
+            healpix_level=outer_level,
+        )
+    )
+    filename = store.healpix_filename(outer_pix)
+    if not filename.is_file():
+        return None
+    stars = apply_proper_motion(store.load_healpix(outer_pix, read_only=True), epoch=epoch)
+    if band == "R" and "R" not in stars.colnames:
+        stars["R"] = compute_r_magnitude(stars)
+
+    mask = ~np.isnan(stars["ra"]) & ~np.isnan(stars["dec"])
+    if band in stars.colnames:
+        mask &= ~np.isnan(stars[band])
+    return stars[mask]
+
+
+def _load_field_asterisms(
+    build_path: Path,
+    *,
+    config: _AsterismPlotConfig,
+    outer_pixs: tuple[int, ...],
+    center: SkyCoord,
+    width_deg: float,
+    max_asterisms: int | None,
+) -> Table:
+    from ao_sky.artifacts import AoSkyArtifactStore
+
+    store = AoSkyArtifactStore(build_path)
+    tables = []
+    for outer_pix in outer_pixs:
+        asterisms = store.asterisms(
+            outer_pix,
+            outer_level=config.outer_level,
+            inner_level=config.inner_level,
+            missing_ok=True,
+        )
+        if asterisms is None or len(asterisms) == 0:
+            continue
+        mask = _local_square_mask(asterisms["ra"], asterisms["dec"], center, width_deg / 2.0)
+        if np.any(mask):
+            tables.append(asterisms[mask])
+    if not tables:
+        return Table()
+    asterisms = _deduplicate_physical_asterisms(vstack(tables))
+    if max_asterisms is not None:
+        asterisms = asterisms[: int(max_asterisms)]
+    return asterisms
+
+
+def _deduplicate_physical_asterisms(asterisms: Table) -> Table:
+    seen: set[tuple[int, ...]] = set()
+    keep = np.zeros(len(asterisms), dtype=bool)
+    for index, row in enumerate(asterisms):
+        key = _physical_asterism_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        keep[index] = True
+    return asterisms[keep]
+
+
+def _physical_asterism_key(row) -> tuple[int, ...]:  # noqa: ANN001
+    num_stars = max(0, min(3, int(row["num_stars"])))
+    source_ids = [
+        int(row[f"star{index}_source_id"])
+        for index in range(1, num_stars + 1)
+        if int(row[f"star{index}_source_id"]) >= 0
+    ]
+    return tuple(sorted(source_ids))
+
+
+def _draw_stars(
+    ax: Axes,
+    stars: Table,
+    center: SkyCoord,
+    *,
+    band: str,
+    min_mag: float,
+) -> None:
+    if len(stars) == 0:
+        return
+
+    x_deg, y_deg = _local_offsets_deg(stars["ra"], stars["dec"], center)
+    magnitudes = (
+        np.asarray(stars[band], dtype=float)
+        if band in stars.colnames
+        else np.full(len(stars), np.nan)
+    )
+    sizes = _linear_marker_sizes(
+        magnitudes,
+        min_mag=7.0,
+        max_mag=19.0,
+        min_size=2.0,
+        max_size=35.0,
+    )
+    bright = np.isfinite(magnitudes) & (magnitudes < float(min_mag))
+    normal = ~bright
+    if np.any(normal):
+        ax.scatter(
+            x_deg[normal],
+            y_deg[normal],
+            s=sizes[normal],
+            facecolors="white",
+            edgecolors="black",
+            linewidths=0.5,
+            zorder=3,
+        )
+    if np.any(bright):
+        ax.scatter(
+            x_deg[bright],
+            y_deg[bright],
+            s=sizes[bright],
+            facecolors="#f4a261",
+            edgecolors="black",
+            linewidths=0.6,
+            zorder=4,
+        )
+
+
+def _draw_fov_circles(
+    ax: Axes,
+    asterisms: Table,
+    center: SkyCoord,
+    fov_radius_deg: float,
+) -> None:
+    if len(asterisms) == 0:
+        return
+    colors = {1: "#f4a261", 2: "#2a9d8f", 3: "#457b9d"}
+    for row in asterisms:
+        x_deg, y_deg = _local_offsets_deg([row["ra"]], [row["dec"]], center)
+        ax.add_patch(
+            Circle(
+                (float(x_deg[0]), float(y_deg[0])),
+                fov_radius_deg,
+                facecolor="none",
+                edgecolor=colors.get(int(row["num_stars"]), "#457b9d"),
+                linewidth=0.9,
+                alpha=0.8,
+                zorder=1,
+            )
+        )
+
+
+def _draw_connections(ax: Axes, asterisms: Table, center: SkyCoord) -> None:
+    if len(asterisms) == 0:
+        return
+    for row in asterisms:
+        num_stars = int(row["num_stars"])
+        if num_stars < 2:
+            continue
+        points = []
+        for index in range(1, min(num_stars, 3) + 1):
+            x_deg, y_deg = _local_offsets_deg(
+                [row[f"star{index}_ra"]],
+                [row[f"star{index}_dec"]],
+                center,
+            )
+            points.append((float(x_deg[0]), float(y_deg[0])))
+        for start, stop in zip(points, points[1:], strict=False):
+            ax.plot(
+                [start[0], stop[0]],
+                [start[1], stop[1]],
+                color="#6c757d",
+                linewidth=0.8,
+                alpha=0.65,
+                zorder=2,
+            )
+        if len(points) == 3:
+            ax.plot(
+                [points[2][0], points[0][0]],
+                [points[2][1], points[0][1]],
+                color="#6c757d",
+                linewidth=0.8,
+                alpha=0.65,
+                zorder=2,
+            )
+
+
+def _linear_marker_sizes(
+    magnitudes: np.ndarray,
+    *,
+    min_mag: float,
+    max_mag: float,
+    min_size: float,
+    max_size: float,
+) -> np.ndarray:
+    values = np.asarray(magnitudes, dtype=float)
+    clipped = np.clip(values, min_mag, max_mag)
+    scale = (max_mag - clipped) / (max_mag - min_mag)
+    sizes = min_size + scale * (max_size - min_size)
+    sizes[~np.isfinite(values)] = min_size
+    return sizes
+
+
+def _style_axis(ax: Axes, half_width_deg: float) -> None:
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-half_width_deg, half_width_deg)
+    ax.set_ylim(-half_width_deg, half_width_deg)
+    ax.set_xlabel(r"$\Delta \mathrm{RA}\cos\delta\ [\mathrm{deg}]$")
+    ax.set_ylabel(r"$\Delta \mathrm{Dec}\ [\mathrm{deg}]$")
+    ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.5)
+
+
+def _local_offsets_deg(
+    ra_deg: Any,
+    dec_deg: Any,
+    center: SkyCoord,
+) -> tuple[np.ndarray, np.ndarray]:
+    ra_deg = np.asarray(ra_deg, dtype=float)
+    dec_deg = np.asarray(dec_deg, dtype=float)
+    delta_ra = (ra_deg - center.ra.deg + 180.0) % 360.0 - 180.0
+    x_deg = delta_ra * np.cos(center.dec.to_value(u.rad))
+    y_deg = dec_deg - center.dec.deg
+    return x_deg, y_deg
+
+
+def _local_square_mask(
+    ra_deg: Any,
+    dec_deg: Any,
+    center: SkyCoord,
+    half_width_deg: float,
+) -> np.ndarray:
+    x_deg, y_deg = _local_offsets_deg(ra_deg, dec_deg, center)
+    return (np.abs(x_deg) <= half_width_deg) & (np.abs(y_deg) <= half_width_deg)
+
+
+__all__ = [
+    "plot_asterisms",
+    "plot_build_asterisms",
+    "read_asterism_stars",
+    "read_build_asterisms",
+]
