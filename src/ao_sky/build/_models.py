@@ -72,6 +72,7 @@ class TraversalExecutionConfig:
     averaged_backend_buckets: tuple[int, ...] = DEFAULT_BACKEND_BUCKETS
     resolved_cache_clear_every: int = -1
     parent_gpu_driver_reserve_mb: float = DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB
+    recover_no_winner_pixels: bool = True
 
 
 @dataclass(frozen=True, slots=True)

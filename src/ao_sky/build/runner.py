@@ -1265,12 +1265,18 @@ def _write_outer_pixel_products(
 def _run_outer_pixel_traversal_task(
     context: TraversalTaskContext,
     outer_pix: int,
+    *,
+    execution_config: TraversalExecutionConfig | None = None,
 ) -> TraversalTaskResult:
     """Run one worker-owned outer-pixel Traversal task and serialize the outcome."""
 
     try:
         configure_inference_threads(1)
-        _materialize_outer_pixel_products(context, outer_pix)
+        _materialize_outer_pixel_products(
+            context,
+            outer_pix,
+            execution_config=execution_config,
+        )
     except Exception as exc:
         return TraversalTaskResult(
             outer_pix=int(outer_pix),
@@ -4276,6 +4282,7 @@ def run_build_outer_pixels(
     outer_pixels: int | Iterable[int],
     *,
     force: bool = False,
+    execution_config: TraversalExecutionConfig | None = None,
 ) -> Path:
     """Run Traversal for selected outer pixels without running aggregation.
 
@@ -4290,6 +4297,8 @@ def run_build_outer_pixels(
         build_path: Initialized build root whose current phase is `traversal`.
         outer_pixels: One outer-pixel id or an iterable of outer-pixel ids.
         force: Re-run selected pixels even when they are already marked done.
+        execution_config: Optional runtime-only Traversal settings for the
+            selected-pixel run.
 
     Returns:
         The input build path.
@@ -4332,7 +4341,11 @@ def run_build_outer_pixels(
             skipped.append(outer_pix)
             continue
         _mark_outer_pixel_running(build_path, state, outer_pix)
-        result = _run_outer_pixel_traversal_task(context, outer_pix)
+        result = _run_outer_pixel_traversal_task(
+            context,
+            outer_pix,
+            execution_config=execution_config,
+        )
         _record_traversal_result(build_path, state, result)
         if result.success:
             append_build_log(build_path, f"selected_outer_pixels outer_pixel={outer_pix} done")

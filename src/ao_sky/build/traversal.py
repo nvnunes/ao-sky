@@ -1346,31 +1346,6 @@ def _build_graph_triangles(adjacency: np.ndarray) -> np.ndarray:
     return np.asarray(triangles, dtype=np.int64)
 
 
-def _filter_fov_valid_triangles(
-    stars: Table,
-    triangles: np.ndarray,
-    runtime: PredictRuntime,
-) -> np.ndarray:
-    if len(triangles) == 0:
-        return np.empty((0, 3), dtype=np.int64)
-    star_ra = np.asarray(stars["ra"], dtype=np.float64)
-    star_dec = np.asarray(stars["dec"], dtype=np.float64)
-    max_radius_arcsec = (
-        runtime.ao_system.fov.to_value(u.arcsec) / 2.0
-        + ASTERISM_CENTER_TOLERANCE_ARCSEC
-    )
-    keep = np.zeros((len(triangles),), dtype=np.bool_)
-    for row, triangle in enumerate(np.asarray(triangles, dtype=np.int64)):
-        center = _candidate_enclosing_fov_center(
-            star_ra[triangle],
-            star_dec[triangle],
-        )
-        keep[row] = center.radius_arcsec <= max_radius_arcsec
-    if not np.any(keep):
-        return np.empty((0, 3), dtype=np.int64)
-    return np.asarray(triangles[keep], dtype=np.int64)
-
-
 def _build_candidate_graph_from_ngs(
     ngs: Table,
     runtime: PredictRuntime,
@@ -1400,11 +1375,7 @@ def _build_candidate_graph_from_ngs(
         else np.zeros((final_count, final_count), dtype=np.bool_)
     )
     triangles = (
-        _filter_fov_valid_triangles(
-            sorted_ngs,
-            _build_graph_triangles(adjacency),
-            runtime,
-        )
+        _build_graph_triangles(adjacency)
         if 3 in enabled
         else np.empty((0, 3), dtype=np.int64)
     )
@@ -1507,7 +1478,6 @@ def _build_candidate_graph_from_source_keys(
         if triangle_set
         else np.empty((0, 3), dtype=np.int64)
     )
-    triangles = _filter_fov_valid_triangles(sorted_ngs, triangles, runtime)
     enabled = set(_enabled_candidate_orders(runtime))
     candidate_count = (
         (len(sorted_ngs) if 1 in enabled else 0)
@@ -3302,7 +3272,7 @@ def build_traversal_products(
             memory_pressure_callback=memory_pressure_callback,
         )
         no_winner_pixel_idxs = np.flatnonzero(top_refs[:, 0] < 0)
-        if len(no_winner_pixel_idxs) > 0:
+        if execution_config.recover_no_winner_pixels and len(no_winner_pixel_idxs) > 0:
             recovery_inner_centres = inner_centres[no_winner_pixel_idxs]
             recovery_pixel_bits = _build_star_pixel_bitsets(
                 candidate_ngs,

@@ -1562,7 +1562,12 @@ def test_run_build_outer_pixels_runs_selected_traversal_without_aggregation(
     )
     seen: list[int] = []
 
-    def fake_run_outer_pixel(context, outer_pix: int) -> TraversalTaskResult:
+    def fake_run_outer_pixel(
+        context,
+        outer_pix: int,
+        *,
+        execution_config=None,
+    ) -> TraversalTaskResult:
         seen.append(int(outer_pix))
         return TraversalTaskResult(outer_pix=int(outer_pix), success=True)
 

@@ -798,7 +798,7 @@ def test_unbounded_candidate_graph_counts_geometry_limited_candidates(
     ]
 
 
-def test_candidate_graph_filters_pairwise_valid_fov_invalid_triangle(
+def test_candidate_graph_retains_pairwise_valid_fov_invalid_triangle_for_late_skip(
     tmp_path: Path,
 ) -> None:
     runtime = _make_predict_runtime(
@@ -824,9 +824,9 @@ def test_candidate_graph_filters_pairwise_valid_fov_invalid_triangle(
     candidate_set = _build_candidate_set(graph, runtime)
 
     assert len(graph.edges) == 3
-    assert len(graph.triangles) == 0
-    assert graph.candidate_count == 6
-    assert len(candidate_set.members) == 6
+    assert len(graph.triangles) == 1
+    assert graph.candidate_count == 7
+    assert len(candidate_set.members) == 7
 
 
 def test_candidate_graph_keeps_near_boundary_valid_triangle(
