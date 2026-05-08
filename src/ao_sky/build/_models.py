@@ -35,6 +35,34 @@ class BuildPaths:
 
 
 @dataclass(frozen=True, slots=True)
+class BuildInspection:
+    """Read-only inspection summary for one persisted build root."""
+
+    build_path: Path
+    build_status: str
+    current_stage: str
+    stage_counts: dict[str, int] | None
+    lineage_name: str
+    lineage_version: int
+    gaia_release: str
+    outer_level: int
+    inner_level: int
+    max_data_level: int
+    runtime_config_path: Path
+    runtime_config_source_path: Path
+    gaia_root: Path
+    dust_root: Path
+    model_root: Path
+    model_manifest_path: Path
+    model_manifest_exists: bool
+    survey_manifest_path: Path
+    survey_manifest_exists: bool
+    survey_overlay_names: tuple[str, ...]
+    map_artifacts: dict[int, dict[str, object]]
+    problems: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class TraversalTaskContext:
     """Pickle-safe worker context for one Traversal run."""
 

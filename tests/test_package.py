@@ -14,8 +14,10 @@ from astropy.table import Table
 from ao_sky import __version__, describe_package
 from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
 from ao_sky.build import (
+    BuildInspection,
     check_runtime_roots,
     fetch_gaia_data,
+    inspect_build,
     init_build,
     load_build_definition,
     show_build,
@@ -45,6 +47,8 @@ def test_gaia_surface_is_importable() -> None:
     assert check_runtime_roots is not None
     assert fetch_gaia_data is not None
     assert init_build is not None
+    assert inspect_build is not None
+    assert BuildInspection is not None
     assert fetch_gaia_store is not None
     assert load_build_definition is not None
     assert show_build is not None
@@ -251,6 +255,7 @@ coverage:
     )
     assert f"build: {build_path}" in show_result.stdout
     assert "status: initialized" in show_result.stdout
+    assert "stage: traversal" in show_result.stdout
 
 
 def test_module_cli_check_reports_valid_runtime_roots(tmp_path: Path) -> None:

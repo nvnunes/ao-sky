@@ -319,7 +319,7 @@ Traversal executes this rule in two paths:
    which is necessary for any shared pointing center to exist. The recovery
    path then projects each surviving no-winner pixel center onto the candidate's
    feasible pointing-center region, the intersection of 1-3 guide-star disks,
-   and runs one additional resolved-prediction phase for recovered
+   and runs one additional resolved-prediction pass for recovered
    candidate-pixel rows.
 
 The optimized pointing center is internal top-K state. It is used for recovered

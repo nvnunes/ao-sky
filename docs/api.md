@@ -169,9 +169,11 @@ the temporary `girmos-aosims` backend adapter behind this native API.
 
 The current package-supported build API exposes:
 
+- `BuildInspection`
 - `BuildError`
 - `check_runtime_roots`
 - `fetch_gaia_data`
+- `inspect_build`
 - `init_build`
 - `load_build_definition`
 - `resolve_build_root_only`
@@ -486,7 +488,7 @@ need fresh local `outer.h5` artifacts for a small sky patch.
 
 Behavior:
 
-- require the build to be initialized and still in the `traversal` phase
+- require the build to be initialized and still in the `traversal` stage
 - use the persisted build config, build-local model snapshot, Gaia root, and
   dust root
 - run the selected outer pixels in-process
@@ -502,9 +504,24 @@ Behavior:
 Resume the latest `v<N>` build under the lineage workspace, using the same
 execution-time worker-count contract as `run_build`.
 
+### `inspect_build(build_path) -> BuildInspection`
+
+Return a structured, read-only inspection summary for one build root.
+
+Behavior:
+
+- read persisted build metadata from `build.h5`
+- report current status, stage, stage work counts, lineage, Gaia release,
+  HEALPix levels, runtime config paths, and persisted roots
+- report model and survey manifest paths and presence
+- report expected map artifact paths and presence for configured map levels
+- return `problems` for missing expected top-level artifacts
+- perform no repair, migration, artifact generation, or per-outer-pixel artifact
+  scan
+
 ### `show_build(build_path) -> str`
 
-Return a human-readable build summary from the persisted `build.h5` state.
+Return a human-readable build summary rendered from `inspect_build`.
 
 ## Working Example
 

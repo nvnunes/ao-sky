@@ -57,6 +57,7 @@ from .control import (
     load_build_definition as load_persisted_build_definition,
     load_build_roots,
     load_current_phase,
+    inspect_build,
     load_runtime_config_path,
     load_state,
     outer_artifact_filename,
@@ -64,7 +65,6 @@ from .control import (
     set_current_phase,
     set_dust_root,
     set_build_status,
-    summarize_build,
     update_state_row,
     write_state_rows,
 )
@@ -4435,21 +4435,63 @@ def _validate_selected_outer_pixels(outer_pixels: tuple[int, ...], state: np.nda
 def show_build(build_path: Path) -> str:
     """Return a summary string for one build."""
 
-    summary = summarize_build(build_path)
+    inspection = inspect_build(build_path)
     lines = [
-        f"build: {summary['build_path']}",
-        f"status: {summary['build_status']}",
-        f"phase: {summary['current_phase']}",
+        f"build: {inspection.build_path}",
+        f"status: {inspection.build_status}",
+        f"stage: {inspection.current_stage}",
+        f"lineage: {inspection.lineage_name} v{inspection.lineage_version}",
+        (
+            "gaia: "
+            f"release={inspection.gaia_release} "
+            f"outer_level={inspection.outer_level} "
+            f"inner_level={inspection.inner_level} "
+            f"max_data_level={inspection.max_data_level}"
+        ),
+        f"runtime config: {inspection.runtime_config_path}",
+        f"gaia root: {inspection.gaia_root}",
+        f"dust root: {inspection.dust_root}",
+        f"model root: {inspection.model_root}",
+        (
+            "model manifest: "
+            f"{_present_missing(inspection.model_manifest_exists)} "
+            f"{inspection.model_manifest_path}"
+        ),
     ]
-    phase_counts: dict[str, int] | None = summary["phase_counts"]  # type: ignore[assignment]
-    if phase_counts is not None:
+    stage_counts = inspection.stage_counts
+    if stage_counts is not None:
         lines.extend(
             [
-                "phase work:",
-                f"  pending={phase_counts['pending']}",
-                f"  running={phase_counts['running']}",
-                f"  done={phase_counts['done']}",
-                f"  failed={phase_counts['failed']}",
+                "stage work:",
+                f"  pending={stage_counts['pending']}",
+                f"  running={stage_counts['running']}",
+                f"  done={stage_counts['done']}",
+                f"  failed={stage_counts['failed']}",
             ]
         )
+    if inspection.survey_overlay_names:
+        lines.extend(
+            [
+                "survey overlays: " + ", ".join(inspection.survey_overlay_names),
+                (
+                    "survey manifest: "
+                    f"{_present_missing(inspection.survey_manifest_exists)} "
+                    f"{inspection.survey_manifest_path}"
+                ),
+            ]
+        )
+    if inspection.map_artifacts:
+        lines.append("map artifacts:")
+        for level, artifact in inspection.map_artifacts.items():
+            lines.append(
+                f"  hpx{level}: {_present_missing(bool(artifact['exists']))} "
+                f"{artifact['path']}"
+            )
+    if inspection.problems:
+        lines.append("problems:")
+        lines.extend(f"  {problem}" for problem in inspection.problems)
     return "\n".join(lines)
+
+
+def _present_missing(exists: bool) -> str:
+    return "present" if exists else "missing"

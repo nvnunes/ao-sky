@@ -17,18 +17,23 @@ from ._constants import (
     BUILD_LAYOUT_VERSION,
     BUILD_LOG_FILENAME,
     BUILD_PHASE_GAIA_LOADING,
+    BUILD_PHASE_AUGMENTATION,
     BUILD_PHASE_TRAVERSAL,
     BUILD_STATUS_INITIALIZED,
+    BUILD_STATUS_COMPLETED,
     MAPS_FILENAME_TEMPLATE,
+    MODEL_SNAPSHOT_MANIFEST_FILENAME,
     RUNTIME_CONFIG_FILENAME,
     STATE_DTYPE,
+    SURVEY_SNAPSHOT_DIRNAME,
+    SURVEY_SNAPSHOT_MANIFEST_FILENAME,
     WORK_STATUS_DONE,
     WORK_STATUS_FAILED,
     WORK_STATUS_PENDING,
     WORK_STATUS_RUNNING,
 )
 from ._exceptions import BuildError
-from ._models import BuildDefinition, BuildPaths
+from ._models import BuildDefinition, BuildInspection, BuildPaths
 
 
 def _write_scalar_dataset(group: h5py.Group, name: str, value: object) -> None:
@@ -407,26 +412,114 @@ def phase_state_fields(phase: str) -> tuple[str, str, str] | None:
 def summarize_build(build_path: Path) -> dict[str, object]:
     """Return a human-readable build summary payload."""
 
+    inspection = inspect_build(build_path)
+    phase_counts = inspection.stage_counts
+    return {
+        "build_path": str(inspection.build_path),
+        "build_status": inspection.build_status,
+        "current_phase": inspection.current_stage,
+        "phase_counts": phase_counts,
+        "current_stage": inspection.current_stage,
+        "stage_counts": phase_counts,
+    }
+
+
+def inspect_build(build_path: Path) -> BuildInspection:
+    """Inspect one build root without repairing or mutating artifacts."""
+
+    build_path = Path(build_path).expanduser().resolve()
     state = load_state(build_path)
     with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
         config_group = handle["metadata"]["config"]
+        lineage_name = str(_decode_bytes(config_group["lineage_name"][()]))
+        lineage_version = int(config_group["lineage_version"][()])
+        gaia_release = str(_decode_bytes(config_group["gaia_release"][()]))
+        gaia_root = Path(str(_decode_bytes(config_group["gaia_root"][()])))
+        dust_root = _resolve_build_metadata_path(build_path, config_group["dust_root"][()])
+        model_root = _resolve_build_metadata_path(build_path, config_group["model_root"][()])
+        runtime_config_path = Path(
+            str(_decode_bytes(config_group["runtime_config_path"][()]))
+        )
+        runtime_config_source_path = Path(
+            str(_decode_bytes(config_group["runtime_config_source_path"][()]))
+        )
+        outer_level = int(config_group["outer_level"][()])
+        inner_level = int(config_group["inner_level"][()])
+        max_data_level = int(config_group["max_data_level"][()])
+        overlays_yaml = str(_decode_bytes(config_group["survey_extent_overlays_yaml"][()]))
         build_status = str(_decode_bytes(config_group["build_status"][()]))
-        current_phase = str(_decode_bytes(config_group["current_phase"][()]))
+        current_stage = str(_decode_bytes(config_group["current_phase"][()]))
 
-    phase_counts: dict[str, int] | None = None
-    fields = phase_state_fields(current_phase)
+    stage_counts: dict[str, int] | None = None
+    fields = phase_state_fields(current_stage)
     if fields is not None:
         status_field, _, _ = fields
-        phase_counts = {
+        stage_counts = {
             "pending": int(np.count_nonzero(state[status_field] == WORK_STATUS_PENDING)),
             "running": int(np.count_nonzero(state[status_field] == WORK_STATUS_RUNNING)),
             "done": int(np.count_nonzero(state[status_field] == WORK_STATUS_DONE)),
             "failed": int(np.count_nonzero(state[status_field] == WORK_STATUS_FAILED)),
         }
 
-    return {
-        "build_path": str(build_path),
-        "build_status": build_status,
-        "current_phase": current_phase,
-        "phase_counts": phase_counts,
+    try:
+        overlays = normalize_survey_extent_overlays(
+            yaml.safe_load(overlays_yaml) or [],
+            base_dir=build_path,
+            resolve_paths=False,
+        )
+    except SurveyError as exc:
+        raise BuildError(str(exc)) from exc
+
+    model_manifest_path = model_root / MODEL_SNAPSHOT_MANIFEST_FILENAME
+    survey_manifest_path = (
+        build_path / SURVEY_SNAPSHOT_DIRNAME / SURVEY_SNAPSHOT_MANIFEST_FILENAME
+    )
+    map_artifacts = {
+        level: {
+            "path": maps_artifact_filename(build_path, level),
+            "exists": maps_artifact_filename(build_path, level).is_file(),
+        }
+        for level in range(outer_level, max_data_level + 1)
     }
+
+    problems: list[str] = []
+    _add_missing_path_problem(problems, runtime_config_path, "runtime config")
+    _add_missing_path_problem(problems, runtime_config_source_path, "runtime config source")
+    _add_missing_path_problem(problems, dust_root, "dust root")
+    _add_missing_path_problem(problems, model_manifest_path, "model manifest")
+    if overlays:
+        _add_missing_path_problem(problems, survey_manifest_path, "survey manifest")
+    if build_status == BUILD_STATUS_COMPLETED or current_stage == BUILD_PHASE_AUGMENTATION:
+        for level, artifact in map_artifacts.items():
+            if not bool(artifact["exists"]):
+                problems.append(f"missing map artifact for level {level}: {artifact['path']}")
+
+    return BuildInspection(
+        build_path=build_path,
+        build_status=build_status,
+        current_stage=current_stage,
+        stage_counts=stage_counts,
+        lineage_name=lineage_name,
+        lineage_version=lineage_version,
+        gaia_release=gaia_release,
+        outer_level=outer_level,
+        inner_level=inner_level,
+        max_data_level=max_data_level,
+        runtime_config_path=runtime_config_path,
+        runtime_config_source_path=runtime_config_source_path,
+        gaia_root=gaia_root,
+        dust_root=dust_root,
+        model_root=model_root,
+        model_manifest_path=model_manifest_path,
+        model_manifest_exists=model_manifest_path.is_file(),
+        survey_manifest_path=survey_manifest_path,
+        survey_manifest_exists=survey_manifest_path.is_file(),
+        survey_overlay_names=tuple(overlay.name for overlay in overlays),
+        map_artifacts=map_artifacts,
+        problems=tuple(problems),
+    )
+
+
+def _add_missing_path_problem(problems: list[str], path: Path, label: str) -> None:
+    if not path.exists():
+        problems.append(f"missing {label}: {path}")

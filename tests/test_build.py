@@ -19,6 +19,7 @@ from ao_sky._hdf5 import HDF5_BLOSC_FILTER_ID, HDF5_BLOSC_LEVEL
 from ao_sky.build import (
     check_runtime_roots,
     fetch_gaia_data,
+    inspect_build,
     init_build as real_init_build,
     restart_build,
     run_build,
@@ -75,6 +76,7 @@ from ao_sky.build.regional import (
 from ao_sky.build.artifacts import (
     write_outer_artifact,
     write_outer_artifact_profiled,
+    write_maps_artifact,
 )
 from ao_sky.build._models import (
     BuildDefinition,
@@ -3020,7 +3022,119 @@ def test_run_build_marks_build_failed_when_augmentation_fails(
     assert summary["build_status"] == "failed"
 
 
-def test_show_build_reports_phase_and_phase_counts(tmp_path: Path) -> None:
+def test_inspect_build_reports_structured_metadata(tmp_path: Path) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    update_state_row(build_path, 0, traversal_status=WORK_STATUS_DONE)
+    update_state_row(build_path, 1, traversal_status=WORK_STATUS_FAILED)
+
+    inspection = inspect_build(build_path)
+
+    assert inspection.build_path == build_path.resolve()
+    assert inspection.build_status == "initialized"
+    assert inspection.current_stage == BUILD_PHASE_TRAVERSAL
+    assert inspection.stage_counts == {
+        "pending": 10,
+        "running": 0,
+        "done": 1,
+        "failed": 1,
+    }
+    assert inspection.lineage_name == "build"
+    assert inspection.lineage_version == 1
+    assert inspection.gaia_release == "dr3"
+    assert inspection.outer_level == 0
+    assert inspection.inner_level == 1
+    assert inspection.max_data_level == 1
+    assert inspection.runtime_config_path == (build_path / "build.yaml").resolve()
+    assert inspection.runtime_config_source_path == definition.resolve()
+    assert inspection.gaia_root == tmp_path / "gaia"
+    assert inspection.dust_root == (build_path / "dust").resolve()
+    assert inspection.model_root == (build_path / "models").resolve()
+    assert inspection.model_manifest_path == build_path.resolve() / "models" / "manifest.json"
+    assert inspection.model_manifest_exists
+    assert not inspection.survey_manifest_exists
+    assert inspection.survey_overlay_names == ()
+    assert sorted(inspection.map_artifacts) == [0, 1]
+    assert not inspection.map_artifacts[0]["exists"]
+    assert not inspection.map_artifacts[1]["exists"]
+    assert inspection.problems == ()
+
+
+def test_inspect_build_reports_missing_model_manifest(tmp_path: Path) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    (build_path / "models" / "manifest.json").unlink()
+
+    inspection = inspect_build(build_path)
+
+    assert not inspection.model_manifest_exists
+    assert any("missing model manifest" in problem for problem in inspection.problems)
+
+
+def test_inspect_build_reports_survey_manifest_when_overlays_are_configured(
+    tmp_path: Path,
+) -> None:
+    overlay = _write_moc(tmp_path / "mocs" / "ews.fits", level=1, pixs=[1])
+    definition = _write_build_definition(
+        tmp_path / "build.yaml",
+        survey_overlays=[{"name": "ews", "moc_files": [overlay.name]}],
+    )
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        survey_root=overlay.parent,
+        legacy_config_path=legacy,
+    )
+
+    inspection = inspect_build(build_path)
+
+    assert inspection.survey_overlay_names == ("ews",)
+    assert inspection.survey_manifest_path == build_path.resolve() / "surveys" / "manifest.json"
+    assert inspection.survey_manifest_exists
+    assert not any("missing survey manifest" in problem for problem in inspection.problems)
+
+
+def test_inspect_build_reports_map_artifact_presence(tmp_path: Path) -> None:
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=tmp_path / "gaia",
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    write_maps_artifact(
+        maps_artifact_filename(build_path, 0),
+        maps=np.zeros(12, dtype=MAPS_DTYPE),
+    )
+    set_current_phase(build_path, BUILD_PHASE_AUGMENTATION)
+
+    inspection = inspect_build(build_path)
+
+    assert inspection.map_artifacts[0]["exists"]
+    assert not inspection.map_artifacts[1]["exists"]
+    assert any("missing map artifact for level 1" in problem for problem in inspection.problems)
+
+
+def test_show_build_reports_stage_and_stage_counts(tmp_path: Path) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
     build_path = init_build(
@@ -3035,7 +3149,12 @@ def test_show_build_reports_phase_and_phase_counts(tmp_path: Path) -> None:
 
     text = show_build(build_path)
 
-    assert "phase: traversal" in text
+    assert "stage: traversal" in text
+    assert "lineage: build v1" in text
+    assert "gaia: release=dr3 outer_level=0 inner_level=1 max_data_level=1" in text
+    assert "runtime config:" in text
+    assert "model manifest: present" in text
+    assert "stage work:" in text
     assert "pending=10" in text
     assert "done=1" in text
     assert "failed=1" in text
@@ -3055,8 +3174,8 @@ def test_show_build_omits_phase_counts_for_aggregation(tmp_path: Path) -> None:
 
     text = show_build(build_path)
 
-    assert "phase: aggregation" in text
-    assert "phase work:" not in text
+    assert "stage: aggregation" in text
+    assert "stage work:" not in text
 
 
 def test_show_build_omits_phase_counts_for_augmentation(tmp_path: Path) -> None:
@@ -3078,8 +3197,10 @@ def test_show_build_omits_phase_counts_for_augmentation(tmp_path: Path) -> None:
 
     text = show_build(build_path)
 
-    assert "phase: augmentation" in text
-    assert "phase work:" not in text
+    assert "stage: augmentation" in text
+    assert "stage work:" not in text
+    assert "survey overlays: ews" in text
+    assert "survey manifest: present" in text
 
 
 def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None:
