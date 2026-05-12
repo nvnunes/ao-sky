@@ -86,7 +86,11 @@ from ._models import (
     TraversalWorkerPlan,
     TraversalWorkerStats,
 )
-from .regional import build_dynamic_work_batches, build_regional_worker_plans
+from .regional import (
+    build_dynamic_work_batches,
+    build_regional_worker_plans,
+    dynamic_model_name,
+)
 from .runtime_gaia import RuntimeGaiaHealpixStore
 from .traversal import (
     TraversalGeometry,
@@ -4067,12 +4071,17 @@ def _run_traversal_phase(
                         1,
                         execution_config,
                     ),
+                    recover_no_winner_pixels=execution_config.recover_no_winner_pixels,
+                )
+                model_name = dynamic_model_name(
+                    recover_no_winner_pixels=execution_config.recover_no_winner_pixels,
                 )
                 append_build_log(
                     build_path,
                     "phase=traversal "
                     "dynamic_schedule "
                     f"batches={len(schedule.batches)} "
+                    f"model={model_name} "
                     f"stress_workers={schedule.stress_worker_count} "
                     f"stress_star_threshold={schedule.stress_star_threshold:.0f}",
                 )

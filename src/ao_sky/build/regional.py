@@ -19,8 +19,10 @@ REGIONAL_SCHEDULE_SECONDS_STAR_EXPONENT = 1.2184647278722778
 REGIONAL_SCHEDULE_SECONDS_DENSE_CAP = 18.58285714285714
 REGIONAL_SCHEDULE_THROUGHPUT_SCALE = 0.5
 GALACTIC_LATITUDE_LOW_BAND_DEG = 15.0
-DYNAMIC_WORKER_RSS_INTERCEPT_GIB = 0.914584
-DYNAMIC_WORKER_RSS_SLOPE_GIB_PER_STAR = 0.000004256378
+DYNAMIC_MODEL_NO_WINNER_RECOVERY_ENABLED = "no_winner_recovery_enabled"
+DYNAMIC_MODEL_NO_WINNER_RECOVERY_DISABLED = "no_winner_recovery_disabled"
+DYNAMIC_WORKER_RSS_INTERCEPT_GIB = 0.937779
+DYNAMIC_WORKER_RSS_SLOPE_GIB_PER_STAR = 0.00000436512
 DYNAMIC_RUNTIME_TRANSITION_START_STARS = 20_000.0
 DYNAMIC_RUNTIME_TRANSITION_END_STARS = 33_000.0
 
@@ -190,6 +192,7 @@ def build_dynamic_work_batches(
     memory_limit_mb: float,
     trim_fraction: float,
     worker_ram_overhead_mb: float,
+    recover_no_winner_pixels: bool = True,
 ) -> DynamicTraversalSchedule:
     """Return parent-owned dynamic Traversal batches.
 
@@ -238,6 +241,7 @@ def build_dynamic_work_batches(
         descending=True,
         star_counts=star_counts,
         worker_ram_overhead_mb=worker_ram_overhead_mb,
+        recover_no_winner_pixels=recover_no_winner_pixels,
     )
     normal_batches = _build_dynamic_batches(
         normal_outer_pixs,
@@ -247,6 +251,7 @@ def build_dynamic_work_batches(
         descending=False,
         star_counts=star_counts,
         worker_ram_overhead_mb=worker_ram_overhead_mb,
+        recover_no_winner_pixels=recover_no_winner_pixels,
     )
     return DynamicTraversalSchedule(
         batches=tuple(stress_batches + normal_batches),
@@ -346,20 +351,35 @@ def dynamic_worker_ram_mb(
     return 1024.0 * rss_gib + float(worker_ram_overhead_mb)
 
 
-def dynamic_outer_pixel_seconds(star_count: int) -> float:
+def dynamic_model_name(*, recover_no_winner_pixels: bool) -> str:
+    """Return the dynamic scheduler model name for the recovery mode."""
+
+    if bool(recover_no_winner_pixels):
+        return DYNAMIC_MODEL_NO_WINNER_RECOVERY_ENABLED
+    return DYNAMIC_MODEL_NO_WINNER_RECOVERY_DISABLED
+
+
+def dynamic_outer_pixel_seconds(
+    star_count: int,
+    *,
+    recover_no_winner_pixels: bool = True,
+) -> float:
     """Return the calibrated dynamic-scheduler runtime proxy."""
 
     u = max(float(star_count), 0.0) / 1000.0
     transition_start = DYNAMIC_RUNTIME_TRANSITION_START_STARS / 1000.0
     transition_end = DYNAMIC_RUNTIME_TRANSITION_END_STARS / 1000.0
     if u <= transition_start:
-        seconds = 0.331 - 0.0914 * u + 0.0670 * u * u
+        if bool(recover_no_winner_pixels):
+            seconds = -0.252369 + 0.385485 * u + 0.0478632 * u * u
+        else:
+            seconds = 0.509411 - 0.161835 * u + 0.0721309 * u * u
     elif u <= transition_end:
         v = u - transition_start
-        seconds = 25.293 - 1.368 * v + 0.0436 * v * v
+        seconds = 26.6026 - 1.14328 * v + 0.0224683 * v * v
     else:
         v = u - transition_end
-        seconds = 14.885 + 0.00394 * v + 0.00000707 * v * v
+        seconds = 15.5371 + 0.00078222 * v + 0.00000815932 * v * v
     return max(float(seconds), 0.1)
 
 
@@ -372,6 +392,7 @@ def _build_dynamic_batches(
     descending: bool,
     star_counts: np.ndarray,
     worker_ram_overhead_mb: float,
+    recover_no_winner_pixels: bool,
 ) -> list[TraversalWorkBatch]:
     if not outer_pixs:
         return []
@@ -416,7 +437,10 @@ def _build_dynamic_batches(
                 is_stress=bool(is_stress),
                 sort_star_count=int(sort_star_count),
                 estimated_seconds=sum(
-                    dynamic_outer_pixel_seconds(int(star_counts[int(pix)]))
+                    dynamic_outer_pixel_seconds(
+                        int(star_counts[int(pix)]),
+                        recover_no_winner_pixels=recover_no_winner_pixels,
+                    )
                     for pix in ordered_outer_pixs
                 ),
                 estimated_ram_mb=dynamic_worker_ram_mb(

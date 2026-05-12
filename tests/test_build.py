@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
+import sys
 from pathlib import Path
 from gzip import open as gzip_open
 
@@ -71,6 +73,7 @@ from ao_sky.build.scheduler import OuterPixelScheduler
 from ao_sky.build.regional import (
     build_dynamic_work_batches,
     build_regional_worker_plans,
+    dynamic_outer_pixel_seconds,
     order_region_outer_pixs,
 )
 from ao_sky.build.artifacts import (
@@ -80,6 +83,7 @@ from ao_sky.build.artifacts import (
 )
 from ao_sky.build._models import (
     BuildDefinition,
+    DynamicTraversalSchedule,
     TraversalExecutionConfig,
     TraversalTaskResult,
 )
@@ -955,6 +959,74 @@ def test_dynamic_work_batches_classify_stress_and_compute_workers() -> None:
     assert all(batch.region_level == 0 for batch in schedule.batches if not batch.is_stress)
 
 
+def test_dynamic_runtime_model_selects_recovery_sparse_segment() -> None:
+    assert dynamic_outer_pixel_seconds(
+        10_000,
+        recover_no_winner_pixels=True,
+    ) != pytest.approx(
+        dynamic_outer_pixel_seconds(
+            10_000,
+            recover_no_winner_pixels=False,
+        )
+    )
+    assert dynamic_outer_pixel_seconds(
+        25_000,
+        recover_no_winner_pixels=True,
+    ) == pytest.approx(
+        dynamic_outer_pixel_seconds(
+            25_000,
+            recover_no_winner_pixels=False,
+        )
+    )
+    assert dynamic_outer_pixel_seconds(
+        500_000,
+        recover_no_winner_pixels=True,
+    ) == pytest.approx(
+        dynamic_outer_pixel_seconds(
+            500_000,
+            recover_no_winner_pixels=False,
+        )
+    )
+
+
+def test_dynamic_work_batches_use_recovery_model_in_estimates() -> None:
+    state = _make_scheduler_state([WORK_STATUS_PENDING] * 64)
+    star_counts = np.full(64, 10_000, dtype=np.int64)
+
+    enabled = build_dynamic_work_batches(
+        state=state,
+        outer_level=2,
+        workers=4,
+        status_field="traversal_status",
+        star_counts=star_counts,
+        memory_limit_mb=8192,
+        trim_fraction=0.85,
+        worker_ram_overhead_mb=0.0,
+        recover_no_winner_pixels=True,
+    )
+    disabled = build_dynamic_work_batches(
+        state=state,
+        outer_level=2,
+        workers=4,
+        status_field="traversal_status",
+        star_counts=star_counts,
+        memory_limit_mb=8192,
+        trim_fraction=0.85,
+        worker_ram_overhead_mb=0.0,
+        recover_no_winner_pixels=False,
+    )
+
+    assert sum(batch.estimated_seconds for batch in enabled.batches) == pytest.approx(
+        64 * dynamic_outer_pixel_seconds(10_000, recover_no_winner_pixels=True)
+    )
+    assert sum(batch.estimated_seconds for batch in disabled.batches) == pytest.approx(
+        64 * dynamic_outer_pixel_seconds(10_000, recover_no_winner_pixels=False)
+    )
+    assert sum(batch.estimated_seconds for batch in enabled.batches) != pytest.approx(
+        sum(batch.estimated_seconds for batch in disabled.batches)
+    )
+
+
 def test_order_region_outer_pixs_prefers_neighbours(monkeypatch: pytest.MonkeyPatch) -> None:
     graph = {
         3: np.asarray([2], dtype=np.int64),
@@ -995,6 +1067,141 @@ def test_order_region_outer_pixs_can_stagger_initial_seed(
         3,
         2,
         0,
+    )
+
+
+def test_dynamic_traversal_phase_passes_recovery_mode_to_schedule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ao_sky.build import runner as runner_module
+
+    definition = _write_build_definition(tmp_path / "build.yaml")
+    legacy = _write_legacy_config(tmp_path / "legacy.yaml")
+    gaia_root = tmp_path / "gaia"
+    build_path = init_build(
+        definition_filename=definition,
+        gaia_root=gaia_root,
+        build_root=tmp_path / "builds",
+        dust_root=tmp_path / "dust",
+        legacy_config_path=legacy,
+    )
+    _write_gaia_summary(
+        gaia_root,
+        release="dr3",
+        outer_level=0,
+        star_counts=[10_000] * 12,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_build_dynamic_work_batches(**kwargs) -> DynamicTraversalSchedule:
+        captured["recover_no_winner_pixels"] = kwargs["recover_no_winner_pixels"]
+        return DynamicTraversalSchedule(
+            batches=(),
+            stress_star_threshold=float("inf"),
+            stress_worker_count=0,
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "build_dynamic_work_batches",
+        fake_build_dynamic_work_batches,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_run_dynamic_traversal_workers",
+        lambda **kwargs: False,
+    )
+
+    runner_module._run_traversal_phase(
+        build_path,
+        execution_config=TraversalExecutionConfig(
+            workers=2,
+            scheduler="dynamic",
+            recover_no_winner_pixels=False,
+        ),
+    )
+
+    assert captured["recover_no_winner_pixels"] is False
+    assert "model=no_winner_recovery_disabled" in (build_path / "build.log").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_benchmark_simulator_selects_no_winner_recovery_model() -> None:
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "benchmarking"
+        / "scripts"
+        / "simulate_regional_schedule_memory.py"
+    )
+    if not script_path.is_file():
+        pytest.skip("benchmarking simulator script is not part of the tracked test fixture")
+    spec = importlib.util.spec_from_file_location(
+        "_aosky_benchmark_simulator_for_test",
+        script_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    disabled_runtime = module.estimate_outer_pixel_seconds(
+        10_000,
+        recover_no_winner_pixels=False,
+    )
+    enabled_runtime = module.estimate_outer_pixel_seconds(
+        10_000,
+        recover_no_winner_pixels=True,
+    )
+
+    assert module.estimate_outer_pixel_seconds(10_000) == pytest.approx(
+        disabled_runtime
+    )
+    assert enabled_runtime != pytest.approx(disabled_runtime)
+    assert module._worker_ram_floor_mb(is_stress=False) == pytest.approx(
+        module._worker_ram_floor_mb(
+            is_stress=False,
+            recover_no_winner_pixels=False,
+        )
+    )
+    assert module._worker_ram_floor_mb(
+        is_stress=False,
+        recover_no_winner_pixels=True,
+    ) != pytest.approx(
+        module._worker_ram_floor_mb(
+            is_stress=False,
+            recover_no_winner_pixels=False,
+        )
+    )
+    assert module._worker_ram_tau_seconds(
+        is_stress=False,
+        recover_no_winner_pixels=True,
+    ) != pytest.approx(
+        module._worker_ram_tau_seconds(
+            is_stress=False,
+            recover_no_winner_pixels=False,
+        )
+    )
+    assert module._worker_ram_floor_mb(
+        is_stress=True,
+        recover_no_winner_pixels=True,
+    ) == pytest.approx(
+        module._worker_ram_floor_mb(
+            is_stress=True,
+            recover_no_winner_pixels=False,
+        )
+    )
+    assert module._worker_ram_tau_seconds(
+        is_stress=True,
+        recover_no_winner_pixels=True,
+    ) == pytest.approx(
+        module._worker_ram_tau_seconds(
+            is_stress=True,
+            recover_no_winner_pixels=False,
+        )
     )
 
 

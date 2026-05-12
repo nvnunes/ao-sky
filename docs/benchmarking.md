@@ -30,7 +30,10 @@ Detailed evidence lives under `docs/benchmarking/entries/`.
   - [First Full-Sky Memory-Aware Scheduler Runs](benchmarking/entries/2026-04-19-e008-static-scheduler-full-sky-runtime-and-modeling/e008d.md)
 - `2026-04-21` Dynamic Scheduler Runtime Validation:
   - [Dynamic Scheduler and Stochastic Simulation](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md)
-  - [Dynamic Scheduler Runtime Evidence](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)
+  - [v2 Dynamic Scheduler Runtime Evidence](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)
+- `2026-05-11` No-Winner Recovery Performance:
+  - [v3 No-Winner Recovery Run Performance](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010a.md)
+  - [Update No-Winner Recovery Dynamic Scheduler Models](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010b.md)
 
 ## Summary
 
@@ -108,17 +111,27 @@ Detailed evidence lives under `docs/benchmarking/entries/`.
 - Added a dynamic scheduler that uses Gaia star count and the RAM model instead of Galactic latitude to decide which work can run together. The simulation favored this approach because it kept high-memory work moving without pinning workers to a fixed latitude split: dynamic `9` reached `1.12 pix/s` versus about `0.81 pix/s` for the fixed splits, with lower peak RAM than fixed `9/6` ([e009a](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md)).
 - The first measured dynamic `9` run matched the policy expectation: it processed `41,184` outer pixels at `1.36 pix/s`, reached only `3` memory clearing events, never paused, and peaked at `22.18 GiB` ([e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
 - The dynamic `9` simulation matched measured throughput over the cropped run window, while the RAM simulation overestimated memory pressure ([e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
+- The completed `v3` dynamic `9` run processed all `49,152` outer pixels in `13.78 h` of active traversal time at `0.99 pix/s`, with only `2` memory clearing events, no pauses, and `22.13 GiB` peak RAM ([e010a](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010a.md)).
+- Active-time accounting for stopped-and-continued builds now skips stopped intervals and de-duplicates restarted `outer_pixel_done` events, so throughput reflects traversal work rather than supervision gaps ([e010a](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010a.md)).
+- Updated dynamic scheduler simulations now distinguish recovery-enabled and
+  no-recovery operation. The no-recovery full-run simulation reaches
+  `1.10 pix/s`, while the recovery-enabled full-run simulation reaches
+  `0.995 pix/s`, leaving about a `10%` throughput gap; both RAM simulations
+  remain conservative relative to measured peak RAM ([e010b](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010b.md)).
 
 #### Conclusions
 
-- Dynamic scheduling is superior to fixed latitude splits for the current GPU build ([e009a](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md), [e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
+- Dynamic scheduling is superior to fixed latitude splits for the current GPU build ([e009a](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md), [e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md), [e010a](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010a.md)).
 - Scheduler simulation is effective for testing scheduling algorithms before committing to full-build runs ([e008c](benchmarking/entries/2026-04-19-e008-static-scheduler-full-sky-runtime-and-modeling/e008c.md), [e009a](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md)).
-- Staying within the MacBook Pro M4 Max RAM ceiling limits throughput, so careful memory scheduling is part of how throughput is increased ([e008b](benchmarking/entries/2026-04-19-e008-static-scheduler-full-sky-runtime-and-modeling/e008b.md), [e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
+- Staying within the MacBook Pro M4 Max RAM ceiling limits throughput, so careful memory scheduling is part of how throughput is increased ([e008b](benchmarking/entries/2026-04-19-e008-static-scheduler-full-sky-runtime-and-modeling/e008b.md), [e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md), [e010a](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010a.md), [e010b](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010b.md)).
+- Use the `v3` dynamic model family as the baseline and vary only the first
+  runtime segment and normal-worker RAM decay when no-winner recovery is
+  disabled ([e010b](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010b.md)).
 
 #### Decisions
 
 - Use dynamic `9` under the current local memory ceiling, with dynamic `8` as the lower-pressure fallback ([e009a](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md)).
-- Keep measured total-RAM guards in control during the run to guard against memory overflow ([e009a](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md), [e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
+- Keep measured total-RAM guards in control during the run to guard against memory overflow ([e009a](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009a.md), [e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md), [e010a](benchmarking/entries/2026-05-11-e010-no-winner-recovery-performance/e010a.md)).
 
 ## Follow-Up
 
@@ -129,5 +142,4 @@ Detailed evidence lives under `docs/benchmarking/entries/`.
 
 ### Runtime
 
-1. Run a full dynamic build that processes all outer pixels rather than stopping part way ([e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
-2. Study how sensitive the dynamic scheduler is to the runtime/RAM models when run on other computers ([e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
+1. Study how sensitive the dynamic scheduler is to the runtime/RAM models when run on other computers ([e009b](benchmarking/entries/2026-04-21-e009-dynamic-scheduler-runtime-validation/e009b.md)).
