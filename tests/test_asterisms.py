@@ -4,17 +4,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 from astropy.table import Table
+from mocpy import MOC
 
+from ao_sky._paths import get_outer_pixel_bucket_path
 from ao_sky.asterisms import (
     ASTERISM_TABLE_COLUMNS,
     AsterismError,
+    AsterismLookupFilters,
     AsterismSearchOptions,
     find_asterisms,
     load_asterism_stars,
 )
+from ao_sky.build._constants import (
+    ASTERISMS_DTYPE,
+    BUILD_FILENAME,
+    INNER_DTYPE,
+    STATE_DTYPE,
+    WORK_STATUS_DONE,
+    WORK_STATUS_PENDING,
+)
+from ao_sky.build.artifacts import write_outer_artifact
 import ao_sky.asterisms.search as search_module
 from ao_sky.gaia import (
     GAIA_SCHEMA_COLUMNS,
@@ -313,11 +326,107 @@ def _search_table(rows: list[tuple[int, float, float, float]]) -> Table:
     return table
 
 
-def test_find_asterisms_returns_single_star_output() -> None:
+def _write_lookup_build_root(
+    build_path: Path,
+    *,
+    done_pixels: tuple[int, ...] = (0,),
+) -> None:
+    build_path.mkdir(parents=True, exist_ok=True)
+    state = np.zeros(12, dtype=STATE_DTYPE)
+    state["outer_pix"] = np.arange(12, dtype=np.int64)
+    state["gaia_loading_status"] = WORK_STATUS_DONE
+    state["traversal_status"] = WORK_STATUS_PENDING
+    for outer_pix in done_pixels:
+        state["traversal_status"][int(outer_pix)] = WORK_STATUS_DONE
+
+    with h5py.File(build_path / BUILD_FILENAME, "w") as handle:
+        metadata = handle.create_group("metadata")
+        config = metadata.create_group("config")
+        config.create_dataset("lineage_name", data="lookup", dtype=h5py.string_dtype("utf-8"))
+        config.create_dataset("gaia_release", data="dr3", dtype=h5py.string_dtype("utf-8"))
+        config.create_dataset("outer_level", data=0)
+        config.create_dataset("inner_level", data=1)
+        config.create_dataset("max_data_level", data=1)
+        config.create_dataset("survey_extent_overlays_yaml", data="[]", dtype=h5py.string_dtype("utf-8"))
+        state_group = handle.create_group("state")
+        state_group.create_dataset("outer_pixels", data=state)
+
+
+def _write_lookup_outer(
+    build_path: Path,
+    *,
+    outer_pix: int,
+    local_ids: tuple[int, ...] = (7,),
+    source_ids: tuple[tuple[int, int, int], ...] = ((101, 202, -1),),
+    asterism_pixs: tuple[int, ...] | None = None,
+    member_mags: tuple[tuple[float, float, float], ...] | None = None,
+    winner_ids: tuple[int, ...] = (7, 7, -1, -1),
+    winner_ee_resolved: tuple[float, ...] = (0.2, 0.4, np.nan, np.nan),
+    winner_ee_averaged: tuple[float, ...] = (0.3, 0.5, np.nan, np.nan),
+    coverage_resolved: tuple[bool, ...] = (False, True, False, False),
+    coverage_averaged: tuple[bool, ...] = (True, True, False, False),
+) -> None:
+    inner = np.zeros(4, dtype=INNER_DTYPE)
+    inner["pix"] = np.arange(4, dtype=np.int64)
+    inner["gaia_A0"] = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float64)
+    inner["best_ee"] = np.asarray([0.4, 0.6, 0.1, 0.2], dtype=np.float64)
+    inner["best_sr"] = np.asarray([0.04, 0.06, 0.01, 0.02], dtype=np.float64)
+    inner["best_fwhm"] = np.asarray([100.0, 80.0, 200.0, 180.0], dtype=np.float64)
+    inner["winner_asterism_id"] = np.asarray(winner_ids, dtype=np.int64)
+    inner["winner_ee_resolved"] = np.asarray(winner_ee_resolved, dtype=np.float64)
+    inner["winner_ee_averaged"] = np.asarray(winner_ee_averaged, dtype=np.float64)
+    inner["coverage_resolved"] = np.asarray(coverage_resolved, dtype=np.bool_)
+    inner["coverage_averaged"] = np.asarray(coverage_averaged, dtype=np.bool_)
+
+    asterisms = np.zeros(len(local_ids), dtype=ASTERISMS_DTYPE)
+    asterisms["asterism_id"] = np.asarray(local_ids, dtype=np.int64)
+    asterisms["ra"] = np.arange(len(local_ids), dtype=np.float64) + 10.0
+    asterisms["dec"] = np.arange(len(local_ids), dtype=np.float64) + 20.0
+    asterisms["num_stars"] = np.asarray(
+        [sum(1 for source_id in row if source_id >= 0) for row in source_ids],
+        dtype=np.int64,
+    )
+    asterisms["pix"] = (
+        np.arange(len(local_ids), dtype=np.int64)
+        if asterism_pixs is None
+        else np.asarray(asterism_pixs, dtype=np.int64)
+    )
+    for row_index, row_source_ids in enumerate(source_ids):
+        for slot, source_id in enumerate(row_source_ids, start=1):
+            asterisms[f"star{slot}_source_id"][row_index] = int(source_id)
+            asterisms[f"star{slot}_ra"][row_index] = 10.0 + slot
+            asterisms[f"star{slot}_dec"][row_index] = 20.0 + slot
+            asterisms[f"star{slot}_mag"][row_index] = (
+                11.0 + slot
+                if member_mags is None
+                else float(member_mags[row_index][slot - 1])
+            )
+
+    filename = (
+        build_path
+        / "hpx0-1"
+        / get_outer_pixel_bucket_path(0, outer_pix)
+        / "outer.h5"
+    )
+    write_outer_artifact(filename, inner=Table(inner), asterisms=Table(asterisms))
+
+
+def _write_lookup_moc(path: Path, *, level: int, pixs: list[int]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    moc = MOC.from_healpix_cells(
+        np.asarray(pixs, dtype=np.uint64),
+        level,
+        max_depth=level,
+    )
+    moc.save(str(path), format="fits", overwrite=True)
+    return path
+
+
+def test_legacy_enumerate_asterism_candidates_returns_single_star_output() -> None:
     stars = _search_table([(101, 10.0, 0.0, 12.0)])
     options = AsterismSearchOptions(min_stars=1, max_stars=1)
 
-    result = find_asterisms(stars, options)
+    result = search_module._enumerate_asterism_candidates(stars, options)
 
     assert result.colnames == list(ASTERISM_TABLE_COLUMNS)
     assert result["asterism_id"].tolist() == [1]
@@ -328,7 +437,7 @@ def test_find_asterisms_returns_single_star_output() -> None:
     assert result["separation_arcsec"].tolist() == [60.0]
 
 
-def test_find_asterisms_returns_deterministic_two_and_three_star_results() -> None:
+def test_legacy_enumerate_asterism_candidates_returns_deterministic_two_and_three_star_results() -> None:
     arcsec = 1.0 / 3600.0
     stars = _search_table(
         [
@@ -338,9 +447,9 @@ def test_find_asterisms_returns_deterministic_two_and_three_star_results() -> No
         ]
     )
 
-    pairs = find_asterisms(stars, AsterismSearchOptions(min_stars=2, max_stars=2))
-    triplets = find_asterisms(stars, AsterismSearchOptions(min_stars=3, max_stars=3))
-    triplets_repeat = find_asterisms(stars, AsterismSearchOptions(min_stars=3, max_stars=3))
+    pairs = search_module._enumerate_asterism_candidates(stars, AsterismSearchOptions(min_stars=2, max_stars=2))
+    triplets = search_module._enumerate_asterism_candidates(stars, AsterismSearchOptions(min_stars=3, max_stars=3))
+    triplets_repeat = search_module._enumerate_asterism_candidates(stars, AsterismSearchOptions(min_stars=3, max_stars=3))
 
     assert len(pairs) == 3
     assert len(triplets) == 1
@@ -353,7 +462,7 @@ def test_find_asterisms_returns_deterministic_two_and_three_star_results() -> No
     assert np.array_equal(triplets.as_array(), triplets_repeat.as_array())
 
 
-def test_find_asterisms_handles_multiple_buffer_chunks(
+def test_legacy_enumerate_asterism_candidates_handles_multiple_buffer_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     arcsec = 1.0 / 3600.0
@@ -373,13 +482,13 @@ def test_find_asterisms_handles_multiple_buffer_chunks(
 
     monkeypatch.setattr(search_module._AsterismBuffer, "__init__", tiny_buffer_init)
 
-    result = find_asterisms(stars, AsterismSearchOptions(min_stars=1, max_stars=3))
+    result = search_module._enumerate_asterism_candidates(stars, AsterismSearchOptions(min_stars=1, max_stars=3))
 
     assert len(result) == 7
     assert result["asterism_id"].tolist() == [1, 2, 3, 4, 5, 6, 7]
 
 
-def test_find_asterisms_uses_derived_r_magnitude_for_triplet_scoring() -> None:
+def test_legacy_enumerate_asterism_candidates_uses_derived_r_magnitude_for_triplet_scoring() -> None:
     arcsec = 1.0 / 3600.0
     stars = _gaia_table(
         [
@@ -393,7 +502,7 @@ def test_find_asterisms_uses_derived_r_magnitude_for_triplet_scoring() -> None:
     stars["RP"] = np.asarray([11.9, 12.0, 13.8], dtype=np.float64)
     stars["R"] = compute_r_magnitude(stars)
 
-    triplets = find_asterisms(stars, AsterismSearchOptions(min_stars=3, max_stars=3))
+    triplets = search_module._enumerate_asterism_candidates(stars, AsterismSearchOptions(min_stars=3, max_stars=3))
 
     assert len(triplets) == 1
     assert triplets["star1_mag"].tolist() == [float(stars["R"][0])]
@@ -406,3 +515,385 @@ def test_asterism_search_options_enforce_phase_two_contract() -> None:
 
     with pytest.raises(AsterismError, match="cannot exceed"):
         AsterismSearchOptions(min_separation_arcsec=10.0, max_separation_arcsec=5.0)
+
+
+def test_find_asterisms_reads_supported_winners_from_done_outer_pixel(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, 404, -1)),
+        winner_ids=(7, 7, -1, -1),
+    )
+
+    result = find_asterisms(build_path, outer_pixels=0)
+
+    assert len(result) == 1
+    assert result.colnames[-7:] == [
+        "global_asterism_id",
+        "representative_outer_pix",
+        "representative_asterism_id",
+        "inner_pixel_count",
+        "winner_ee_resolved",
+        "winner_ee_averaged",
+        "gaia_A0",
+    ]
+    assert int(result["global_asterism_id"][0]) == 1
+    assert int(result["representative_outer_pix"][0]) == 0
+    assert int(result["representative_asterism_id"][0]) == 7
+    assert int(result["inner_pixel_count"][0]) == 2
+    assert int(result["star1_source_id"][0]) == 101
+    assert np.isclose(float(result["winner_ee_resolved"][0]), 0.3)
+    assert np.isclose(float(result["winner_ee_averaged"][0]), 0.4)
+    assert np.isclose(float(result["gaia_A0"][0]), 0.15)
+
+
+def test_find_asterisms_deduplicates_physical_asterisms_across_outer_pixels(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0, 1))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7,),
+        source_ids=((101, 202, -1),),
+        winner_ids=(7, 7, -1, -1),
+    )
+    _write_lookup_outer(
+        build_path,
+        outer_pix=1,
+        local_ids=(99,),
+        source_ids=((202, 101, -1),),
+        winner_ids=(99, -1, -1, -1),
+        winner_ee_resolved=(0.8, np.nan, np.nan, np.nan),
+        winner_ee_averaged=(0.7, np.nan, np.nan, np.nan),
+    )
+
+    result = find_asterisms(build_path, outer_pixels=[0, 1])
+
+    assert len(result) == 1
+    assert int(result["inner_pixel_count"][0]) == 3
+    assert int(result["representative_outer_pix"][0]) == 0
+    assert int(result["representative_asterism_id"][0]) == 7
+    assert np.isclose(float(result["winner_ee_resolved"][0]), (0.2 + 0.4 + 0.8) / 3.0)
+
+
+def test_find_asterisms_rejects_incomplete_outer_pixels(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=())
+
+    with pytest.raises(AsterismError, match="traversal is not done"):
+        find_asterisms(build_path, outer_pixels=0)
+
+
+def test_find_asterisms_rejects_missing_done_artifact(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+
+    with pytest.raises(AsterismError, match="outer artifact is missing"):
+        find_asterisms(build_path, outer_pixels=0)
+
+
+def test_find_asterisms_enforces_max_rows(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, 404, -1)),
+        winner_ids=(7, 8, -1, -1),
+    )
+
+    with pytest.raises(AsterismError, match="exceeding max_rows=1"):
+        find_asterisms(build_path, outer_pixels=0, max_rows=1)
+
+
+def test_find_asterisms_moc_selects_inner_winner_support(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, 404, -1)),
+        asterism_pixs=(3, 1),
+        winner_ids=(7, 8, -1, -1),
+    )
+    moc = _write_lookup_moc(tmp_path / "region.fits", level=1, pixs=[0])
+
+    result = find_asterisms(build_path, moc_file=moc)
+
+    assert len(result) == 1
+    assert int(result["representative_asterism_id"][0]) == 7
+    assert int(result["pix"][0]) == 3
+    assert int(result["inner_pixel_count"][0]) == 1
+    assert int(result["star1_source_id"][0]) == 101
+
+
+def test_find_asterisms_moc_aggregates_selected_support_only(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8, 9),
+        source_ids=((101, 202, -1), (202, 101, -1), (303, 404, -1)),
+        asterism_pixs=(3, 0, 1),
+        winner_ids=(7, 8, 9, 7),
+        winner_ee_resolved=(0.2, 0.4, 0.8, 1.0),
+        winner_ee_averaged=(0.3, 0.5, 0.9, 1.1),
+    )
+    moc = _write_lookup_moc(tmp_path / "region.fits", level=1, pixs=[0, 1])
+
+    result = find_asterisms(build_path, moc_file=moc)
+
+    assert len(result) == 1
+    assert int(result["representative_asterism_id"][0]) == 7
+    assert int(result["pix"][0]) == 3
+    assert int(result["inner_pixel_count"][0]) == 2
+    assert int(result["star1_source_id"][0]) == 101
+    assert int(result["star2_source_id"][0]) == 202
+    assert float(result["winner_ee_resolved"][0]) == pytest.approx(0.3)
+    assert float(result["winner_ee_averaged"][0]) == pytest.approx(0.4)
+    assert float(result["gaia_A0"][0]) == pytest.approx(0.15)
+
+
+def test_find_asterisms_moc_matches_equivalent_outer_pixel_region(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, 404, -1)),
+        winner_ids=(7, 8, -1, -1),
+    )
+    moc = _write_lookup_moc(tmp_path / "outer.fits", level=0, pixs=[0])
+
+    outer_result = find_asterisms(build_path, outer_pixels=0)
+    moc_result = find_asterisms(build_path, moc_file=moc)
+
+    assert set(
+        tuple(row)
+        for row in outer_result["global_asterism_id", "inner_pixel_count"].as_array()
+    ) == set(
+        tuple(row)
+        for row in moc_result["global_asterism_id", "inner_pixel_count"].as_array()
+    )
+
+
+def test_find_asterisms_moc_rejects_incomplete_intersecting_outer_pixels(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=())
+    moc = _write_lookup_moc(tmp_path / "outer.fits", level=0, pixs=[0])
+
+    with pytest.raises(AsterismError, match="traversal is not done"):
+        find_asterisms(build_path, moc_file=moc)
+
+
+def test_find_asterisms_filters_by_star_count(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, -1, -1), (202, 303, -1)),
+        winner_ids=(7, 8, -1, -1),
+    )
+
+    result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(min_num_stars=2),
+    )
+
+    assert len(result) == 1
+    assert int(result["representative_asterism_id"][0]) == 8
+    assert int(result["num_stars"][0]) == 2
+
+
+def test_find_asterisms_filters_by_member_magnitude(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, 404, -1)),
+        member_mags=((12.0, 13.0, -1.0), (12.0, 16.0, -1.0)),
+        winner_ids=(7, 8, -1, -1),
+    )
+
+    result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(max_member_mag=15.0),
+    )
+
+    assert len(result) == 1
+    assert int(result["representative_asterism_id"][0]) == 7
+
+
+def test_find_asterisms_filters_by_lookup_summary_fields(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, 404, -1)),
+        winner_ids=(7, 7, 8, -1),
+        winner_ee_resolved=(0.2, 0.4, 0.8, np.nan),
+        winner_ee_averaged=(0.3, 0.5, 0.9, np.nan),
+    )
+
+    count_result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(min_inner_pixel_count=2),
+    )
+    resolved_result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(min_winner_ee_resolved=0.7),
+    )
+    averaged_result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(min_winner_ee_averaged=0.8),
+    )
+    dust_result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(max_gaia_A0=0.2),
+    )
+
+    assert count_result["representative_asterism_id"].tolist() == [7]
+    assert resolved_result["representative_asterism_id"].tolist() == [8]
+    assert averaged_result["representative_asterism_id"].tolist() == [8]
+    assert dust_result["representative_asterism_id"].tolist() == [7]
+
+
+@pytest.mark.parametrize(
+    ("filters", "expected_ids"),
+    [
+        (AsterismLookupFilters(min_num_stars=3), [9]),
+        (AsterismLookupFilters(max_num_stars=1), [7]),
+        (AsterismLookupFilters(min_member_mag=15.0), [9]),
+        (AsterismLookupFilters(max_member_mag=14.0), [7, 8]),
+        (AsterismLookupFilters(min_inner_pixel_count=2), [8]),
+        (AsterismLookupFilters(max_inner_pixel_count=1), [7, 9]),
+        (AsterismLookupFilters(min_winner_ee_resolved=0.7), [9]),
+        (AsterismLookupFilters(max_winner_ee_resolved=0.3), [7]),
+        (AsterismLookupFilters(min_winner_ee_averaged=0.8), [9]),
+        (AsterismLookupFilters(max_winner_ee_averaged=0.4), [7]),
+        (AsterismLookupFilters(min_gaia_A0=0.3), [9]),
+        (AsterismLookupFilters(max_gaia_A0=0.15), [7]),
+    ],
+)
+def test_find_asterisms_filter_options_cover_each_bound(
+    tmp_path: Path,
+    filters: AsterismLookupFilters,
+    expected_ids: list[int],
+) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8, 9),
+        source_ids=((101, -1, -1), (202, 303, -1), (404, 505, 606)),
+        member_mags=((12.0, 99.0, 99.0), (13.0, 14.0, 99.0), (15.0, 16.0, 17.0)),
+        winner_ids=(7, 8, 8, 9),
+        winner_ee_resolved=(0.2, 0.4, 0.6, 0.8),
+        winner_ee_averaged=(0.3, 0.5, 0.7, 0.9),
+    )
+
+    result = find_asterisms(build_path, outer_pixels=0, filters=filters)
+
+    assert result["representative_asterism_id"].tolist() == expected_ids
+
+
+def test_find_asterisms_member_magnitude_filters_ignore_empty_slots(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8, 9),
+        source_ids=((101, -1, -1), (202, 303, -1), (404, -1, -1)),
+        member_mags=((12.0, 99.0, 99.0), (13.0, 16.0, 99.0), (16.0, 0.0, 0.0)),
+        winner_ids=(7, 8, 9, -1),
+    )
+
+    bright_result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(max_member_mag=15.0),
+    )
+    faint_result = find_asterisms(
+        build_path,
+        outer_pixels=0,
+        filters=AsterismLookupFilters(min_member_mag=15.0),
+    )
+
+    assert bright_result["representative_asterism_id"].tolist() == [7]
+    assert faint_result["representative_asterism_id"].tolist() == [9]
+
+
+def test_find_asterisms_applies_filters_to_moc_lookup(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, -1, -1), (202, 303, -1)),
+        winner_ids=(7, 8, -1, -1),
+    )
+    moc = _write_lookup_moc(tmp_path / "outer.fits", level=0, pixs=[0])
+
+    result = find_asterisms(
+        build_path,
+        moc_file=moc,
+        filters=AsterismLookupFilters(max_num_stars=1),
+    )
+
+    assert len(result) == 1
+    assert int(result["representative_asterism_id"][0]) == 7
+    assert int(result["num_stars"][0]) == 1
+
+
+def test_asterism_lookup_filters_validate_bounds() -> None:
+    with pytest.raises(AsterismError, match="min_num_stars must be at least 1"):
+        AsterismLookupFilters(min_num_stars=0)
+
+    with pytest.raises(AsterismError, match="max_num_stars must be at least 1"):
+        AsterismLookupFilters(max_num_stars=0)
+
+    with pytest.raises(AsterismError, match="min_inner_pixel_count must be at least 1"):
+        AsterismLookupFilters(min_inner_pixel_count=0)
+
+    with pytest.raises(AsterismError, match="max_inner_pixel_count must be at least 1"):
+        AsterismLookupFilters(max_inner_pixel_count=0)
+
+    with pytest.raises(AsterismError, match="min_num_stars cannot exceed"):
+        AsterismLookupFilters(min_num_stars=3, max_num_stars=2)
+
+    with pytest.raises(AsterismError, match="min_member_mag cannot exceed"):
+        AsterismLookupFilters(min_member_mag=15.0, max_member_mag=12.0)
+
+    with pytest.raises(AsterismError, match="min_inner_pixel_count cannot exceed"):
+        AsterismLookupFilters(min_inner_pixel_count=3, max_inner_pixel_count=2)
+
+    with pytest.raises(AsterismError, match="min_winner_ee_resolved cannot exceed"):
+        AsterismLookupFilters(min_winner_ee_resolved=0.8, max_winner_ee_resolved=0.7)
+
+    with pytest.raises(AsterismError, match="min_winner_ee_averaged cannot exceed"):
+        AsterismLookupFilters(min_winner_ee_averaged=0.8, max_winner_ee_averaged=0.7)
+
+    with pytest.raises(AsterismError, match="min_gaia_A0 cannot exceed"):
+        AsterismLookupFilters(min_gaia_A0=0.3, max_gaia_A0=0.2)

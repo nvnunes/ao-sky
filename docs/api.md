@@ -7,7 +7,8 @@ The supported public surface currently centers on:
 - `ao_sky.gaia` for canonical Gaia storage and proper-motion transforms
 - `ao_sky.dust` for Gaia TGE source validation and build-local A0 cache helpers
 - `ao_sky.spatial` for reusable non-plotting HEALPix helpers
-- `ao_sky.asterisms` for outer-pixel star assembly and in-memory search
+- `ao_sky.asterisms` for outer-pixel star assembly, retained-winner lookup,
+  and diagnostic in-memory candidate enumeration
 - `ao_sky.predict` for native prediction runtime records and array prediction helpers
 - `ao_sky.build` for persisted build roots, build state, and per-outer-pixel
   derived artifacts
@@ -134,6 +135,7 @@ The current package-supported spatial API exposes:
 The current package-supported asterism API exposes:
 
 - `AsterismError`
+- `AsterismLookupFilters`
 - `AsterismSearchOptions`
 - `AsterismSearchProfile`
 - `load_asterism_stars`
@@ -341,22 +343,38 @@ Behavior:
 - the default two-ring boundary provides edge completeness headroom before
   proper-motion shifting, so stars just outside the raw boundary can still
   contribute after epoch shifting
-- add the legacy empirical `R` magnitude used by the current asterism search
+- add the legacy empirical `R` magnitude still used by asterism candidate
+  construction
 - return Gaia-schema rows, optionally enriched with locality columns
 
-### `find_asterisms(stars, options) -> Table`
+### `find_asterisms(build_path, *, outer_pixels=None, moc_file=None, filters=None, max_rows=None) -> Table`
 
-Run the legacy-faithful in-memory asterism search over a prepared Gaia star
-table.
+Look up retained regularized winner asterisms from completed build artifacts.
 
+The current lookup supports explicit outer-pixel lookup and MOC-file region
+lookup.
 Behavior:
 
-- search brightness is fixed to the legacy empirical Gaia-derived `R`
-- supported star-count range is 1-3
-- output is a clean flat table with fixed `star1_*`/`star2_*`/`star3_*` slots
-- the table carries the temporary full legacy-comparison field set
+- read `build.h5` state and the requested per-outer-pixel `outer.h5` artifacts
+- require selected outer pixels to have `traversal_status == done`
+- when `moc_file` is supplied, select supporting inner pixels by testing
+  inner-pixel centers against the MOC
+- return only retained asterisms referenced by selected inner rows through
+  `winner_asterism_id`
+- deduplicate physical asterisms by sorted real member `source_id` set
+- add lookup provenance and support fields:
+  `global_asterism_id`, `representative_outer_pix`,
+  `representative_asterism_id`, `inner_pixel_count`,
+  `winner_ee_resolved`, `winner_ee_averaged`, and `gaia_A0`
+- report `winner_ee_resolved`, `winner_ee_averaged`, and `gaia_A0` as means
+  over inner pixels where the returned asterism is the retained winner
+- when `filters` is provided, apply star-count bounds, real member-star
+  magnitude bounds, `inner_pixel_count` bounds, and bounds on the lookup mean
+  fields
+- perform no Gaia loading, AO prediction, winner recomputation, artifact repair,
+  or persisted mutation
 
-Non-goals of the current Gaia API:
+Non-goals of the current asterism lookup API:
 
 - instrument-specific photometric proxies
 - repo-root config discovery
@@ -528,7 +546,7 @@ Return a human-readable build summary rendered from `inspect_build`.
 ```python
 from pathlib import Path
 
-from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
+from ao_sky.asterisms import load_asterism_stars
 from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig
 
 config = GaiaStoreConfig(
@@ -540,12 +558,9 @@ store = GaiaHealpixStore(config)
 
 filename = store.healpix_filename(outer_pix=0)
 stars = load_asterism_stars(store, outer_pix=0, neighbour_level=7, epoch=2016.0)
-asterisms = find_asterisms(stars, AsterismSearchOptions(min_stars=1, max_stars=3))
-
 print(filename)
 print(stars.colnames)
-print(asterisms.colnames)
-print(len(asterisms))
+print(len(stars))
 ```
 
 ## Reference

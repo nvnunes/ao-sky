@@ -499,7 +499,8 @@ Measured optimization decisions retained from Phase 13:
 
 Status: complete. The traversal algorithm, dense-field NGS control, prediction
 policy, memory guard, dynamic scheduler, benchmark evidence, and documentation
-are complete. Phase 15 is the next active validation phase.
+are complete. Phase 15 is complete, and the next active migration phase is
+Phase 16.
 
 Implemented algorithm:
 
@@ -621,36 +622,34 @@ Notes for Phase 15:
 - Treat the RAM model as conservative and machine-specific; use the parent
   guard as the live safety mechanism.
 
-### Phase 15: Validate Partial-Sky Aggregation And Maps
+### Phase 15: Validate All-Sky Aggregation And Maps
+
+Status: complete. The retained `v1` build reached full-sky aggregation, the
+first all-sky physical validation pass is recorded in `docs/validation.md` and
+the retained validation entries, and the Phase 15 closeout decisions have been
+made.
 
 - Treat this phase as the first physical-validation layer after the Phase 14
-  algorithm works mechanically. Use the partial `v1` artifacts already produced
-  under `/Volumes/Data/Galaxy/aosky/gnao-baseline/v1` as the validation source.
-- Keep the live `v1` build read-only during this phase. Use
+  algorithm works mechanically.
+- Keep the live `v1` build read-only during validation work. Use
   `traversal_status == done` as the authoritative completed-pixel set, ignore
   stale `running` rows, and treat extra `outer.h5` files without done state as
-  non-authoritative.
+  non-authoritative when partial validation support is needed.
 - Organize the work as passes so each layer can be reviewed before continuing:
-  - Pass 1: Partial Aggregation
-    - Add a validation-only partial aggregation script that reads completed
-      outer pixels from `build.h5`, verifies expected `outer.h5` artifacts,
-      reports missing done artifacts and extra non-done artifacts, and writes
-      validation copies of `maps-hpx6.h5` through `maps-hpx9.h5` outside the
-      `v1` build root.
-    - Default outputs under
-      `/Volumes/Data/Galaxy/aosky/gnao-baseline/phase15-validation/partial-v1-20260419`.
-    - Include a machine-readable summary with state counts, levels written,
-      finite-cell counts, field ranges, and artifact discrepancies.
+  - Pass 1: Aggregation Support
+    - Support validation against completed-pixel map artifacts while the build
+      is still in flight.
+    - This pass was primarily partial-sky support work during the `v1` run and
+      is now superseded by the completed all-sky `v1` aggregation.
   - Pass 2: Aggregated Map Plotting Capability
-    - Add an `ao-sky` plotting capability that can render the validation
+    - Add an `ao-sky` plotting capability that can render native
       `maps-hpx*.h5` artifacts and future production map artifacts with the
       same code path.
     - Bring across the useful plotting ideas from `survey_tools` without
       preserving the legacy compatibility surface: use `skyproj` and Matplotlib
       for static all-sky HEALPix figures, read native `ao-sky` map HDF5
-      artifacts directly, support explicit field and level selection, and
-      provide a phase-prefixed script backed by an internal reusable plotting
-      module.
+      artifacts directly, support explicit field and level selection, and back
+      the retained validation recipe with an internal reusable plotting module.
     - Keep the plotter artifact-oriented rather than build-root-oriented. It
       should accept either a map artifact or a directory containing
       `maps-hpx*.h5`, preserve nested HEALPix semantics, expose basic controls
@@ -662,30 +661,17 @@ Notes for Phase 15:
       dictionaries unless a later validation task proves one of those features
       is still needed.
   - Pass 3: Aggregated Map Validation
-    - Validate the partial aggregated maps for schema, dimensions, readable
-      compression, missing-region behavior, and level-reduction correctness.
+    - Validate aggregated maps for schema, dimensions, readable compression,
+      missing-region behavior where relevant, and level-reduction correctness.
     - Compare sampled aggregated cells against direct reductions from source
       `outer.h5` inner tables.
     - Summarize physical ranges and distributions for `winner_ee_averaged`,
       `winner_ee_resolved`, `best_ee`, `coverage_*`, `star_count`, `ngs_count`,
-      and `gaia_A0`, and produce initial diagnostic plots for aggregated map
+      and `gaia_A0`, and produce retained diagnostic plots for aggregated map
       levels where useful.
-    - Start `docs/validation.md` and use it as the running validation record
-      for dated findings, commands, output roots, retained plots, open
-      questions, and decisions. Add it to the docs navigation when it is
-      created.
-  - Pass 4: Local Value Validation
-    - Plot local areas and check whether the values are physically reasonable.
-    - Plot values for deep fields including RMS roughness measure.
-  - Pass 5: Legacy Sanity Checks
-    - Compare against legacy outputs only as a physical sanity reference, not
-      as a parity target.
-    - Use existing saved-artifact comparison helpers first, and add small helper
-      scripts only when an ad hoc check becomes reusable.
-    - Focus on obvious physical issues in the partial maps: boundary
-      discontinuities, over-smoothed regions, isolated winner speckles,
-      excessive fallback to 1-star asterisms, implausible dense-field behavior,
-      and unexpected dust/star-density structure.
+    - Use `docs/validation.md` as the running validation record and retain
+      dated validation entries, commands, plots, summaries, and conclusions
+      there.
 - Use `resolved` for inner-pixel-center diagnostics and `averaged` for
   field-of-view mean diagnostics; continue to ignore rotation/orientation.
 - Treat dust and stellar-density cuts as later field-selection policy, not as
@@ -694,120 +680,156 @@ Notes for Phase 15:
   with benchmark-sensitive runtime evidence kept in
   `docs/benchmarking.md`. Update
   [`algorithms.md`](algorithms.md) only when physical-policy decisions change.
-- At Phase 15 closeout, decide whether the validation scripts should remain
-  phase-prefixed one-off tools, be renamed for long-term script use, or be
-  integrated into the supported CLI surface.
+- Phase 15 closeout decision: keep the retained validation scripts where they
+  are rather than renaming or promoting them into the supported CLI surface at
+  this stage.
 - Keep this phase separate from Phase 14 so "the algorithm runs" does not get
-  confused with "the partial-sky maps aggregate and look physically sane."
+  confused with "the all-sky maps aggregate and look physically sane."
 
-### Phase 16: Build Inner-Pixel And Field Validation Metrics
+### Phase 16: Minimal Build Inspection
 
-- Build the higher-level AO validation products after Phase 15 establishes that
-  partial aggregation and first-pass map sanity checks are sound.
-- Treat `winner_ee_averaged` as the primary coverage and uniformity metric;
-  use `winner_ee_resolved` and raw `best_*` fields as diagnostics for
-  point-performance behavior.
-- Pass 1: add scripts that stream completed `outer.h5` artifacts directly and
-  compute AO coverage curves, AO uniformity, and prototype AO spatial coherence
-  from inner-pixel data. Do not derive primary metrics from aggregated
-  level-9 map means.
-- Compute AO coverage curves as area fractions of finite `winner_ee_averaged`
-  inner pixels above threshold, with resolved coverage curves retained as
-  diagnostics.
-- Compute AO uniformity from `winner_ee_averaged` using the Phase 15/16
-  retained definition, guarding against missing or unstable median values.
-- Compute prototype AO spatial coherence with sampled inner-pixel two-point
-  autocorrelation and report the separation where correlation first falls to
-  `0.5`, along with enough diagnostics to identify noisy or invalid estimates.
-- Produce machine-readable summaries and plots such as inner-metric summaries,
-  per-outer-pixel metric tables, coverage-curve CSVs, coherence-sample CSVs,
-  and selected benchmark figures worth retaining with the benchmark record.
-- Pass 2: add field/MOC metric scripts that compute statistics directly from
-  inner pixels whose centers fall inside supplied MOC footprints. Do not
-  average precomputed outer-pixel summaries for science fields that are not
-  aligned with outer HEALPix pixels.
-- Field/MOC scripts should support one or more named MOC inputs, use completed
-  outer pixels only, and report footprint completeness as both inner-pixel count
-  and fraction of the requested MOC footprint covered by completed artifacts.
-- For each field, compute coverage curves, resolved diagnostic curves,
-  uniformity, sampled spatial coherence when enough finite pixels exist, and
-  summary distributions for `best_ee`, `winner_ee_resolved`,
-  `winner_ee_averaged`, `star_count`, `ngs_count`, and `gaia_A0`.
-- Use configured survey/field MOCs already snapshotted in `v1/surveys` as the
-  first real field inputs, then support explicitly supplied ad hoc science-field
-  MOCs.
-- Document metric definitions, command examples, output locations, sanity-check
-  findings, and retained plots in `docs/validation.md`.
-- Use the metric evidence to decide whether to continue the build unchanged,
-  run targeted policy sweeps, or investigate a specific physical issue.
+Status: complete. The build-inspection API and richer `ao-sky show` output are
+implemented.
 
-### Phase 17: Modernize Public `find_asterisms`
+- Replace the broader provenance and validation-support idea with a narrow
+  build-inspection layer that is enough for downstream adoption.
+- Add a structured `inspect_build(build_path)` API that reads existing build
+  metadata and checks expected top-level artifacts without mutating the build.
+- Report build path, status, current stage, stage work counts, lineage, Gaia
+  release, HEALPix levels, runtime config paths, persisted roots, model manifest
+  presence, survey manifest presence, configured survey overlays, expected map
+  artifact presence, and missing-artifact problems.
+- Render `ao-sky show` from the structured inspection API and use user-facing
+  `stage` wording while keeping persisted `current_phase` internals unchanged.
+- Do not create a new provenance manifest, compare builds, define a validation
+  workspace, scan every per-outer-pixel artifact, repair missing artifacts, or
+  add new CLI flags in this phase.
 
-- Modernize the public `ao_sky.asterisms.find_asterisms` implementation after
-  Phases 15 and 16 have established physically credible Traversal candidate
-  behavior.
-- Keep exact enumeration as the default public behavior so existing callers that
-  expect all valid combinations are not surprised.
-- Add an explicit bounded-search option only if the public API contract can name
-  the behavior clearly, including whether the returned table is exact or
-  budgeted.
-- Reuse or extract the Phase 14 candidate-count and close-pair graph primitives
-  where they fit, so public asterism search and Traversal candidate generation
-  do not drift unnecessarily.
-- Consider adaptive brighter-star subset budgeting for dense public search
-  calls: sort by sensing magnitude and source ID, respect magnitude tie groups,
-  estimate enabled 1-, 2-, and 3-star counts, and reduce the effective faint
-  limit when a caller-provided candidate budget would otherwise be exceeded.
-- Consider an internal streaming/chunked candidate-construction path to reduce
-  peak memory while preserving the table-returning public API.
-- Preserve the current output schema unless this phase explicitly defines a
-  versioned public API change.
-- Keep winner selection, bright-star masking, regularization, and AO model
-  prediction out of `find_asterisms`; those remain build Traversal policy.
-- Do not make build Traversal depend on the public `find_asterisms` API again.
-  Shared lower-level graph/counting utilities are acceptable; the high-level
-  build path should remain winner-map-first and streaming.
-- Validate the modernized API with existing exact-search tests, dense synthetic
-  fields, budgeted-search tests, deterministic tie handling, and memory
-  benchmarks.
+### Phase 17: Build-Artifact Asterism Lookup
+
+Status: complete. The public `find_asterisms` API now reads retained winner
+asterisms from completed build artifacts, supports outer-pixel and MOC
+selectors, applies artifact-backed filters, and has synthetic contract coverage
+for lookup semantics.
+
+- Reframe the public `ao_sky.asterisms.find_asterisms` surface as a read-only
+  lookup over completed `ao-sky` build artifacts rather than as a fresh full
+  candidate-enumeration routine.
+- Treat Traversal's persisted regularized winners as the authoritative
+  asterism source. `find_asterisms` should return selected winner asterisms for
+  a caller-defined sky patch, not the full overlapping candidate universe that
+  existed before winner selection.
+- Keep exact full enumeration out of the primary public lookup path. Retain or
+  extract lower-level candidate graph helpers only where they remain useful for
+  tests, diagnostics, or future recomputation work.
+- Define a patch selector contract for lookup. The first implementation should
+  support build-local outer pixels and completed-pixel subsets; support for MOC
+  footprints, named survey overlays, sky circles, or polygons can layer on top
+  of the same selector contract when needed.
+- Add a shared asterism filter contract used by both lookup and export. It
+  should support filtering by star count, real member-star magnitude, retained
+  winner inner-pixel support count, and retained winner lookup mean fields.
+- Keep filters artifact-backed and explicit. Do not require live AO prediction,
+  Gaia reloading, or recomputation to evaluate normal lookup filters.
+- Resolve duplicate physical asterisms by sorted member `source_id` set when a
+  lookup spans multiple outer pixels. Preserve enough provenance to identify
+  which build outer pixels and inner-pixel winners referenced each returned
+  asterism.
+- Define catalog-facing asterism identity separately from per-outer-pixel
+  `asterism_id`. Local `winner_asterism_id` values remain artifact-local
+  references, not global identifiers.
+- Let the table-returning `find_asterisms` API materialize bounded query
+  results. Streaming whole-sky traversal belongs to the export path.
+- Keep the lookup read-only. It must not repair, recompute, regularize,
+  aggregate, or mutate build artifacts.
+- Organize the work as passes:
+  - Pass 1: Outer-Pixel Lookup
+    - Support explicit build-local outer-pixel selections.
+    - Read `build.h5` state and one `outer.h5` artifact at a time.
+    - Include only retained asterisms referenced by selected inner rows through
+      `winner_asterism_id`.
+    - Deduplicate materialized results by sorted real member `source_id` set.
+    - Add lookup provenance and support fields: representative local IDs,
+      `inner_pixel_count`, mean `winner_ee_resolved`, mean
+      `winner_ee_averaged`, and mean `gaia_A0` over inner pixels where the
+      returned asterism is the retained winner.
+  - Pass 2: MOC Region Lookup
+    - Support arbitrary sky regions from supplied MOC files.
+    - Derive intersecting outer pixels from the MOC at the build outer level.
+    - Within each intersecting outer pixel, select only inner-pixel centers
+      inside the MOC.
+    - Include retained asterisms that win at least one selected inner pixel,
+      even when the asterism center itself lies outside the MOC.
+  - Pass 3: Lookup Filters
+    - Add a shared asterism filter contract for both lookup and export.
+    - Support star-count, real member-star magnitude, `inner_pixel_count`,
+      `winner_ee_resolved`, `winner_ee_averaged`, and `gaia_A0` filters.
+    - Keep filter semantics reusable by Phase 18 export so interactive lookup
+      and export agree.
+  - Pass 4: Synthetic Contract Coverage
+    - Keep this pass focused on unit-test coverage for lookup semantics, not
+      real-sky validation or build-output acceptance.
+    - Use synthetic build artifacts to verify MOC patch selection. Assert that
+      only asterisms supported by selected inner pixels are returned, duplicate
+      physical asterisms collapse by member `source_id` set, and lookup mean
+      fields are aggregated over the selected retained-winner support.
+    - Ensure testing coverage for every supported filter option: star count,
+      real member-star magnitude, `inner_pixel_count`,
+      `winner_ee_resolved`, `winner_ee_averaged`, and `gaia_A0`.
+    - Do not require a validation-log entry for this pass unless later
+      real-data acceptance checks or science-facing claims are added.
+- Validate lookup with single-outer-pixel queries, multi-pixel duplicate
+  deduplication, incomplete build-state handling, MOC patch selection, shared
+  filters, and bounded materialization behavior.
 
 ### Phase 18: Rebuild The Asterism Catalog Export Path
 
-- Rebuild the asterism catalog export workflow on top of the richer `ao-sky`
-  build products rather than the legacy `aomap` export path.
-- Resolve duplicate physical winning-asterism records before catalog export.
-  The same sorted member-`source_id` set can currently be retained in multiple
-  neighbouring `outer.h5` artifacts with different local `asterism_id` values.
-- Define the catalog-facing asterism identity and ownership contract so
-  per-outer-pixel `winner_asterism_id` values are not mistaken for globally
-  unique catalog identifiers.
-- Resolve cross-outer-pixel winner regularization before catalog export. The
-  current local regularizer clips neighbour support at outer-pixel boundaries
-  and cannot recognize the same physical asterism across neighbouring outer
-  pixels.
-- Add export-oriented asterism-side fields such as `Av` there, rather than
-  carrying them in the core build `asterisms` artifact.
-- Define which richer asterism-side fields belong in exported catalogs versus
-  remaining transient model-prediction context.
-- Add validation cases for duplicate cross-outer retained asterisms and
-  boundary-spanning regularization before accepting exported catalogs.
-- Validate exported catalogs against the intended downstream use cases before
-  compatibility adoption proceeds.
+- Rebuild the asterism catalog export workflow on top of the Phase 17
+  build-artifact lookup layer rather than the legacy `aomap` export path.
+- Export regularized winner asterisms only. Do not export the full candidate
+  enumeration unless a later diagnostic export mode explicitly requests it.
+- Provide the streaming traversal layer for retained winner asterisms in the
+  export path. Whole-sky export must not first load all retained asterisms into
+  memory.
+- Use the same patch selector and filter contract as `find_asterisms`, so
+  export and interactive lookup agree for magnitude cuts, star-count cuts,
+  inner-pixel support cuts, and retained winner mean-field cuts.
+- Write catalog rows incrementally. Deduplicate physical asterisms by global
+  member-`source_id` key while retaining compact provenance such as contributing
+  outer pixels, winner support counts, mean `winner_ee_resolved`, mean
+  `winner_ee_averaged`, and mean `gaia_A0`.
+- Define which asterism-side fields belong in exported catalogs versus staying
+  transient or artifact-local. Add export-oriented fields such as `Av` only
+  when they can be read from build artifacts or derived from build-persisted
+  fields without live recomputation.
+- Keep export restartable or chunk-addressable enough for large regions and
+  whole-sky runs. A failed export should not require re-reading successful
+  chunks when the output format can support resumable writes.
+- Validate export against the Phase 17 lookup results for sampled regions,
+  duplicate cross-outer retained asterisms, filters, whole-sky streaming memory
+  behavior, and the intended downstream catalog use cases before compatibility
+  adoption proceeds.
 
-### Phase 19: Define The WFS Photometric Proxy Layer
+### Phase 19: Compatibility Adoption And Handoff
 
-- Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
-  AO-system-specific photometric products.
-- Continue using the current legacy empirical Gaia-derived `R` estimate as the
-  interim asterism-search input until this phase replaces it.
-- Define AO-system-aware derived photometry on top of loaded Gaia stars rather
-  than inside the canonical Gaia store.
-- Support transient sensing-band outputs, including photon-rate proxies and
-  magnitude-like proxies where useful to downstream consumers.
-- Decide how Gaia XP synthetic photometry, empirical Gaia-to-band transforms,
-  and flux-space combinations fit behind one interface.
-- Define uncertainty handling and the downstream contract for asterism-building
-  and AO-simulation consumers.
+- Move downstream consumers from the legacy implementation to `ao-sky` through
+  explicit compatibility adapters and a final cleanup pass.
+- Organize the work as passes:
+  - Pass 1: `survey_tools` Adapters
+    - Add thin `survey_tools` adapters that call `ao-sky` public APIs.
+    - Keep pinned legacy assets readable through explicit compatibility paths.
+  - Pass 2: `girmos-aosims` Adoption
+    - Add the downstream adoption work needed for `girmos-aosims` to consume the
+      new `ao-sky` build and photometric surfaces cleanly.
+    - Repoint downstream consumers incrementally across both `survey_tools` and
+      `girmos-aosims`.
+  - Pass 3: Deduplication And Final Handoff
+    - Remove the superseded legacy implementation from `survey_tools`.
+    - Retain only the compatibility surface that is still worth carrying.
+    - Decide whether remaining legacy asset readers stay in `survey_tools` or
+      move to a dedicated compatibility namespace.
+- Avoid deleting legacy code until the new path is documented, tested, and used
+  in practice.
 
 ### Phase 20: Upgrade Prediction Model Ordering Contract
 
@@ -835,48 +857,65 @@ Notes for Phase 15:
   contract as development/validation inputs only until production models are
   retrained or validated under the `ao-sky` ordering contract.
 
-### Phase 21: Add Build Provenance, Introspection, And Validation Support
+### Phase 21: Introduce Coverage Curves And AO Uniformity
 
-- Add a build-root provenance manifest that summarizes existing authoritative
-  metadata rather than replacing `build.h5`, `build.yaml`, Gaia
-  summaries, model manifests, map artifacts, or overlay datasets as sources of
-  truth.
-- Include enough manifest detail to audit and compare builds:
-  runtime-config path and content hash, merged build-config content hash, package
-  version or code identity, Gaia release and level, Gaia summary path, dust
-  dataset identity, model snapshot manifest, map levels, survey overlays, and
-  implemented build phase completion.
-- Add build introspection commands or APIs that can list available builds,
-  inspect one build's provenance and artifact completeness, and compare two
-  builds for meaningful policy, model, input, and artifact differences.
-- Keep introspection read-only and contract-focused; do not add implicit
-  migration, repair, or rebuild behavior to these commands.
-- Define a lightweight science-validation workspace and toolkit for comparing
-  important build outputs before compatibility adoption.
-- Standardize representative sample pixels, low-density smoke samples, map
-  comparison summaries, and human-inspection outputs so algorithm-changing
-  phases can be reviewed consistently.
-- Use this phase to make post-legacy comparisons reproducible after the
-  winner-algorithm and photometric-proxy phases intentionally move beyond exact
-  legacy parity.
+- Build the higher-level AO validation products for coverage curves, AO
+  uniformity, and related field metrics after the earlier migration and
+  validation phases have established that the map products are stable enough to
+  support this additional analysis.
+- Treat `winner_ee_averaged` as the primary coverage and uniformity metric;
+  use `winner_ee_resolved` and raw `best_*` fields as diagnostics for
+  point-performance behavior.
+- Pass 1: add scripts that stream completed `outer.h5` artifacts directly and
+  compute AO coverage curves, AO uniformity, and prototype AO spatial coherence
+  from inner-pixel data. Do not derive primary metrics from aggregated
+  level-9 map means.
+- Compute AO coverage curves as area fractions of finite `winner_ee_averaged`
+  inner pixels above threshold, with resolved coverage curves retained as
+  diagnostics.
+- Compute AO uniformity from `winner_ee_averaged` using the retained
+  validation definition, guarding against missing or unstable median values.
+- Compute prototype AO spatial coherence with sampled inner-pixel two-point
+  autocorrelation and report the separation where correlation first falls to
+  `0.5`, along with enough diagnostics to identify noisy or invalid estimates.
+- Produce machine-readable summaries and plots such as inner-metric summaries,
+  per-outer-pixel metric tables, coverage-curve CSVs, coherence-sample CSVs,
+  and selected benchmark figures worth retaining with the benchmark record.
+- Pass 2: add field/MOC metric scripts that compute statistics directly from
+  inner pixels whose centers fall inside supplied MOC footprints. Do not
+  average precomputed outer-pixel summaries for science fields that are not
+  aligned with outer HEALPix pixels.
+- Field/MOC scripts should support one or more named MOC inputs, use completed
+  outer pixels only, and report footprint completeness as both inner-pixel count
+  and fraction of the requested MOC footprint covered by completed artifacts.
+- For each field, compute coverage curves, resolved diagnostic curves,
+  uniformity, sampled spatial coherence when enough finite pixels exist, and
+  summary distributions for `best_ee`, `winner_ee_resolved`,
+  `winner_ee_averaged`, `star_count`, `ngs_count`, and `gaia_A0`.
+- Use configured survey/field MOCs already snapshotted in `v1/surveys` as the
+  first real field inputs, then support explicitly supplied ad hoc science-field
+  MOCs.
+- Document metric definitions, command examples, output locations, sanity-check
+  findings, and retained plots in `docs/validation.md`.
+- Use the metric evidence to decide whether to continue the build unchanged,
+  run targeted policy sweeps, or investigate a specific physical issue.
 
-### Phase 22: Compatibility Adoption In `survey_tools` And `girmos-aosims`
+### Phase 22: Define The WFS Photometric Proxy Layer
 
-- Add thin `survey_tools` adapters that call `ao-sky` public APIs.
-- Add the downstream adoption work needed for `girmos-aosims` to consume the
-  new `ao-sky` build and photometric surfaces cleanly.
-- Keep pinned legacy assets readable through explicit compatibility paths.
-- Repoint downstream consumers incrementally across both `survey_tools` and
-  `girmos-aosims`.
-- Avoid deleting legacy code until the new path is documented, tested, and used
-  in practice.
-
-### Phase 23: Deduplication And Final Handoff
-
-- Remove the superseded legacy implementation from `survey_tools`.
-- Retain only the compatibility surface that is still worth carrying.
-- Decide whether remaining legacy asset readers stay in `survey_tools` or move
-  to a dedicated compatibility namespace.
+- Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
+  AO-system-specific photometric products.
+- Use [`wfs-bands-plan.md`](wfs-bands-plan.md) as the current planning note for
+  instrument-specific WFS sensing-band proxy decisions.
+- Continue using the current legacy empirical Gaia-derived `R` estimate as the
+  interim asterism-search input until this phase replaces it.
+- Define AO-system-aware derived photometry on top of loaded Gaia stars rather
+  than inside the canonical Gaia store.
+- Support transient sensing-band outputs, including photon-rate proxies and
+  magnitude-like proxies where useful to downstream consumers.
+- Decide how Gaia XP synthetic photometry, empirical Gaia-to-band transforms,
+  and flux-space combinations fit behind one interface.
+- Define uncertainty handling and the downstream contract for asterism-building
+  and AO-simulation consumers.
 
 ## Compatibility Strategy
 

@@ -30,8 +30,8 @@ class AsterismSearchOptions:
         max_single_star_radius_arcsec: Radius used for one-star asterisms.
 
     Raises:
-        AsterismError: If the requested search options are outside the Phase 2
-            1-3 star search contract.
+        AsterismError: If the requested search options are outside the legacy
+            1-3 star in-memory construction contract.
     """
 
     min_stars: int = 1
@@ -48,7 +48,7 @@ class AsterismSearchOptions:
         max_single_star_radius = float(self.max_single_star_radius_arcsec)
 
         if min_stars < 1 or max_stars > 3 or min_stars > max_stars:
-            raise AsterismError("Phase 2 asterism search supports only 1-3 stars")
+            raise AsterismError("asterism search supports only 1-3 stars")
         if min_separation < 0.0:
             raise AsterismError("min_separation_arcsec must be non-negative")
         if max_separation <= 0.0:
@@ -153,7 +153,7 @@ def _require_search_columns(stars: Table) -> Table:
     missing = [name for name in required if name not in stars.colnames]
     if missing:
         raise AsterismError(
-            "find_asterisms requires columns: " + ", ".join(required)
+            "_enumerate_asterism_candidates requires columns: " + ", ".join(required)
         )
     return stars
 
@@ -438,20 +438,24 @@ def _add_asterism(
     buffer.separation_arcsec[-1][row_idx] = separation
 
 
-# Public search
+# Legacy exact candidate enumeration
 
-def find_asterisms(
+# Retained for regression tests only. The supported public `find_asterisms` API
+# now reads retained winners from build artifacts instead of running this path.
+
+
+def _enumerate_asterism_candidates(
     stars: Table,
     options: AsterismSearchOptions,
     *,
     verbose: bool = False,
     profile: AsterismSearchProfile | None = None,
 ) -> Table:
-    """Return all asterisms found in a prepared Gaia star table.
+    """Return all candidate asterisms found in a prepared Gaia star table.
 
-    The implementation deliberately follows the legacy `survey_tools`
-    search/deduping strategy before later optimization work. Search brightness
-    is fixed to the legacy empirical Gaia-derived ``R`` magnitude.
+    This diagnostic helper preserves the exact in-memory candidate enumeration
+    path that originally backed public ``find_asterisms``. Search brightness is
+    fixed to the empirical Gaia-derived ``R`` magnitude.
 
     Args:
         stars: Prepared Gaia rows to search.
