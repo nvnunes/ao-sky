@@ -41,6 +41,15 @@ class _LookupAccumulator:
 
 
 @dataclass(frozen=True, slots=True)
+class _LookupObservation:
+    outer_pix: int
+    local_asterism_id: int
+    key: tuple[int, ...]
+    representative: dict[str, object]
+    support: Table
+
+
+@dataclass(frozen=True, slots=True)
 class AsterismLookupFilters:
     """Filters for retained-winner asterism lookup.
 
@@ -272,6 +281,50 @@ def _lookup_outer_pixel_asterisms(
     max_outer_pix = len(state) - 1
     accumulators: dict[tuple[int, ...], _LookupAccumulator] = {}
 
+    for observation in _iter_lookup_observations(
+        build_path,
+        outer_pixels,
+        inner_selector=inner_selector,
+        filters=filters,
+        definition=definition,
+        state=state,
+    ):
+        accumulator = accumulators.get(observation.key)
+        if accumulator is None:
+            accumulator = _LookupAccumulator(
+                representative=observation.representative,
+                representative_outer_pix=int(observation.outer_pix),
+                representative_asterism_id=int(observation.local_asterism_id),
+            )
+            accumulators[observation.key] = accumulator
+        _record_support(accumulator, support=observation.support)
+
+    rows: list[dict[str, object]] = []
+    for global_asterism_id, key in enumerate(sorted(accumulators), start=1):
+        accumulator = accumulators[key]
+        row = _accumulator_to_row(accumulator, global_asterism_id)
+        if _passes_lookup_metric_filters(row, filters):
+            rows.append(row)
+    for global_asterism_id, row in enumerate(rows, start=1):
+        row["global_asterism_id"] = int(global_asterism_id)
+    return rows
+
+
+def _iter_lookup_observations(
+    build_path: Path,
+    outer_pixels: tuple[int, ...],
+    *,
+    inner_selector=None,
+    filters: AsterismLookupFilters | None = None,
+    definition=None,
+    state: Table | None = None,
+):
+    if definition is None:
+        definition = load_build_definition(build_path)
+    if state is None:
+        state = load_state(build_path)
+    max_outer_pix = len(state) - 1
+
     for outer_pix in outer_pixels:
         if outer_pix > max_outer_pix:
             raise AsterismError(
@@ -318,25 +371,13 @@ def _lookup_outer_pixel_asterisms(
             key = _real_member_source_ids(representative)
             if not key:
                 continue
-            accumulator = accumulators.get(key)
-            if accumulator is None:
-                accumulator = _LookupAccumulator(
-                    representative=representative,
-                    representative_outer_pix=int(outer_pix),
-                    representative_asterism_id=local_id,
-                )
-                accumulators[key] = accumulator
-            _record_support(accumulator, support=support)
-
-    rows: list[dict[str, object]] = []
-    for global_asterism_id, key in enumerate(sorted(accumulators), start=1):
-        accumulator = accumulators[key]
-        row = _accumulator_to_row(accumulator, global_asterism_id)
-        if _passes_lookup_metric_filters(row, filters):
-            rows.append(row)
-    for global_asterism_id, row in enumerate(rows, start=1):
-        row["global_asterism_id"] = int(global_asterism_id)
-    return rows
+            yield _LookupObservation(
+                outer_pix=int(outer_pix),
+                local_asterism_id=local_id,
+                key=key,
+                representative=representative,
+                support=support,
+            )
 
 
 def _make_moc_inner_selector(moc, *, inner_level: int):

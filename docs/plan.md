@@ -784,33 +784,96 @@ for lookup semantics.
 
 ### Phase 18: Rebuild The Asterism Catalog Export Path
 
+Status: completed. The Python export API is implemented with HDF5/FITS output,
+catalog-level `asterism_id` assignment, `chunk_count` output chunking, shared
+lookup filters/selectors, and unit coverage for the export contract.
+
 - Rebuild the asterism catalog export workflow on top of the Phase 17
   build-artifact lookup layer rather than the legacy `aomap` export path.
-- Export regularized winner asterisms only. Do not export the full candidate
-  enumeration unless a later diagnostic export mode explicitly requests it.
-- Provide the streaming traversal layer for retained winner asterisms in the
-  export path. Whole-sky export must not first load all retained asterisms into
-  memory.
-- Use the same patch selector and filter contract as `find_asterisms`, so
-  export and interactive lookup agree for magnitude cuts, star-count cuts,
-  inner-pixel support cuts, and retained winner mean-field cuts.
-- Write catalog rows incrementally. Deduplicate physical asterisms by global
-  member-`source_id` key while retaining compact provenance such as contributing
-  outer pixels, winner support counts, mean `winner_ee_resolved`, mean
-  `winner_ee_averaged`, and mean `gaia_A0`.
-- Define which asterism-side fields belong in exported catalogs versus staying
-  transient or artifact-local. Add export-oriented fields such as `Av` only
-  when they can be read from build artifacts or derived from build-persisted
-  fields without live recomputation.
-- Keep export restartable or chunk-addressable enough for large regions and
-  whole-sky runs. A failed export should not require re-reading successful
-  chunks when the output format can support resumable writes.
-- Validate export against the Phase 17 lookup results for sampled regions,
-  duplicate cross-outer retained asterisms, filters, whole-sky streaming memory
-  behavior, and the intended downstream catalog use cases before compatibility
-  adoption proceeds.
+- Export retained regularized winner asterisms only. Do not export the full
+  candidate enumeration unless a later diagnostic export mode explicitly
+  requests it.
+- Keep this phase Python-API only. Do not add a CLI command yet.
+- Organize the work as passes:
+  - Pass 1: Catalog Export API
+    - Status: completed.
+    - Add `export_asterisms(build_path, output_path, *, format="hdf5",
+      outer_pixels=None, moc_file=None, filters=None, overwrite=False,
+      chunk_count=1) -> AsterismExportSummary`.
+    - Support `hdf5` and `fits` output. Each call writes one format.
+    - Use `chunk_count` as the final catalog chunking control. Chunks are
+      contiguous ranges of exported `asterism_id`, not sky partitions. Do not
+      write empty chunks.
+    - Default to `chunk_count=1`, which produces one globally deduplicated
+      catalog table for the selected export.
+    - Default to all traversal-done outer pixels when neither `outer_pixels`
+      nor `moc_file` is supplied.
+    - Use the same selector and filter contract as `find_asterisms`, so export
+      and interactive lookup agree for magnitude cuts, star-count cuts,
+      inner-pixel support cuts, and retained winner mean-field cuts.
+    - Define a unique exported asterism by its real Gaia member stars: sort real
+      member `source_id` values, ignore `-1` empty slots, and treat the same
+      stars in a different order as the same asterism.
+    - Assign exported `asterism_id` values by first-seen build stream order:
+      selected outer pixels sorted ascending, then local retained asterism rows
+      in artifact order. Later duplicate occurrences aggregate into the same
+      exported row.
+    - Aggregate support fields across all selected inner pixels where that
+      physical asterism is the retained winner, even when support comes from
+      different outer pixels. `inner_pixel_count` is the total selected support
+      count; `winner_ee_resolved`, `winner_ee_averaged`, and `gaia_A0` are
+      means over those selected support pixels.
+    - Export catalog-facing fields only: `asterism_id`, `outer_pix`, retained
+      asterism center/member fields except artifact-local `pix`,
+      `inner_pixel_count`, `winner_ee_resolved`, `winner_ee_averaged`, and
+      `gaia_A0`.
+    - Do not export lookup-internal identifiers such as `global_asterism_id`,
+      `representative_outer_pix`, or `representative_asterism_id`.
+    - Do not add `Av` or other derived export-only fields yet.
+    - Use temporary implementation-internal partitions keyed by member-source
+      tuple if needed to keep exact deduplication memory bounded. These
+      partitions are not part of the public chunking model.
+    - For HDF5, write one output file with metadata plus one `asterisms`
+      dataset per final chunk. For FITS, write primary metadata plus one binary
+      table HDU per final chunk.
+    - Existing output should raise unless `overwrite=True`. Write through a
+      temporary output path and atomically replace the target on success.
+  - Pass 2: Unit Coverage Review
+    - Status: completed.
+    - Verify that unit tests are sufficient for the export contract before
+      treating the phase as completed.
+    - Cover no-selector whole-completed-build export, explicit outer-pixel
+      export, MOC export, filters, same-member different-order deduplication,
+      duplicate aggregation across outer pixels, first-seen `asterism_id`
+      assignment, chunk-count behavior, HDF5/FITS round trips, schema exclusion
+      of lookup-internal IDs and artifact-local `pix`, and `overwrite=False`
+      protection.
+    - Compare sampled export rows against `find_asterisms` for equivalent
+      selectors and filters where schemas overlap.
+    - Do not require a validation-log entry unless later real-data acceptance
+      checks or science-facing export claims are added.
 
-### Phase 19: Compatibility Adoption And Handoff
+### Phase 19: Code Review The AO Sky Implementation
+
+- Review the `ao-sky` implementation before downstream adoption starts.
+- Exclude tests from this review except where they clarify intended behavior or
+  reveal a public-contract mismatch.
+- Focus the review on whether the API and implementation shape are worth
+  carrying forward:
+  - Public Python API names, signatures, return types, and ownership boundaries.
+  - CLI-facing helper contracts and wording.
+  - Artifact schema boundaries and build-artifact access patterns.
+  - Package structure, module ownership, and stale abstractions.
+  - Error handling, validation behavior, lifecycle clarity, and memory/streaming
+    behavior for whole-sky paths.
+  - Documentation alignment with the implemented public surface.
+- Produce a concrete review record with required changes, optional cleanup, and
+  explicit accept/defer decisions before treating the implementation as ready
+  for downstream replacement work.
+- Do not broaden this phase into real-sky validation, prediction-model
+  retraining, or downstream migration implementation.
+
+### Phase 20: Compatibility Adoption And Handoff
 
 - Move downstream consumers from the legacy implementation to `ao-sky` through
   explicit compatibility adapters and a final cleanup pass.
@@ -831,7 +894,7 @@ for lookup semantics.
 - Avoid deleting legacy code until the new path is documented, tested, and used
   in practice.
 
-### Phase 20: Upgrade Prediction Model Ordering Contract
+### Phase 21: Upgrade Prediction Model Ordering Contract
 
 - Treat this as required prediction-model/interface work before publishing the
   new `ao-sky` Traversal path.
@@ -857,7 +920,7 @@ for lookup semantics.
   contract as development/validation inputs only until production models are
   retrained or validated under the `ao-sky` ordering contract.
 
-### Phase 21: Introduce Coverage Curves And AO Uniformity
+### Phase 22: Introduce Coverage Curves And AO Uniformity
 
 - Build the higher-level AO validation products for coverage curves, AO
   uniformity, and related field metrics after the earlier migration and
@@ -900,7 +963,7 @@ for lookup semantics.
 - Use the metric evidence to decide whether to continue the build unchanged,
   run targeted policy sweeps, or investigate a specific physical issue.
 
-### Phase 22: Define The WFS Photometric Proxy Layer
+### Phase 23: Define The WFS Photometric Proxy Layer
 
 - Keep canonical Gaia storage raw and free of derived bands, fluxes, and other
   AO-system-specific photometric products.

@@ -96,9 +96,10 @@ The canonical package is split by ownership:
 - `ao_sky.asterisms`
   - star assembly for asterism search
   - retained winner-asterism lookup from completed build artifacts
+  - retained winner-asterism catalog export
   - diagnostic in-memory candidate enumeration
   - geometry
-  - public lookup seams kept separate from active build Traversal execution
+  - public lookup/export seams kept separate from active build Traversal execution
 - `ao_sky.dust`
   - Gaia TGE source loading and build-local dense A0 cache creation
   - mmap-backed local dust-field sampling

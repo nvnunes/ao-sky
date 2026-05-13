@@ -135,9 +135,11 @@ The current package-supported spatial API exposes:
 The current package-supported asterism API exposes:
 
 - `AsterismError`
+- `AsterismExportSummary`
 - `AsterismLookupFilters`
 - `AsterismSearchOptions`
 - `AsterismSearchProfile`
+- `export_asterisms`
 - `load_asterism_stars`
 - `find_asterisms`
 - `ASTERISM_TABLE_COLUMNS`
@@ -378,6 +380,29 @@ Non-goals of the current asterism lookup API:
 
 - instrument-specific photometric proxies
 - repo-root config discovery
+
+### `export_asterisms(build_path, output_path, *, format="hdf5", outer_pixels=None, moc_file=None, filters=None, overwrite=False, chunk_count=1) -> AsterismExportSummary`
+
+Export retained regularized winner asterisms from completed build artifacts.
+
+Behavior:
+
+- support `hdf5` and `fits` output formats
+- default to all traversal-done outer pixels when no selector is supplied
+- accept the same outer-pixel, MOC, and filter semantics as `find_asterisms`
+- deduplicate exported asterisms by sorted real member `source_id` set
+- assign export-local `asterism_id` values in first-seen build stream order
+- aggregate `inner_pixel_count`, `winner_ee_resolved`,
+  `winner_ee_averaged`, and `gaia_A0` over all selected support pixels for the
+  same physical asterism, including support from different outer pixels
+- split final output into `chunk_count` contiguous `asterism_id` ranges without
+  writing empty chunks
+- export catalog-facing fields only, excluding lookup-internal identifiers and
+  artifact-local `pix`
+- raise when the output exists unless `overwrite=True`
+
+`AsterismExportSummary` reports the output path, format, selected outer-pixel
+count, exported asterism count, and actual non-empty chunk count.
 
 ## Build Lifecycle
 

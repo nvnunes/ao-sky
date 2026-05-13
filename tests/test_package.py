@@ -12,7 +12,13 @@ import numpy as np
 from astropy.table import Table
 
 from ao_sky import __version__, describe_package
-from ao_sky.asterisms import AsterismSearchOptions, find_asterisms, load_asterism_stars
+from ao_sky.asterisms import (
+    AsterismExportSummary,
+    AsterismSearchOptions,
+    export_asterisms,
+    find_asterisms,
+    load_asterism_stars,
+)
 from ao_sky.build import (
     BuildInspection,
     check_runtime_roots,
@@ -43,6 +49,8 @@ def test_gaia_surface_is_importable() -> None:
     assert apply_proper_motion is not None
     assert load_asterism_stars is not None
     assert find_asterisms is not None
+    assert export_asterisms is not None
+    assert AsterismExportSummary is not None
     assert AsterismSearchOptions().max_stars == 1
     assert check_runtime_roots is not None
     assert fetch_gaia_data is not None

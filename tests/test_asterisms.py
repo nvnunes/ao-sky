@@ -7,6 +7,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
+from astropy.io import fits
 from astropy.table import Table
 from mocpy import MOC
 
@@ -16,6 +17,7 @@ from ao_sky.asterisms import (
     AsterismError,
     AsterismLookupFilters,
     AsterismSearchOptions,
+    export_asterisms,
     find_asterisms,
     load_asterism_stars,
 )
@@ -420,6 +422,26 @@ def _write_lookup_moc(path: Path, *, level: int, pixs: list[int]) -> Path:
     )
     moc.save(str(path), format="fits", overwrite=True)
     return path
+
+
+def _read_hdf5_asterism_export(path: Path) -> Table:
+    arrays = []
+    with h5py.File(path, "r") as handle:
+        for chunk_name in sorted(handle["chunks"]):
+            arrays.append(handle["chunks"][chunk_name]["asterisms"][()])
+    if not arrays:
+        return Table()
+    return Table(np.concatenate(arrays))
+
+
+def _read_fits_asterism_export(path: Path) -> Table:
+    arrays = []
+    with fits.open(path) as handle:
+        for hdu in handle[1:]:
+            arrays.append(np.asarray(hdu.data))
+    if not arrays:
+        return Table()
+    return Table(np.concatenate(arrays))
 
 
 def test_legacy_enumerate_asterism_candidates_returns_single_star_output() -> None:
@@ -897,3 +919,250 @@ def test_asterism_lookup_filters_validate_bounds() -> None:
 
     with pytest.raises(AsterismError, match="min_gaia_A0 cannot exceed"):
         AsterismLookupFilters(min_gaia_A0=0.3, max_gaia_A0=0.2)
+
+
+def test_export_asterisms_hdf5_exports_done_pixels_and_catalog_chunks(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0, 1, 2))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, -1, -1)),
+        winner_ids=(7, 7, 8, -1),
+        winner_ee_resolved=(0.2, 0.4, 0.6, np.nan),
+        winner_ee_averaged=(0.3, 0.5, 0.7, np.nan),
+    )
+    _write_lookup_outer(
+        build_path,
+        outer_pix=1,
+        local_ids=(99,),
+        source_ids=((202, 101, -1),),
+        winner_ids=(99, -1, -1, -1),
+        winner_ee_resolved=(0.8, np.nan, np.nan, np.nan),
+        winner_ee_averaged=(0.9, np.nan, np.nan, np.nan),
+    )
+    _write_lookup_outer(
+        build_path,
+        outer_pix=2,
+        local_ids=(5,),
+        source_ids=((404, 505, 606),),
+        winner_ids=(5, -1, -1, -1),
+        winner_ee_resolved=(1.0, np.nan, np.nan, np.nan),
+        winner_ee_averaged=(1.1, np.nan, np.nan, np.nan),
+    )
+    output = tmp_path / "asterisms.h5"
+
+    summary = export_asterisms(build_path, output, chunk_count=2)
+    result = _read_hdf5_asterism_export(output)
+
+    assert summary.exported_asterism_count == 3
+    assert summary.selected_outer_pixel_count == 3
+    assert summary.chunk_count == 2
+    assert result.colnames == [
+        "asterism_id",
+        "outer_pix",
+        "ra",
+        "dec",
+        "num_stars",
+        "star1_source_id",
+        "star1_ra",
+        "star1_dec",
+        "star1_mag",
+        "star2_source_id",
+        "star2_ra",
+        "star2_dec",
+        "star2_mag",
+        "star3_source_id",
+        "star3_ra",
+        "star3_dec",
+        "star3_mag",
+        "inner_pixel_count",
+        "winner_ee_resolved",
+        "winner_ee_averaged",
+        "gaia_A0",
+    ]
+    assert result["asterism_id"].tolist() == [1, 2, 3]
+    assert "pix" not in result.colnames
+    assert "global_asterism_id" not in result.colnames
+    assert int(result["inner_pixel_count"][0]) == 3
+    assert float(result["winner_ee_resolved"][0]) == pytest.approx((0.2 + 0.4 + 0.8) / 3.0)
+    assert float(result["winner_ee_averaged"][0]) == pytest.approx((0.3 + 0.5 + 0.9) / 3.0)
+    assert float(result["gaia_A0"][0]) == pytest.approx((0.1 + 0.2 + 0.1) / 3.0)
+    with h5py.File(output, "r") as handle:
+        assert list(sorted(handle["chunks"])) == ["chunk_000001", "chunk_000002"]
+        assert handle["chunks/chunk_000001"].attrs["start_asterism_id"] == 1
+        assert handle["chunks/chunk_000001"].attrs["end_asterism_id"] == 2
+        assert handle["chunks/chunk_000002"].attrs["start_asterism_id"] == 3
+        assert handle["chunks/chunk_000002"].attrs["end_asterism_id"] == 3
+
+
+def test_export_asterisms_fits_round_trips_chunks(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, -1, -1), (202, 303, -1)),
+        winner_ids=(7, 8, -1, -1),
+    )
+    output = tmp_path / "asterisms.fits"
+
+    summary = export_asterisms(build_path, output, format="fits", chunk_count=4)
+    result = _read_fits_asterism_export(output)
+
+    assert summary.exported_asterism_count == 2
+    assert summary.chunk_count == 2
+    assert result["asterism_id"].tolist() == [1, 2]
+    with fits.open(output) as handle:
+        assert handle[0].header["NCHUNKS"] == 2
+        assert handle[1].header["STARTID"] == 1
+        assert handle[2].header["STARTID"] == 2
+
+
+def test_export_asterisms_filters_match_find_asterisms(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8, 9),
+        source_ids=((101, -1, -1), (202, 303, -1), (404, 505, 606)),
+        winner_ids=(7, 8, 8, 9),
+        winner_ee_resolved=(0.2, 0.4, 0.6, 0.8),
+        winner_ee_averaged=(0.3, 0.5, 0.7, 0.9),
+    )
+    filters = AsterismLookupFilters(min_inner_pixel_count=2)
+    output = tmp_path / "filtered.h5"
+
+    export_asterisms(build_path, output, outer_pixels=0, filters=filters)
+    exported = _read_hdf5_asterism_export(output)
+    found = find_asterisms(build_path, outer_pixels=0, filters=filters)
+
+    assert exported["star1_source_id"].tolist() == found["star1_source_id"].tolist()
+    assert exported["inner_pixel_count"].tolist() == found["inner_pixel_count"].tolist()
+    assert exported["asterism_id"].tolist() == [1]
+
+
+def test_export_asterisms_moc_matches_find_asterisms_support(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7, 8),
+        source_ids=((101, 202, -1), (303, 404, -1)),
+        winner_ids=(7, 8, -1, -1),
+    )
+    moc = _write_lookup_moc(tmp_path / "region.fits", level=1, pixs=[0])
+    output = tmp_path / "region.h5"
+
+    export_asterisms(build_path, output, moc_file=moc)
+    exported = _read_hdf5_asterism_export(output)
+    found = find_asterisms(build_path, moc_file=moc)
+
+    assert exported["star1_source_id"].tolist() == found["star1_source_id"].tolist()
+    assert exported["inner_pixel_count"].tolist() == found["inner_pixel_count"].tolist()
+
+
+def test_export_asterisms_rejects_existing_output_without_overwrite(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(build_path, outer_pix=0)
+    output = tmp_path / "asterisms.h5"
+    output.write_text("existing", encoding="utf-8")
+
+    with pytest.raises(AsterismError, match="output already exists"):
+        export_asterisms(build_path, output)
+
+    summary = export_asterisms(build_path, output, overwrite=True)
+
+    assert summary.exported_asterism_count == 1
+
+
+def test_export_asterisms_rejects_invalid_format_and_chunk_count(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+
+    with pytest.raises(AsterismError, match="format must be one of"):
+        export_asterisms(build_path, tmp_path / "asterisms.bad", format="bad")
+
+    with pytest.raises(AsterismError, match="chunk_count must be at least 1"):
+        export_asterisms(build_path, tmp_path / "asterisms.h5", chunk_count=0)
+
+
+def test_export_asterisms_writes_empty_export(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7,),
+        source_ids=((101, -1, -1),),
+        winner_ids=(-1, -1, -1, -1),
+    )
+    output = tmp_path / "empty.h5"
+
+    summary = export_asterisms(build_path, output, chunk_count=3)
+
+    assert summary.exported_asterism_count == 0
+    assert summary.chunk_count == 0
+    with h5py.File(output, "r") as handle:
+        assert list(handle["chunks"].keys()) == []
+        assert handle["metadata"].attrs["chunk_count"] == 0
+
+
+def test_export_asterisms_outer_pixels_selects_only_requested_pixels(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0, 1))
+    _write_lookup_outer(
+        build_path,
+        outer_pix=0,
+        local_ids=(7,),
+        source_ids=((101, -1, -1),),
+        winner_ids=(7, -1, -1, -1),
+    )
+    _write_lookup_outer(
+        build_path,
+        outer_pix=1,
+        local_ids=(8,),
+        source_ids=((202, -1, -1),),
+        winner_ids=(8, -1, -1, -1),
+    )
+    output = tmp_path / "outer1.h5"
+
+    summary = export_asterisms(build_path, output, outer_pixels=1)
+    exported = _read_hdf5_asterism_export(output)
+
+    assert summary.selected_outer_pixel_count == 1
+    assert exported["star1_source_id"].tolist() == [202]
+    assert exported["outer_pix"].tolist() == [1]
+
+
+def test_export_asterisms_rejects_incomplete_selected_outer_pixel(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=())
+
+    with pytest.raises(AsterismError, match="traversal is not done"):
+        export_asterisms(build_path, tmp_path / "asterisms.h5", outer_pixels=0)
+
+
+def test_export_asterisms_rejects_missing_done_artifact(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+
+    with pytest.raises(AsterismError, match="outer artifact is missing"):
+        export_asterisms(build_path, tmp_path / "asterisms.h5", outer_pixels=0)
+
+
+def test_export_asterisms_cleans_temporary_files(tmp_path: Path) -> None:
+    build_path = tmp_path / "build"
+    _write_lookup_build_root(build_path, done_pixels=(0,))
+    _write_lookup_outer(build_path, outer_pix=0)
+    output = tmp_path / "nested" / "asterisms.h5"
+
+    export_asterisms(build_path, output)
+
+    assert output.is_file()
+    assert list(output.parent.glob(".asterisms.h5.*")) == []
