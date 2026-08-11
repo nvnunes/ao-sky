@@ -1,4 +1,4 @@
-"""Thin temporary adapter over `ao_tools.training` from girmos-aosims."""
+"""Thin temporary adapter over `ao_tools.legacy.training` from girmos-aosims."""
 
 from __future__ import annotations
 
@@ -20,17 +20,17 @@ INFERENCE_THREAD_ENV_VARS = (
 
 def _get_training_module():
     try:
-        return import_module("ao_tools.training")
+        return import_module("ao_tools.legacy.training")
     except ModuleNotFoundError as exc:
         sibling_repo = Path(__file__).resolve().parents[3].parent / "girmos-aosims"
         if sibling_repo.is_dir():
             sys.path.insert(0, str(sibling_repo))
             try:
-                return import_module("ao_tools.training")
+                return import_module("ao_tools.legacy.training")
             except ModuleNotFoundError:
                 pass
         raise PredictError(
-            "AO prediction requires 'ao_tools.training', which is provided by "
+            "AO prediction requires 'ao_tools.legacy.training', which is provided by "
             "girmos-aosims. Install girmos-aosims or keep a sibling "
             "'../girmos-aosims' checkout available to use the native Traversal "
             "prediction path."
@@ -45,14 +45,14 @@ def load_model(model_root: Path, model_name: str, force_cpu: bool = True):
 
 
 def get_model_X(*args, **kwargs):
-    """Delegate model-feature construction to `ao_tools.training`."""
+    """Delegate model-feature construction to `ao_tools.legacy.training`."""
 
     training = _get_training_module()
     return training.get_model_X(*args, **kwargs)
 
 
 def get_prediction(*args, **kwargs):
-    """Delegate model inference to `ao_tools.training`."""
+    """Delegate model inference to `ao_tools.legacy.training`."""
 
     training = _get_training_module()
     return training.get_prediction(*args, **kwargs)

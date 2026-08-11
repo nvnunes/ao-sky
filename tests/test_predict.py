@@ -526,7 +526,7 @@ def test_backend_missing_dependency_raises_clear_error(
         raise ModuleNotFoundError(name)
 
     monkeypatch.setattr(predict_backend, "import_module", _missing)
-    with pytest.raises(PredictError, match="ao_tools.training"):
+    with pytest.raises(PredictError, match=r"ao_tools\.legacy\.training"):
         predict_backend._get_training_module()
 
 
