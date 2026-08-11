@@ -48,6 +48,7 @@ Issues = "https://github.com/nvnunes/ao-sky/issues"
 dev = [
     "build>=1.2",
     "pytest>=8.0",
+    "ruff",
 ]
 docs = [
     "mkdocs>=1.6.0,<2.0",
