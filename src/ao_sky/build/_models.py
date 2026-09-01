@@ -14,7 +14,16 @@ DEFAULT_PARENT_GPU_DRIVER_RESERVE_MB = 1075.0
 
 @dataclass(frozen=True, slots=True)
 class BuildDefinition:
-    """Normalized build identity derived from one merged build config."""
+    """Normalized persisted identity derived from one build config.
+
+    Attributes:
+        lineage_name: Build-lineage name derived from the config filename.
+        gaia_release: Gaia release identifier used by the build.
+        outer_level: HEALPix level of one restartable outer-pixel task.
+        inner_level: HEALPix level of evaluated science-point centers.
+        max_data_level: Highest HEALPix level written to dense map artifacts.
+        survey_extent_overlays: Normalized survey-overlay specifications.
+    """
 
     lineage_name: str
     gaia_release: str
@@ -26,7 +35,14 @@ class BuildDefinition:
 
 @dataclass(frozen=True, slots=True)
 class BuildPaths:
-    """Resolved filesystem roots used by build commands."""
+    """Resolved filesystem roots used by build commands.
+
+    Attributes:
+        gaia_root: Root containing canonical Gaia release stores.
+        build_root: Root under which versioned build directories are created.
+        dust_root: Root containing the Gaia TGE source used during ``init``.
+        model_root: Root containing source AO model files used during ``init``.
+    """
 
     gaia_root: Path
     build_root: Path

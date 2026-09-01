@@ -20,7 +20,9 @@ from ao_sky.asterisms import (
     load_asterism_stars,
 )
 from ao_sky.build import (
+    BuildDefinition,
     BuildInspection,
+    BuildPaths,
     check_runtime_roots,
     fetch_gaia_data,
     inspect_build,
@@ -56,7 +58,9 @@ def test_gaia_surface_is_importable() -> None:
     assert fetch_gaia_data is not None
     assert init_build is not None
     assert inspect_build is not None
+    assert BuildDefinition is not None
     assert BuildInspection is not None
+    assert BuildPaths is not None
     assert fetch_gaia_store is not None
     assert load_build_definition is not None
     assert show_build is not None

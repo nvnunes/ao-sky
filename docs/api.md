@@ -173,7 +173,9 @@ the temporary `girmos-aosims` backend adapter behind this native API.
 
 The current package-supported build API exposes:
 
+- `BuildDefinition`
 - `BuildInspection`
+- `BuildPaths`
 - `BuildError`
 - `check_runtime_roots`
 - `fetch_gaia_data`
