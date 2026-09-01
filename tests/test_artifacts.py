@@ -31,8 +31,9 @@ def test_artifact_store_reads_runtime_maps_outer_and_gaia(tmp_path: Path) -> Non
 
     map_data = store.map_data("coverage_resolved", level=1, nan_below=0.25)
     assert map_data.level == 1
+    assert map_data.field == "coverage_resolved"
+    assert len(map_data.coords) == len(map_data.values)
     assert map_data.values[0] != map_data.values[0]
-    assert map_data.to_layer().field == "coverage_resolved"
 
     inner = store.inner(0, outer_level=0, inner_level=1)
     assert inner["pix"].tolist() == [0, 1, 2, 3]

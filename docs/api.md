@@ -13,7 +13,7 @@ The supported public surface currently centers on:
 - `ao_sky.build` for persisted build roots, build state, and per-outer-pixel
   derived artifacts
 - `ao_sky.artifacts` for read-only access to existing build artifacts
-- `ao_sky.plotting` for artifact-backed map and local asterism diagnostics
+- `ao_sky.plotting` for artifact-backed local asterism diagnostics
 
 ## Current Public Surface
 

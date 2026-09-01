@@ -124,8 +124,9 @@ The canonical package is split by ownership:
   - dense map, outer-pixel, and pinned Gaia artifact loading
   - no build execution or consumer-specific compatibility shaping
 - `ao_sky.plotting`
-  - artifact-backed map plotting helpers
   - local retained-asterism diagnostic figures
+  - internal dense-map plotting utilities not included in the supported public
+    import surface
   - no build execution or artifact mutation
 - `ao_sky.survey`
   - survey-extent overlays

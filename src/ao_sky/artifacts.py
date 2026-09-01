@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from astropy.table import Table
 import h5py
 import numpy as np
+from astropy.coordinates import SkyCoord
+from astropy.table import Table
 
 from ._hdf5 import ensure_hdf5_filters
 from ._paths import get_outer_pixel_bucket_path
@@ -23,9 +24,7 @@ from .build.artifacts import read_maps_dataset, read_outer_dataset, read_outer_p
 from .build.runtime_config import load_runtime_config
 from .gaia._constants import HDF5_DATASET_NAME
 from .gaia.transform import apply_proper_motion, compute_r_magnitude
-from .plotting.fields import get_field_convention
 from .plotting.healpix import get_pixel_skycoord
-from .plotting.maps import MapLayer
 
 
 @dataclass(frozen=True)
@@ -37,21 +36,8 @@ class MapData:
     field: str
     values: np.ndarray
     pixs: np.ndarray
-    coords: object
+    coords: SkyCoord
     table: Table
-
-    def to_layer(self) -> MapLayer:
-        """Return the plotting-layer representation for this map field."""
-
-        return MapLayer(
-            filename=self.filename,
-            level=self.level,
-            field=self.field,
-            values=self.values,
-            pixs=self.pixs,
-            table=self.table,
-            convention=get_field_convention(self.field),
-        )
 
 
 class AoSkyArtifactStore:
@@ -113,17 +99,6 @@ class AoSkyArtifactStore:
             coords=get_pixel_skycoord(level, pixs),
             table=table,
         )
-
-    def map_layer(
-        self,
-        field: str,
-        *,
-        level: int,
-        nan_below: float | None = None,
-    ) -> MapLayer:
-        """Read one dense map field as a plotting layer."""
-
-        return self.map_data(field, level=level, nan_below=nan_below).to_layer()
 
     def outer_path(self, outer_pix: int, *, outer_level: int, inner_level: int) -> Path:
         """Return the per-outer artifact path for one outer pixel."""
