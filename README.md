@@ -12,8 +12,11 @@ The repository currently provides:
 - reusable `ao_sky.spatial` HEALPix helpers
 - public `ao_sky.asterisms` star-loading, retained-winner lookup/export, and
   diagnostic candidate-enumeration APIs
+- native `ao_sky.predict` runtime records and array prediction helpers
 - persisted `ao_sky.build` build roots, build state, and per-outer-pixel
   derived artifact containers
+- read-only `ao_sky.artifacts` access to completed build products
+- `ao_sky.plotting` helpers for artifact-backed asterism diagnostics
 - a public `ao-sky` CLI with build lifecycle commands
 - a repo-local Conda workflow rooted at `./.conda`
 - strict docs-site and packaging verification commands

@@ -68,7 +68,6 @@ git config core.hooksPath .githooks
 - Keep verification commands and completion expectations in `docs/testing.md`.
 - Keep package boundaries, persisted contracts, and lifecycle-sensitive design
   rules in `docs/architecture.md`.
-- Keep migration sequencing and compatibility-handoff planning in `docs/plan.md`.
 - Keep git hook activation and hook behavior here.
 
 ## Daily Commands
