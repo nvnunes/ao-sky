@@ -33,7 +33,6 @@ nav:
       - Algorithms: algorithms.md
       - Development: development.md
       - Testing: testing.md
-      - Plan: plan.md
   - Reference:
       - Gaia API: reference/gaia/api.md
       - Spatial API: reference/spatial/api.md

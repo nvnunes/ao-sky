@@ -10,7 +10,6 @@
 - Follow `docs/algorithms.md` for traversal, dense-field NGS selection, winner
   selection, and AO metric aggregation algorithms.
 - Follow `docs/development.md` for local bootstrap, environment, and daily workflow.
-- Follow `docs/plan.md` for transitional migration context and implementation sequencing.
 - Follow `docs/benchmarking.md` for benchmark evidence that informs storage, scheduling, and cache decisions.
 - Follow `docs/testing.md` for verification expectations.
 
@@ -34,5 +33,4 @@
 - For package structure, public API boundaries, persisted contracts, and lifecycle-sensitive changes, consult `docs/architecture.md` before editing.
 - For local Python bootstrap, environment choice, and daily workflow, consult `docs/development.md`.
 - Before concluding substantial work, satisfy the verification expectations in `docs/testing.md`.
-- For transitional migration boundaries and intended-versus-implemented structure, consult `docs/plan.md` before making structural changes.
 - For storage, scheduling, traversal, or cache decisions that depend on measured evidence, consult `docs/benchmarking.md`.

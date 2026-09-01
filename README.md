@@ -38,6 +38,5 @@ including root preflight, Gaia fetch, build definitions, runtime config, and
 - [`docs/algorithms.md`](docs/algorithms.md): traversal, dense-field NGS
   selection, and winner-selection algorithms
 - [`docs/development.md`](docs/development.md): local bootstrap and development workflow
-- [`docs/plan.md`](docs/plan.md): transitional migration context and implementation plan
 - [`docs/benchmarking.md`](docs/benchmarking.md): benchmark evidence that informs storage and cache decisions
 - [`docs/testing.md`](docs/testing.md): verification expectations

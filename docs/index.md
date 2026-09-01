@@ -28,4 +28,3 @@ The current repo surface establishes:
   installs, and daily commands
 - [`testing.md`](testing.md): canonical verification commands and completion
   expectations
-- [`plan.md`](plan.md): migration sequencing and immediate next steps

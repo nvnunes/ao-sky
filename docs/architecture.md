@@ -4,9 +4,9 @@ This document is the source of truth for `ao-sky` package boundaries, canonical
 data layers, persisted artifact model, build execution model, and public
 package/documentation shape.
 
-It describes a mix of implemented and intended architecture. Use
-[`plan.md`](plan.md) for the transitional migration context and implementation
-sequencing around that architecture.
+It describes a mix of implemented and intended architecture. Transitional
+migration context and sequencing are maintained in the peer GIRMOS project,
+outside this package's public documentation surface.
 
 ## Shared Validation And Skills
 
@@ -300,7 +300,6 @@ repository.
 
 - `README.md` provides the public summary.
 - `docs/architecture.md` is the stable design source of truth.
-- `docs/plan.md` holds transitional migration context.
 - `docs/testing.md` is the source of truth for verification expectations.
 - API, CLI, development, and reference docs explain supported workflows and
   interfaces as the repo grows.
