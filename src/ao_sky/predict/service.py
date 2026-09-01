@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-import time
 
 import astropy.units as u
 import numpy as np
 
 from . import backend
 from ._exceptions import PredictError
-from ._models import PointPredictionBatch, PredictRuntime, SeeingBaselinePerformance
+from ._models import PredictionBatch, PredictRuntime, SeeingBaselinePerformance
 
 _ModelCacheKey = tuple[str, str, str, int, bool]
 _FeatureTemplateKey = tuple[float, int, bool, tuple[tuple[float, float], ...]]
-_POINT_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
-_MEAN_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
+_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
+_LEGACY_FIELD_AVERAGED_MODEL_CACHE: dict[_ModelCacheKey, object] = {}
 _FEATURE_TEMPLATE_CACHE: dict[_FeatureTemplateKey, "_FeatureTemplate"] = {}
 _FEATURE_BUFFER_CACHE: dict[int, np.ndarray] = {}
 
@@ -129,7 +129,9 @@ def clear_backend_cache() -> None:
     """Clear loaded model caches owned by the temporary native backend."""
 
     cleared_models: set[int] = set()
-    for model in tuple(_POINT_MODEL_CACHE.values()) + tuple(_MEAN_MODEL_CACHE.values()):
+    for model in tuple(_MODEL_CACHE.values()) + tuple(
+        _LEGACY_FIELD_AVERAGED_MODEL_CACHE.values()
+    ):
         model_id = id(model)
         if model_id in cleared_models:
             continue
@@ -143,67 +145,91 @@ def configure_inference_threads(num_threads: int) -> None:
     backend.configure_inference_threads(num_threads)
 
 
-def get_point_model(runtime: PredictRuntime, num_stars: int, *, device: str = "cpu"):
-    """Return the cached point model for one surviving guide-star count."""
+def get_model(
+    runtime: PredictRuntime,
+    num_stars: int,
+    *,
+    device: str = "cpu",
+) -> object:
+    """Return the cached production model for one guide-star count.
+
+    Args:
+        runtime: Prediction contract containing the model mapping and root.
+        num_stars: Guide-star count whose `<N>star` model should be loaded.
+        device: `cpu` or `gpu`. GPU selection delegates device choice to the
+            temporary backend.
+
+    Returns:
+        The backend model object. Pass this object unchanged to
+        `predict_arrays`.
+
+    Raises:
+        PredictError: If the model mapping is missing, the device is invalid,
+            or the configured model cannot be loaded.
+    """
 
     key = f"{int(num_stars)}star"
-    model_name = runtime.resolved_models.get(key)
+    model_name = runtime.models.get(key)
     if model_name is None:
-        raise PredictError(f"Missing resolved model for {key}")
+        raise PredictError(f"Missing model for {key}")
 
     force_cpu = _force_cpu_for_device(device, field_name="device")
     cache_key = _get_model_cache_key(
-        "point",
+        "model",
         runtime,
         model_name=model_name,
         num_stars=num_stars,
         force_cpu=force_cpu,
     )
-    if cache_key not in _POINT_MODEL_CACHE:
-        _POINT_MODEL_CACHE[cache_key] = backend.load_model(
+    if cache_key not in _MODEL_CACHE:
+        _MODEL_CACHE[cache_key] = backend.load_model(
             runtime.model_root,
             model_name,
             force_cpu=force_cpu,
         )
-    return _POINT_MODEL_CACHE[cache_key]
+    return _MODEL_CACHE[cache_key]
 
 
-def get_mean_model(runtime: PredictRuntime, num_stars: int, *, device: str = "cpu"):
-    """Return the cached mean-field model for one surviving guide-star count."""
+def _get_legacy_field_averaged_model(
+    runtime: PredictRuntime,
+    num_stars: int,
+    *,
+    device: str = "cpu",
+):
+    """Return the transitional field-averaged model for one guide-star count."""
 
     key = f"{int(num_stars)}star"
-    model_name = runtime.averaged_models.get(key)
+    model_name = runtime.legacy_field_averaged_models.get(key)
     if model_name is None:
-        raise PredictError(f"Missing averaged model for {key}")
+        raise PredictError(f"Missing legacy field-averaged model for {key}")
 
     force_cpu = _force_cpu_for_device(device, field_name="device")
     cache_key = _get_model_cache_key(
-        "mean",
+        "legacy_field_averaged",
         runtime,
         model_name=model_name,
         num_stars=num_stars,
         force_cpu=force_cpu,
     )
-    if cache_key not in _MEAN_MODEL_CACHE:
-        _MEAN_MODEL_CACHE[cache_key] = backend.load_model(
+    if cache_key not in _LEGACY_FIELD_AVERAGED_MODEL_CACHE:
+        _LEGACY_FIELD_AVERAGED_MODEL_CACHE[cache_key] = backend.load_model(
             runtime.model_root,
             model_name,
             force_cpu=force_cpu,
         )
-    return _MEAN_MODEL_CACHE[cache_key]
+    return _LEGACY_FIELD_AVERAGED_MODEL_CACHE[cache_key]
 
 
 def warm_model_cache(
     runtime: PredictRuntime,
     *,
-    prediction_device: str = "cpu",
-    averaged_prediction_device: str = "cpu",
+    device: str = "cpu",
 ) -> None:
     """Load all configured temporary backend models for one AO runtime."""
 
     for num_stars in range(runtime.ao_system.min_wfs, runtime.ao_system.max_wfs + 1):
-        get_point_model(runtime, num_stars, device=prediction_device)
-        get_mean_model(runtime, num_stars, device=averaged_prediction_device)
+        get_model(runtime, num_stars, device=device)
+        _get_legacy_field_averaged_model(runtime, num_stars, device=device)
 
 
 def _get_ao_lgs_xy(lgs: tuple[dict[str, float], ...]) -> list[dict[str, float]]:
@@ -275,7 +301,7 @@ def _get_feature_template(
         column += 1
 
     if not mean_only:
-        column += 2  # science target r and theta are zero in Traversal point mode.
+        column += 2  # science target r and theta are zero in Traversal on-axis mode.
         for lgs_star in lgs:
             row[column] = float(np.hypot(float(lgs_star["x"]), float(lgs_star["y"])))
             column += 1
@@ -393,19 +419,43 @@ def _validate_prediction_num_stars(ngs_zd: np.ndarray, num_stars: int) -> None:
         )
 
 
-def predict_point_arrays(
+def predict_arrays(
     runtime: PredictRuntime,
     *,
     num_stars: int,
-    model,
+    model: object,
     ngs_zd: np.ndarray,
     ngs_az_deg: np.ndarray,
     ngs_mag: np.ndarray,
     backend_row_count: int | None = None,
     feature_buffer_row_count: int | None = None,
     prediction_telemetry: PredictionArrayTelemetry | None = None,
-) -> PointPredictionBatch:
-    """Return resolved predictions for one magnitude-ordered homogeneous batch."""
+) -> PredictionBatch:
+    """Return position-dependent predictions for one homogeneous NGS batch.
+
+    Args:
+        runtime: Prediction contract used to build backend features.
+        num_stars: Guide-star count shared by every input row.
+        model: Model returned by `get_model` for the same runtime, star count,
+            and execution device.
+        ngs_zd: Guide-star radial offsets in arcseconds with shape
+            `(rows, num_stars)`.
+        ngs_az_deg: Guide-star azimuths in degrees with the same shape.
+        ngs_mag: Magnitudes in `runtime.ao_system.band` with the same shape and
+            stars ordered from brightest to faintest within each row.
+        backend_row_count: Optional padded row count used for backend bucketing.
+        feature_buffer_row_count: Optional reusable feature-buffer capacity;
+            it cannot be smaller than `backend_row_count`.
+        prediction_telemetry: Optional mutable collector for feature, backend,
+            and device-memory measurements.
+
+    Returns:
+        Prediction arrays with one output row per unpadded input row.
+
+    Raises:
+        PredictError: If array shapes, star count, padding, or backend inputs
+            violate the prediction contract.
+    """
 
     row_count = int(np.asarray(ngs_zd).shape[0])
     _validate_prediction_num_stars(ngs_zd, num_stars)
@@ -432,7 +482,7 @@ def predict_point_arrays(
     if prediction_telemetry is not None:
         prediction_telemetry.record_backend_batch(time.perf_counter() - started)
         prediction_telemetry.record_mps_snapshot(model)
-    return PointPredictionBatch(
+    return PredictionBatch(
         sr=y_pred[:, backend.get_sr_index()],
         ee=y_pred[:, backend.get_ee_index()],
         fwhm=y_pred[:, backend.get_fwhm_index()],
@@ -440,7 +490,7 @@ def predict_point_arrays(
     )
 
 
-def predict_field_mean_arrays(
+def _predict_legacy_field_averaged_arrays(
     runtime: PredictRuntime,
     *,
     num_stars: int,
@@ -452,7 +502,7 @@ def predict_field_mean_arrays(
     feature_buffer_row_count: int | None = None,
     prediction_telemetry: PredictionArrayTelemetry | None = None,
 ) -> np.ndarray:
-    """Return mean-field EE predictions for one magnitude-ordered batch."""
+    """Return transitional field-averaged EE for one homogeneous NGS batch."""
 
     row_count = int(np.asarray(ngs_zd).shape[0])
     _validate_prediction_num_stars(ngs_zd, num_stars)

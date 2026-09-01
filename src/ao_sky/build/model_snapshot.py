@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
 import shutil
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 
@@ -17,6 +17,7 @@ from ._constants import (
     WORK_STATUS_PENDING,
 )
 from ._exceptions import BuildError
+from ._schema_compat import require_current_build_layout
 from .config import resolve_runtime_root_candidates
 from .control import (
     load_build_roots,
@@ -41,6 +42,7 @@ def fetch_model_data(
     """Snapshot configured AO model files into one build-local models directory."""
 
     resolved_build_path = Path(build_path).expanduser().resolve()
+    require_current_build_layout(resolved_build_path, operation="refresh models for")
     _require_traversal_not_started(resolved_build_path)
 
     destination_root = (resolved_build_path / MODEL_SNAPSHOT_DIRNAME).resolve()
@@ -55,6 +57,7 @@ def fetch_model_data(
     runtime = load_runtime_config(
         runtime_config_path,
         model_root=source_root,
+        allow_legacy=False,
     )
     model_roles = _required_model_roles(runtime)
 
@@ -135,12 +138,12 @@ def _required_model_roles(runtime) -> dict[str, set[str]]:
     roles: dict[str, set[str]] = defaultdict(set)
     for num_stars in range(runtime.ao_system.min_wfs, runtime.ao_system.max_wfs + 1):
         key = f"{int(num_stars)}star"
-        point_model = runtime.resolved_models.get(key)
-        if point_model:
-            roles[point_model].add(f"resolved:{key}")
-        mean_model = runtime.averaged_models.get(key)
-        if mean_model:
-            roles[mean_model].add(f"averaged:{key}")
+        model = runtime.models.get(key)
+        if model:
+            roles[model].add(f"model:{key}")
+        legacy_model = runtime.legacy_field_averaged_models.get(key)
+        if legacy_model:
+            roles[legacy_model].add(f"legacy_field_averaged:{key}")
     return dict(roles)
 
 

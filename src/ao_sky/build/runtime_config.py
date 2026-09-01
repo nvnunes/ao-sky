@@ -10,10 +10,13 @@ import astropy.units as u
 import yaml
 
 from ..predict import AOSystemRuntime, PredictRuntime
-from ._constants import RUNTIME_CONFIG_FILENAME
+from ._constants import RUNTIME_CONFIG_FILENAME, RUNTIME_CONFIG_SCHEMA_VERSION
 from ._exceptions import BuildError
+from ._schema_compat import (
+    normalize_runtime_config_payload,
+    require_current_build_layout_if_present,
+)
 
-RUNTIME_CONFIG_SCHEMA_VERSION = 2
 DEFAULT_WINNER_TOP_K = 3
 MAX_WINNER_TOP_K = 32
 
@@ -31,6 +34,10 @@ def write_runtime_config(
     """Persist one native runtime config inside a build root."""
 
     filename = runtime_config_filename(build_path)
+    require_current_build_layout_if_present(
+        build_path,
+        operation="write runtime config for",
+    )
     payload = runtime_to_config(runtime)
     filename.parent.mkdir(parents=True, exist_ok=True)
     temp = filename.with_name(f".{filename.name}.tmp")
@@ -47,8 +54,13 @@ def load_runtime_config(
     filename: Path,
     *,
     model_root: Path,
+    allow_legacy: bool = False,
 ) -> PredictRuntime:
-    """Load a build-local native runtime config."""
+    """Load a current build-local runtime config.
+
+    Set ``allow_legacy=True`` only for read-only access to a completed
+    schema-version-2 build.
+    """
 
     resolved = Path(filename).expanduser().resolve()
     try:
@@ -57,16 +69,9 @@ def load_runtime_config(
     except OSError as exc:
         raise BuildError(f"Runtime config not found: {resolved}") from exc
 
-    try:
-        schema_version = int(payload.get("schema_version", 0))
-    except (TypeError, ValueError) as exc:
-        raise BuildError(
-            f"Unsupported runtime config schema_version: {payload.get('schema_version')!r}"
-        ) from exc
-    if schema_version != RUNTIME_CONFIG_SCHEMA_VERSION:
-        raise BuildError(
-            f"Unsupported runtime config schema_version: {payload.get('schema_version')!r}"
-        )
+    if not isinstance(payload, dict):
+        raise BuildError("Runtime config must contain a mapping")
+    payload = normalize_runtime_config_payload(payload, allow_legacy=allow_legacy)
 
     ao_system_raw = _required_mapping(payload, "ao_system", "Runtime config")
     traversal_raw = _required_mapping(payload, "traversal", "Runtime config")
@@ -104,12 +109,12 @@ def load_runtime_config(
     if "max_overlap" in asterism_raw:
         raise BuildError(
             "Runtime config asterism.max_overlap is legacy-only and is not "
-            "supported by schema_version 2"
+            "supported by schema_version 3"
         )
     if "max_candidate_asterisms" in asterism_raw:
         raise BuildError(
             "Runtime config asterism.max_candidate_asterisms was removed and is not "
-            "supported by schema_version 2"
+            "supported by schema_version 3"
         )
     winner_ee_epsilon = _optional_float(
         asterism_raw.get("winner_ee_epsilon"),
@@ -136,14 +141,14 @@ def load_runtime_config(
     seeing_sr = _required_float(seeing_raw, "sr", "best.seeing_baseline")
     seeing_ee = _required_float(seeing_raw, "ee", "best.seeing_baseline")
     seeing_fwhm = _required_float(seeing_raw, "fwhm_mas", "best.seeing_baseline")
-    coverage_resolved = _required_float(
+    on_axis_ee_threshold = _required_float(
         coverage_raw,
-        "resolved_ee_threshold",
+        "on_axis_ee_threshold",
         "coverage",
     )
-    coverage_averaged = _required_float(
+    field_averaged_ee_threshold = _required_float(
         coverage_raw,
-        "averaged_ee_threshold",
+        "field_averaged_ee_threshold",
         "coverage",
     )
 
@@ -162,8 +167,8 @@ def load_runtime_config(
         prediction_wavelength=prediction_wavelength,
         seeing_wavelength=seeing_wavelength,
         seeing_fwhm=seeing_fwhm,
-        coverage_resolved=coverage_resolved,
-        coverage_averaged=coverage_averaged,
+        on_axis_ee_threshold=on_axis_ee_threshold,
+        field_averaged_ee_threshold=field_averaged_ee_threshold,
     )
 
     ao_system = AOSystemRuntime(
@@ -176,14 +181,14 @@ def load_runtime_config(
         max_mag=max_mag,
         min_sep=min_sep_arcsec * u.arcsec,
     )
-    resolved_models = _required_model_mapping(
+    models = _required_model_mapping(
         prediction_raw,
-        "resolved_models",
+        "models",
         ao_system=ao_system,
     )
-    averaged_models = _required_model_mapping(
+    legacy_field_averaged_models = _required_model_mapping(
         prediction_raw,
-        "averaged_models",
+        "legacy_field_averaged_models",
         ao_system=ao_system,
     )
     return PredictRuntime(
@@ -196,14 +201,14 @@ def load_runtime_config(
         winner_ee_epsilon=winner_ee_epsilon,
         winner_top_k=winner_top_k,
         prediction_wavelength=prediction_wavelength * u.micron,
-        resolved_models=resolved_models,
-        averaged_models=averaged_models,
+        models=models,
+        legacy_field_averaged_models=legacy_field_averaged_models,
         seeing_reference_wavelength=seeing_wavelength * u.micron,
         seeing_reference_sr=seeing_sr,
         seeing_reference_ee=seeing_ee,
         seeing_reference_fwhm=seeing_fwhm,
-        coverage_ee_threshold_resolved=coverage_resolved,
-        coverage_ee_threshold_averaged=coverage_averaged,
+        on_axis_ee_threshold=on_axis_ee_threshold,
+        field_averaged_ee_threshold=field_averaged_ee_threshold,
         model_root=Path(model_root).expanduser().resolve(),
     )
 
@@ -234,8 +239,8 @@ def runtime_to_config(runtime: PredictRuntime) -> dict[str, Any]:
                 "wavelength_micron": float(
                     runtime.prediction_wavelength.to_value(u.micron)
                 ),
-                "resolved_models": dict(runtime.resolved_models),
-                "averaged_models": dict(runtime.averaged_models),
+                "models": dict(runtime.models),
+                "legacy_field_averaged_models": dict(runtime.legacy_field_averaged_models),
             },
             "traversal": {
                 "outer_level": int(runtime.outer_level),
@@ -263,8 +268,8 @@ def runtime_to_config(runtime: PredictRuntime) -> dict[str, Any]:
                 },
             },
             "coverage": {
-                "resolved_ee_threshold": float(runtime.coverage_ee_threshold_resolved),
-                "averaged_ee_threshold": float(runtime.coverage_ee_threshold_averaged),
+                "on_axis_ee_threshold": float(runtime.on_axis_ee_threshold),
+                "field_averaged_ee_threshold": float(runtime.field_averaged_ee_threshold),
             },
         }
     )
@@ -420,8 +425,8 @@ def _validate_runtime_values(
     prediction_wavelength: float,
     seeing_wavelength: float,
     seeing_fwhm: float,
-    coverage_resolved: float,
-    coverage_averaged: float,
+    on_axis_ee_threshold: float,
+    field_averaged_ee_threshold: float,
 ) -> None:
     if fov_arcsec <= 0:
         raise BuildError("Runtime config ao_system.fov_arcsec must be positive")
@@ -458,7 +463,7 @@ def _validate_runtime_values(
         )
     if seeing_fwhm < 0:
         raise BuildError("Runtime config best.seeing_baseline.fwhm_mas must be non-negative")
-    if coverage_resolved < 0:
-        raise BuildError("Runtime config coverage.resolved_ee_threshold must be non-negative")
-    if coverage_averaged < 0:
-        raise BuildError("Runtime config coverage.averaged_ee_threshold must be non-negative")
+    if on_axis_ee_threshold < 0:
+        raise BuildError("Runtime config coverage.on_axis_ee_threshold must be non-negative")
+    if field_averaged_ee_threshold < 0:
+        raise BuildError("Runtime config coverage.field_averaged_ee_threshold must be non-negative")

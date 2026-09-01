@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import sqlite3
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from astropy.io import fits
-from astropy.table import Table
 import h5py
 import numpy as np
+from astropy.io import fits
+from astropy.table import Table
 
 from .._hdf5 import ensure_hdf5_filters, hdf5_dataset_options
 from ..build._constants import ASTERISMS_DTYPE, WORK_STATUS_DONE
@@ -28,7 +28,6 @@ from .lookup import (
     _normalize_outer_pixels,
     _passes_lookup_metric_filters,
 )
-
 
 ASTERISM_EXPORT_FORMATS: tuple[str, ...] = ("hdf5", "fits")
 ASTERISM_EXPORT_DTYPE: np.dtype = np.dtype(
@@ -188,10 +187,10 @@ def _build_export_database(
                 representative_json TEXT NOT NULL,
                 outer_pix INTEGER NOT NULL,
                 inner_pixel_count INTEGER NOT NULL,
-                sum_winner_ee_resolved REAL NOT NULL,
-                count_winner_ee_resolved INTEGER NOT NULL,
-                sum_winner_ee_averaged REAL NOT NULL,
-                count_winner_ee_averaged INTEGER NOT NULL,
+                sum_on_axis_winner_ee REAL NOT NULL,
+                count_on_axis_winner_ee INTEGER NOT NULL,
+                sum_field_averaged_winner_ee REAL NOT NULL,
+                count_field_averaged_winner_ee INTEGER NOT NULL,
                 sum_gaia_A0 REAL NOT NULL,
                 count_gaia_A0 INTEGER NOT NULL
             )
@@ -224,10 +223,10 @@ def _build_export_database(
                         json.dumps(_jsonable_representative(observation.representative)),
                         int(observation.outer_pix),
                         int(len(observation.support)),
-                        sums["winner_ee_resolved"],
-                        counts["winner_ee_resolved"],
-                        sums["winner_ee_averaged"],
-                        counts["winner_ee_averaged"],
+                        sums["on_axis_winner_ee"],
+                        counts["on_axis_winner_ee"],
+                        sums["field_averaged_winner_ee"],
+                        counts["field_averaged_winner_ee"],
                         sums["gaia_A0"],
                         counts["gaia_A0"],
                     ),
@@ -238,20 +237,20 @@ def _build_export_database(
                     """
                     UPDATE asterisms
                     SET inner_pixel_count = inner_pixel_count + ?,
-                        sum_winner_ee_resolved = sum_winner_ee_resolved + ?,
-                        count_winner_ee_resolved = count_winner_ee_resolved + ?,
-                        sum_winner_ee_averaged = sum_winner_ee_averaged + ?,
-                        count_winner_ee_averaged = count_winner_ee_averaged + ?,
+                        sum_on_axis_winner_ee = sum_on_axis_winner_ee + ?,
+                        count_on_axis_winner_ee = count_on_axis_winner_ee + ?,
+                        sum_field_averaged_winner_ee = sum_field_averaged_winner_ee + ?,
+                        count_field_averaged_winner_ee = count_field_averaged_winner_ee + ?,
                         sum_gaia_A0 = sum_gaia_A0 + ?,
                         count_gaia_A0 = count_gaia_A0 + ?
                     WHERE key = ?
                     """,
                     (
                         int(len(observation.support)),
-                        sums["winner_ee_resolved"],
-                        counts["winner_ee_resolved"],
-                        sums["winner_ee_averaged"],
-                        counts["winner_ee_averaged"],
+                        sums["on_axis_winner_ee"],
+                        counts["on_axis_winner_ee"],
+                        sums["field_averaged_winner_ee"],
+                        counts["field_averaged_winner_ee"],
                         sums["gaia_A0"],
                         counts["gaia_A0"],
                         key,
@@ -283,10 +282,10 @@ def _collect_export_rows(
                 representative_json,
                 outer_pix,
                 inner_pixel_count,
-                sum_winner_ee_resolved,
-                count_winner_ee_resolved,
-                sum_winner_ee_averaged,
-                count_winner_ee_averaged,
+                sum_on_axis_winner_ee,
+                count_on_axis_winner_ee,
+                sum_field_averaged_winner_ee,
+                count_field_averaged_winner_ee,
                 sum_gaia_A0,
                 count_gaia_A0
             FROM asterisms
@@ -311,8 +310,8 @@ def _record_to_export_row(record: tuple[Any, ...]) -> dict[str, object]:
         row[name] = representative[name]
     row["inner_pixel_count"] = int(record[2])
     metric_records = {
-        "winner_ee_resolved": (float(record[3]), int(record[4])),
-        "winner_ee_averaged": (float(record[5]), int(record[6])),
+        "on_axis_winner_ee": (float(record[3]), int(record[4])),
+        "field_averaged_winner_ee": (float(record[5]), int(record[6])),
         "gaia_A0": (float(record[7]), int(record[8])),
     }
     for field_name, (value_sum, value_count) in metric_records.items():

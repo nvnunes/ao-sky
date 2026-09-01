@@ -6,7 +6,9 @@ from typing import Final
 
 import numpy as np
 
-BUILD_LAYOUT_VERSION: Final[int] = 2
+BUILD_LAYOUT_VERSION: Final[int] = 3
+RUNTIME_CONFIG_SCHEMA_VERSION: Final[int] = 3
+ARTIFACT_LAYOUT_VERSION_ATTRIBUTE: Final[str] = "layout_version"
 BUILD_FILENAME: Final[str] = "build.h5"
 BUILD_LOG_FILENAME: Final[str] = "build.log"
 RUNTIME_CONFIG_FILENAME: Final[str] = "build.yaml"
@@ -59,10 +61,10 @@ INNER_DTYPE: Final[np.dtype] = np.dtype(
         ("best_sr", "<f8"),
         ("best_fwhm", "<f8"),
         ("winner_asterism_id", "<i8"),
-        ("winner_ee_resolved", "<f8"),
-        ("winner_ee_averaged", "<f8"),
-        ("coverage_resolved", "?"),
-        ("coverage_averaged", "?"),
+        ("on_axis_winner_ee", "<f8"),
+        ("field_averaged_winner_ee", "<f8"),
+        ("on_axis_coverage", "?"),
+        ("field_averaged_coverage", "?"),
     ]
 )
 
@@ -98,10 +100,10 @@ MAPS_DTYPE: Final[np.dtype] = np.dtype(
         ("best_sr", "<f8"),
         ("best_ee", "<f8"),
         ("best_fwhm", "<f8"),
-        ("winner_ee_resolved", "<f8"),
-        ("winner_ee_averaged", "<f8"),
-        ("coverage_resolved", "<f8"),
-        ("coverage_averaged", "<f8"),
+        ("on_axis_winner_ee", "<f8"),
+        ("field_averaged_winner_ee", "<f8"),
+        ("on_axis_coverage", "<f8"),
+        ("field_averaged_coverage", "<f8"),
     ]
 )
 
@@ -115,8 +117,8 @@ MAPS_MEAN_FIELDS: Final[tuple[str, ...]] = (
     "best_sr",
     "best_ee",
     "best_fwhm",
-    "winner_ee_resolved",
-    "winner_ee_averaged",
-    "coverage_resolved",
-    "coverage_averaged",
+    "on_axis_winner_ee",
+    "field_averaged_winner_ee",
+    "on_axis_coverage",
+    "field_averaged_coverage",
 )

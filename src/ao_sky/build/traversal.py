@@ -2,31 +2,33 @@
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import math
 from pathlib import Path
-import time
 
 import astropy.units as u
-from astropy.coordinates import SkyCoord, search_around_sky
-from astropy.table import Table
 import astropy_healpix
 import numpy as np
+from astropy.coordinates import SkyCoord, search_around_sky
+from astropy.table import Table
 
 from ..asterisms import load_asterism_stars
 from ..dust import add_gaia_a0_to_inner
 from ..gaia import GAIA_SCHEMA_COLUMNS, GaiaHealpixStore, compute_r_magnitude
 from ..predict import (
     clear_backend_cache,
-    get_mean_model,
-    get_point_model,
+    get_model,
     get_seeing_baseline_performance,
-    predict_field_mean_arrays,
-    predict_point_arrays,
+    predict_arrays,
 )
 from ..predict._models import PredictRuntime, SeeingBaselinePerformance
-from ..predict.service import PredictionArrayTelemetry
+from ..predict.service import (
+    PredictionArrayTelemetry,
+    _get_legacy_field_averaged_model,
+    _predict_legacy_field_averaged_arrays,
+)
 from ..spatial import (
     get_parent_pixel,
     get_pixel_area,
@@ -38,7 +40,11 @@ from ..spatial import (
 from ._exceptions import BuildError
 from ._models import (
     DEFAULT_BACKEND_BUCKETS as _DEFAULT_BACKEND_BUCKETS,
+)
+from ._models import (
     DEFAULT_PREDICTION_BATCH_SIZE as _DEFAULT_PREDICTION_BATCH_SIZE,
+)
+from ._models import (
     TraversalExecutionConfig,
     TraversalStageStats,
     TraversalStructureStats,
@@ -216,24 +222,24 @@ class TraversalStageProfile:
     local_selection_seconds: float = 0.0
     inner_table_seconds: float = 0.0
     context_seconds: float = 0.0
-    point_prediction_seconds: float = 0.0
-    point_prediction_eligibility_seconds: float = 0.0
-    point_prediction_eligibility_intersection_seconds: float = 0.0
-    point_prediction_eligibility_extract_seconds: float = 0.0
-    point_prediction_buffer_seconds: float = 0.0
-    point_prediction_ngs_array_seconds: float = 0.0
-    point_prediction_model_seconds: float = 0.0
-    point_prediction_feature_seconds: float = 0.0
-    point_prediction_backend_seconds: float = 0.0
-    point_prediction_scatter_seconds: float = 0.0
-    point_prediction_scatter_filter_seconds: float = 0.0
-    point_prediction_scatter_merge_seconds: float = 0.0
-    point_prediction_scatter_sort_seconds: float = 0.0
-    point_prediction_scatter_write_seconds: float = 0.0
-    point_prediction_cache_clear_seconds: float = 0.0
-    field_mean_prediction_seconds: float = 0.0
-    field_mean_prediction_feature_seconds: float = 0.0
-    field_mean_prediction_backend_seconds: float = 0.0
+    on_axis_prediction_seconds: float = 0.0
+    on_axis_prediction_eligibility_seconds: float = 0.0
+    on_axis_prediction_eligibility_intersection_seconds: float = 0.0
+    on_axis_prediction_eligibility_extract_seconds: float = 0.0
+    on_axis_prediction_buffer_seconds: float = 0.0
+    on_axis_prediction_ngs_array_seconds: float = 0.0
+    on_axis_prediction_model_seconds: float = 0.0
+    on_axis_prediction_feature_seconds: float = 0.0
+    on_axis_prediction_backend_seconds: float = 0.0
+    on_axis_prediction_scatter_seconds: float = 0.0
+    on_axis_prediction_scatter_filter_seconds: float = 0.0
+    on_axis_prediction_scatter_merge_seconds: float = 0.0
+    on_axis_prediction_scatter_sort_seconds: float = 0.0
+    on_axis_prediction_scatter_write_seconds: float = 0.0
+    on_axis_prediction_cache_clear_seconds: float = 0.0
+    field_averaged_prediction_seconds: float = 0.0
+    field_averaged_prediction_feature_seconds: float = 0.0
+    field_averaged_prediction_backend_seconds: float = 0.0
     coverage_seconds: float = 0.0
     dust_seconds: float = 0.0
     persisted_asterisms_seconds: float = 0.0
@@ -248,43 +254,43 @@ class TraversalStageProfile:
             local_selection_seconds=self.local_selection_seconds,
             inner_table_seconds=self.inner_table_seconds,
             context_seconds=self.context_seconds,
-            point_prediction_seconds=self.point_prediction_seconds,
-            point_prediction_eligibility_seconds=(
-                self.point_prediction_eligibility_seconds
+            on_axis_prediction_seconds=self.on_axis_prediction_seconds,
+            on_axis_prediction_eligibility_seconds=(
+                self.on_axis_prediction_eligibility_seconds
             ),
-            point_prediction_eligibility_intersection_seconds=(
-                self.point_prediction_eligibility_intersection_seconds
+            on_axis_prediction_eligibility_intersection_seconds=(
+                self.on_axis_prediction_eligibility_intersection_seconds
             ),
-            point_prediction_eligibility_extract_seconds=(
-                self.point_prediction_eligibility_extract_seconds
+            on_axis_prediction_eligibility_extract_seconds=(
+                self.on_axis_prediction_eligibility_extract_seconds
             ),
-            point_prediction_buffer_seconds=self.point_prediction_buffer_seconds,
-            point_prediction_ngs_array_seconds=self.point_prediction_ngs_array_seconds,
-            point_prediction_model_seconds=self.point_prediction_model_seconds,
-            point_prediction_feature_seconds=self.point_prediction_feature_seconds,
-            point_prediction_backend_seconds=self.point_prediction_backend_seconds,
-            point_prediction_scatter_seconds=self.point_prediction_scatter_seconds,
-            point_prediction_scatter_filter_seconds=(
-                self.point_prediction_scatter_filter_seconds
+            on_axis_prediction_buffer_seconds=self.on_axis_prediction_buffer_seconds,
+            on_axis_prediction_ngs_array_seconds=self.on_axis_prediction_ngs_array_seconds,
+            on_axis_prediction_model_seconds=self.on_axis_prediction_model_seconds,
+            on_axis_prediction_feature_seconds=self.on_axis_prediction_feature_seconds,
+            on_axis_prediction_backend_seconds=self.on_axis_prediction_backend_seconds,
+            on_axis_prediction_scatter_seconds=self.on_axis_prediction_scatter_seconds,
+            on_axis_prediction_scatter_filter_seconds=(
+                self.on_axis_prediction_scatter_filter_seconds
             ),
-            point_prediction_scatter_merge_seconds=(
-                self.point_prediction_scatter_merge_seconds
+            on_axis_prediction_scatter_merge_seconds=(
+                self.on_axis_prediction_scatter_merge_seconds
             ),
-            point_prediction_scatter_sort_seconds=(
-                self.point_prediction_scatter_sort_seconds
+            on_axis_prediction_scatter_sort_seconds=(
+                self.on_axis_prediction_scatter_sort_seconds
             ),
-            point_prediction_scatter_write_seconds=(
-                self.point_prediction_scatter_write_seconds
+            on_axis_prediction_scatter_write_seconds=(
+                self.on_axis_prediction_scatter_write_seconds
             ),
-            point_prediction_cache_clear_seconds=(
-                self.point_prediction_cache_clear_seconds
+            on_axis_prediction_cache_clear_seconds=(
+                self.on_axis_prediction_cache_clear_seconds
             ),
-            field_mean_prediction_seconds=self.field_mean_prediction_seconds,
-            field_mean_prediction_feature_seconds=(
-                self.field_mean_prediction_feature_seconds
+            field_averaged_prediction_seconds=self.field_averaged_prediction_seconds,
+            field_averaged_prediction_feature_seconds=(
+                self.field_averaged_prediction_feature_seconds
             ),
-            field_mean_prediction_backend_seconds=(
-                self.field_mean_prediction_backend_seconds
+            field_averaged_prediction_backend_seconds=(
+                self.field_averaged_prediction_backend_seconds
             ),
             coverage_seconds=self.coverage_seconds,
             dust_seconds=self.dust_seconds,
@@ -308,30 +314,30 @@ class TraversalStructureProfile:
     context_pair_rows: int = 0
     winner_rows: int = 0
     winner_payload_rows: int = 0
-    point_prediction_batches: int = 0
-    point_prediction_rows: int = 0
-    recovered_point_prediction_rows: int = 0
+    on_axis_prediction_batches: int = 0
+    on_axis_prediction_rows: int = 0
+    recovered_on_axis_prediction_rows: int = 0
     recovered_winner_pixels: int = 0
-    point_prediction_batch_rows_peak: int = 0
-    point_prediction_backend_rows: int = 0
-    point_prediction_backend_batch_rows_peak: int = 0
-    point_feature_bytes_peak: int = 0
-    point_mps_current_bytes_peak: int = 0
-    point_mps_driver_bytes_peak: int = 0
-    point_mps_recommended_bytes: int = 0
-    point_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
-    point_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
-    field_mean_prediction_batches: int = 0
-    field_mean_prediction_rows: int = 0
-    field_mean_prediction_batch_rows_peak: int = 0
-    field_mean_prediction_backend_rows: int = 0
-    field_mean_prediction_backend_batch_rows_peak: int = 0
-    field_mean_feature_bytes_peak: int = 0
-    field_mean_mps_current_bytes_peak: int = 0
-    field_mean_mps_driver_bytes_peak: int = 0
-    field_mean_mps_recommended_bytes: int = 0
-    field_mean_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
-    field_mean_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
+    on_axis_prediction_batch_rows_peak: int = 0
+    on_axis_prediction_backend_rows: int = 0
+    on_axis_prediction_backend_batch_rows_peak: int = 0
+    on_axis_feature_bytes_peak: int = 0
+    on_axis_mps_current_bytes_peak: int = 0
+    on_axis_mps_driver_bytes_peak: int = 0
+    on_axis_mps_recommended_bytes: int = 0
+    on_axis_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
+    on_axis_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
+    field_averaged_prediction_batches: int = 0
+    field_averaged_prediction_rows: int = 0
+    field_averaged_prediction_batch_rows_peak: int = 0
+    field_averaged_prediction_backend_rows: int = 0
+    field_averaged_prediction_backend_batch_rows_peak: int = 0
+    field_averaged_feature_bytes_peak: int = 0
+    field_averaged_mps_current_bytes_peak: int = 0
+    field_averaged_mps_driver_bytes_peak: int = 0
+    field_averaged_mps_recommended_bytes: int = 0
+    field_averaged_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
+    field_averaged_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
     search_star_rows_peak: int = 0
     ngs_rows_peak: int = 0
     close_pair_rows_peak: int = 0
@@ -354,46 +360,46 @@ class TraversalStructureProfile:
             context_pair_rows=self.context_pair_rows,
             winner_rows=self.winner_rows,
             winner_payload_rows=self.winner_payload_rows,
-            point_prediction_batches=self.point_prediction_batches,
-            point_prediction_rows=self.point_prediction_rows,
-            recovered_point_prediction_rows=self.recovered_point_prediction_rows,
+            on_axis_prediction_batches=self.on_axis_prediction_batches,
+            on_axis_prediction_rows=self.on_axis_prediction_rows,
+            recovered_on_axis_prediction_rows=self.recovered_on_axis_prediction_rows,
             recovered_winner_pixels=self.recovered_winner_pixels,
-            point_prediction_batch_rows_peak=self.point_prediction_batch_rows_peak,
-            point_prediction_backend_rows=self.point_prediction_backend_rows,
-            point_prediction_backend_batch_rows_peak=(
-                self.point_prediction_backend_batch_rows_peak
+            on_axis_prediction_batch_rows_peak=self.on_axis_prediction_batch_rows_peak,
+            on_axis_prediction_backend_rows=self.on_axis_prediction_backend_rows,
+            on_axis_prediction_backend_batch_rows_peak=(
+                self.on_axis_prediction_backend_batch_rows_peak
             ),
-            point_prediction_backend_bucket_counts=tuple(
-                sorted(self.point_backend_bucket_counts.items())
+            on_axis_prediction_backend_bucket_counts=tuple(
+                sorted(self.on_axis_backend_bucket_counts.items())
             ),
-            point_prediction_backend_bucket_rows=tuple(
-                sorted(self.point_backend_bucket_rows.items())
+            on_axis_prediction_backend_bucket_rows=tuple(
+                sorted(self.on_axis_backend_bucket_rows.items())
             ),
-            point_feature_bytes_peak=self.point_feature_bytes_peak,
-            point_mps_current_bytes_peak=self.point_mps_current_bytes_peak,
-            point_mps_driver_bytes_peak=self.point_mps_driver_bytes_peak,
-            point_mps_recommended_bytes=self.point_mps_recommended_bytes,
-            field_mean_prediction_batches=self.field_mean_prediction_batches,
-            field_mean_prediction_rows=self.field_mean_prediction_rows,
-            field_mean_prediction_batch_rows_peak=(
-                self.field_mean_prediction_batch_rows_peak
+            on_axis_feature_bytes_peak=self.on_axis_feature_bytes_peak,
+            on_axis_mps_current_bytes_peak=self.on_axis_mps_current_bytes_peak,
+            on_axis_mps_driver_bytes_peak=self.on_axis_mps_driver_bytes_peak,
+            on_axis_mps_recommended_bytes=self.on_axis_mps_recommended_bytes,
+            field_averaged_prediction_batches=self.field_averaged_prediction_batches,
+            field_averaged_prediction_rows=self.field_averaged_prediction_rows,
+            field_averaged_prediction_batch_rows_peak=(
+                self.field_averaged_prediction_batch_rows_peak
             ),
-            field_mean_prediction_backend_rows=(
-                self.field_mean_prediction_backend_rows
+            field_averaged_prediction_backend_rows=(
+                self.field_averaged_prediction_backend_rows
             ),
-            field_mean_prediction_backend_batch_rows_peak=(
-                self.field_mean_prediction_backend_batch_rows_peak
+            field_averaged_prediction_backend_batch_rows_peak=(
+                self.field_averaged_prediction_backend_batch_rows_peak
             ),
-            field_mean_prediction_backend_bucket_counts=tuple(
-                sorted(self.field_mean_backend_bucket_counts.items())
+            field_averaged_prediction_backend_bucket_counts=tuple(
+                sorted(self.field_averaged_backend_bucket_counts.items())
             ),
-            field_mean_prediction_backend_bucket_rows=tuple(
-                sorted(self.field_mean_backend_bucket_rows.items())
+            field_averaged_prediction_backend_bucket_rows=tuple(
+                sorted(self.field_averaged_backend_bucket_rows.items())
             ),
-            field_mean_feature_bytes_peak=self.field_mean_feature_bytes_peak,
-            field_mean_mps_current_bytes_peak=self.field_mean_mps_current_bytes_peak,
-            field_mean_mps_driver_bytes_peak=self.field_mean_mps_driver_bytes_peak,
-            field_mean_mps_recommended_bytes=self.field_mean_mps_recommended_bytes,
+            field_averaged_feature_bytes_peak=self.field_averaged_feature_bytes_peak,
+            field_averaged_mps_current_bytes_peak=self.field_averaged_mps_current_bytes_peak,
+            field_averaged_mps_driver_bytes_peak=self.field_averaged_mps_driver_bytes_peak,
+            field_averaged_mps_recommended_bytes=self.field_averaged_mps_recommended_bytes,
             search_star_rows_peak=self.search_star_rows_peak or self.search_star_rows,
             ngs_rows_peak=self.ngs_rows_peak or self.ngs_rows,
             close_pair_rows_peak=self.close_pair_rows_peak or self.close_pair_rows,
@@ -422,10 +428,10 @@ class TraversalMemoryProfile:
     peak_rss_after_filtering_mb: float = 0.0
     rss_after_context_mb: float = 0.0
     peak_rss_after_context_mb: float = 0.0
-    rss_after_point_prediction_mb: float = 0.0
-    peak_rss_after_point_prediction_mb: float = 0.0
-    rss_after_field_mean_mb: float = 0.0
-    peak_rss_after_field_mean_mb: float = 0.0
+    rss_after_on_axis_prediction_mb: float = 0.0
+    peak_rss_after_on_axis_prediction_mb: float = 0.0
+    rss_after_field_averaged_mb: float = 0.0
+    peak_rss_after_field_averaged_mb: float = 0.0
     rss_after_coverage_mb: float = 0.0
     peak_rss_after_coverage_mb: float = 0.0
     rss_after_dust_mb: float = 0.0
@@ -496,7 +502,7 @@ class _RegionalCandidateStats:
     max_depth: int
     max_regional_combination_work: int
     exact_combination_work: int
-    final_resolved_inferences: int
+    final_on_axis_inferences: int
     incomplete_for_regions: int
 
 
@@ -535,94 +541,94 @@ def _new_prediction_telemetry(
 def _record_prediction_telemetry(
     telemetry: PredictionArrayTelemetry | None,
     *,
-    resolved: bool,
+    on_axis: bool,
     profile: TraversalStageProfile | None,
     structure_profile: TraversalStructureProfile | None,
 ) -> None:
     if telemetry is None:
         return
     if profile is not None:
-        if resolved:
-            profile.point_prediction_feature_seconds += telemetry.feature_seconds
-            profile.point_prediction_backend_seconds += telemetry.backend_seconds
+        if on_axis:
+            profile.on_axis_prediction_feature_seconds += telemetry.feature_seconds
+            profile.on_axis_prediction_backend_seconds += telemetry.backend_seconds
         else:
-            profile.field_mean_prediction_feature_seconds += telemetry.feature_seconds
-            profile.field_mean_prediction_backend_seconds += telemetry.backend_seconds
+            profile.field_averaged_prediction_feature_seconds += telemetry.feature_seconds
+            profile.field_averaged_prediction_backend_seconds += telemetry.backend_seconds
     if structure_profile is not None:
-        if resolved:
-            structure_profile.point_prediction_batches += int(telemetry.batches)
-            structure_profile.point_prediction_rows += int(telemetry.rows)
-            structure_profile.point_prediction_batch_rows_peak = max(
-                structure_profile.point_prediction_batch_rows_peak,
+        if on_axis:
+            structure_profile.on_axis_prediction_batches += int(telemetry.batches)
+            structure_profile.on_axis_prediction_rows += int(telemetry.rows)
+            structure_profile.on_axis_prediction_batch_rows_peak = max(
+                structure_profile.on_axis_prediction_batch_rows_peak,
                 int(telemetry.batch_rows_peak),
             )
-            structure_profile.point_prediction_backend_rows += int(
+            structure_profile.on_axis_prediction_backend_rows += int(
                 telemetry.backend_rows
             )
-            structure_profile.point_prediction_backend_batch_rows_peak = max(
-                structure_profile.point_prediction_backend_batch_rows_peak,
+            structure_profile.on_axis_prediction_backend_batch_rows_peak = max(
+                structure_profile.on_axis_prediction_backend_batch_rows_peak,
                 int(telemetry.backend_batch_rows_peak),
             )
             _merge_bucket_stats(
-                structure_profile.point_backend_bucket_counts,
+                structure_profile.on_axis_backend_bucket_counts,
                 telemetry.backend_bucket_counts,
             )
             _merge_bucket_stats(
-                structure_profile.point_backend_bucket_rows,
+                structure_profile.on_axis_backend_bucket_rows,
                 telemetry.backend_bucket_rows,
             )
-            structure_profile.point_feature_bytes_peak = max(
-                structure_profile.point_feature_bytes_peak,
+            structure_profile.on_axis_feature_bytes_peak = max(
+                structure_profile.on_axis_feature_bytes_peak,
                 int(telemetry.feature_bytes_peak),
             )
-            structure_profile.point_mps_current_bytes_peak = max(
-                structure_profile.point_mps_current_bytes_peak,
+            structure_profile.on_axis_mps_current_bytes_peak = max(
+                structure_profile.on_axis_mps_current_bytes_peak,
                 int(telemetry.mps_current_bytes_peak),
             )
-            structure_profile.point_mps_driver_bytes_peak = max(
-                structure_profile.point_mps_driver_bytes_peak,
+            structure_profile.on_axis_mps_driver_bytes_peak = max(
+                structure_profile.on_axis_mps_driver_bytes_peak,
                 int(telemetry.mps_driver_bytes_peak),
             )
-            structure_profile.point_mps_recommended_bytes = max(
-                structure_profile.point_mps_recommended_bytes,
+            structure_profile.on_axis_mps_recommended_bytes = max(
+                structure_profile.on_axis_mps_recommended_bytes,
                 int(telemetry.mps_recommended_bytes),
             )
         else:
-            structure_profile.field_mean_prediction_batches += int(telemetry.batches)
-            structure_profile.field_mean_prediction_rows += int(telemetry.rows)
-            structure_profile.field_mean_prediction_batch_rows_peak = max(
-                structure_profile.field_mean_prediction_batch_rows_peak,
+            structure_profile.field_averaged_prediction_batches += int(telemetry.batches)
+            structure_profile.field_averaged_prediction_rows += int(telemetry.rows)
+            structure_profile.field_averaged_prediction_batch_rows_peak = max(
+                structure_profile.field_averaged_prediction_batch_rows_peak,
                 int(telemetry.batch_rows_peak),
             )
-            structure_profile.field_mean_prediction_backend_rows += int(
+            structure_profile.field_averaged_prediction_backend_rows += int(
                 telemetry.backend_rows
             )
-            structure_profile.field_mean_prediction_backend_batch_rows_peak = max(
-                structure_profile.field_mean_prediction_backend_batch_rows_peak,
+            structure_profile.field_averaged_prediction_backend_batch_rows_peak = max(
+                structure_profile.field_averaged_prediction_backend_batch_rows_peak,
                 int(telemetry.backend_batch_rows_peak),
             )
             _merge_bucket_stats(
-                structure_profile.field_mean_backend_bucket_counts,
+                structure_profile.field_averaged_backend_bucket_counts,
                 telemetry.backend_bucket_counts,
             )
             _merge_bucket_stats(
-                structure_profile.field_mean_backend_bucket_rows,
+                structure_profile.field_averaged_backend_bucket_rows,
                 telemetry.backend_bucket_rows,
             )
-            structure_profile.field_mean_feature_bytes_peak = max(
-                structure_profile.field_mean_feature_bytes_peak,
+            structure_profile.field_averaged_feature_bytes_peak = max(
+                structure_profile.field_averaged_feature_bytes_peak,
                 int(telemetry.feature_bytes_peak),
             )
-            structure_profile.field_mean_mps_current_bytes_peak = max(
-                structure_profile.field_mean_mps_current_bytes_peak,
+            structure_profile.field_averaged_mps_current_bytes_peak = max(
+                structure_profile.field_averaged_mps_current_bytes_peak,
                 int(telemetry.mps_current_bytes_peak),
             )
-            structure_profile.field_mean_mps_driver_bytes_peak = max(
-                structure_profile.field_mean_mps_driver_bytes_peak,
+            structure_profile.field_averaged_mps_driver_bytes_peak = max(
+                structure_profile.field_averaged_mps_driver_bytes_peak,
                 int(telemetry.mps_driver_bytes_peak),
             )
-            structure_profile.field_mean_mps_recommended_bytes = max(
-                structure_profile.field_mean_mps_recommended_bytes,
+            structure_profile.field_averaged_mps_recommended_bytes = max(
+                structure_profile.field_averaged_mps_recommended_bytes,
                 int(telemetry.mps_recommended_bytes),
             )
 
@@ -631,7 +637,7 @@ def _clear_backend_cache_with_profile(profile: TraversalStageProfile | None) -> 
     started = time.perf_counter()
     clear_backend_cache()
     if profile is not None:
-        profile.point_prediction_cache_clear_seconds += time.perf_counter() - started
+        profile.on_axis_prediction_cache_clear_seconds += time.perf_counter() - started
 
 
 @dataclass(slots=True)
@@ -929,10 +935,10 @@ def build_base_inner_table(
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_ee_resolved",
-            "winner_ee_averaged",
-            "coverage_resolved",
-            "coverage_averaged",
+            "on_axis_winner_ee",
+            "field_averaged_winner_ee",
+            "on_axis_coverage",
+            "field_averaged_coverage",
         ),
     )
 
@@ -1907,7 +1913,7 @@ def _build_region_star_bitsets(
     return bitsets
 
 
-def _count_final_candidate_graph_resolved_inferences(
+def _count_final_candidate_graph_on_axis_inferences(
     graph: _CandidateGraph,
     coverage: _StarForCoverage,
     ngs: Table,
@@ -2075,7 +2081,7 @@ def _build_regional_candidate_graph(
         graph = _build_candidate_graph_from_source_keys(ngs, candidate_keys, runtime)
         return (
             graph,
-            _count_final_candidate_graph_resolved_inferences(
+            _count_final_candidate_graph_on_axis_inferences(
                 graph,
                 coverage,
                 ngs,
@@ -2085,7 +2091,7 @@ def _build_regional_candidate_graph(
             incomplete_regions,
         )
 
-    graph, final_resolved_inferences, incomplete_for_regions = build_for_graph()
+    graph, final_on_axis_inferences, incomplete_for_regions = build_for_graph()
 
     return graph, _RegionalCandidateStats(
         exact_regions=exact_regions,
@@ -2094,7 +2100,7 @@ def _build_regional_candidate_graph(
         max_depth=deepest_region,
         max_regional_combination_work=max_regional_combination_work,
         exact_combination_work=exact_combination_work,
-        final_resolved_inferences=final_resolved_inferences,
+        final_on_axis_inferences=final_on_axis_inferences,
         incomplete_for_regions=incomplete_for_regions,
     )
 
@@ -2240,7 +2246,7 @@ def _scatter_top_candidates(
     finite = np.isfinite(ee)
     if not np.any(finite):
         if profile is not None:
-            profile.point_prediction_scatter_filter_seconds += (
+            profile.on_axis_prediction_scatter_filter_seconds += (
                 time.perf_counter() - started
             )
         return
@@ -2253,7 +2259,7 @@ def _scatter_top_candidates(
     batch_pointing_x = np.asarray(pointing_x, dtype=np.float64)[finite]
     batch_pointing_y = np.asarray(pointing_y, dtype=np.float64)[finite]
     if profile is not None:
-        profile.point_prediction_scatter_filter_seconds += (
+        profile.on_axis_prediction_scatter_filter_seconds += (
             time.perf_counter() - started
         )
 
@@ -2281,7 +2287,7 @@ def _scatter_top_candidates(
         (existing_pointing_y[existing_valid], batch_pointing_y)
     )
     if profile is not None:
-        profile.point_prediction_scatter_merge_seconds += (
+        profile.on_axis_prediction_scatter_merge_seconds += (
             time.perf_counter() - started
         )
 
@@ -2296,7 +2302,7 @@ def _scatter_top_candidates(
     ranks = np.arange(len(sorted_pixels)) - group_start_indexes
     keep = ranks < top_k
     if profile is not None:
-        profile.point_prediction_scatter_sort_seconds += time.perf_counter() - started
+        profile.on_axis_prediction_scatter_sort_seconds += time.perf_counter() - started
 
     started = time.perf_counter()
     top_refs[affected_pixels] = -1
@@ -2325,10 +2331,10 @@ def _scatter_top_candidates(
     best_sr[improved_pixels] = top_sr[improved_pixels, 0]
     best_fwhm[improved_pixels] = top_fwhm[improved_pixels, 0]
     if profile is not None:
-        profile.point_prediction_scatter_write_seconds += time.perf_counter() - started
+        profile.on_axis_prediction_scatter_write_seconds += time.perf_counter() - started
 
 
-def _flush_resolved_prediction_rows(
+def _flush_on_axis_prediction_rows(
     runtime: PredictRuntime,
     execution_config: TraversalExecutionConfig,
     *,
@@ -2385,17 +2391,17 @@ def _flush_resolved_prediction_rows(
         pointing_y=pointing_y_array,
     )
     if profile is not None:
-        profile.point_prediction_ngs_array_seconds += time.perf_counter() - started
+        profile.on_axis_prediction_ngs_array_seconds += time.perf_counter() - started
     started = time.perf_counter()
-    model = get_point_model(
+    model = get_model(
         runtime,
         num_stars,
-        device=execution_config.prediction_device,
+        device=execution_config.device,
     )
     if profile is not None:
-        profile.point_prediction_model_seconds += time.perf_counter() - started
+        profile.on_axis_prediction_model_seconds += time.perf_counter() - started
     prediction_telemetry = _new_prediction_telemetry(profile, structure_profile)
-    metrics = predict_point_arrays(
+    metrics = predict_arrays(
         runtime,
         num_stars=num_stars,
         model=model,
@@ -2404,21 +2410,21 @@ def _flush_resolved_prediction_rows(
         ngs_mag=ngs_mag,
         backend_row_count=_backend_row_count(
             len(ngs_zd),
-            execution_config.resolved_backend_buckets,
+            execution_config.on_axis_backend_buckets,
         ),
         feature_buffer_row_count=_backend_buffer_row_count(
-            execution_config.resolved_backend_buckets,
+            execution_config.on_axis_backend_buckets,
         ),
         prediction_telemetry=prediction_telemetry,
     )
     _record_prediction_telemetry(
         prediction_telemetry,
-        resolved=True,
+        on_axis=True,
         profile=profile,
         structure_profile=structure_profile,
     )
     if recovered and structure_profile is not None and prediction_telemetry is not None:
-        structure_profile.recovered_point_prediction_rows += int(
+        structure_profile.recovered_on_axis_prediction_rows += int(
             prediction_telemetry.rows
         )
     started = time.perf_counter()
@@ -2442,10 +2448,10 @@ def _flush_resolved_prediction_rows(
         profile=profile,
     )
     if profile is not None:
-        profile.point_prediction_scatter_seconds += time.perf_counter() - started
+        profile.on_axis_prediction_scatter_seconds += time.perf_counter() - started
 
 
-def _stream_resolved_candidate_predictions(
+def _stream_on_axis_candidate_predictions(
     runtime: PredictRuntime,
     execution_config: TraversalExecutionConfig,
     candidate_set: _CandidateSet,
@@ -2473,7 +2479,7 @@ def _stream_resolved_candidate_predictions(
     inner_count = len(inner_x)
     stream_batch_size = _stream_batch_size(
         execution_config.prediction_batch_size,
-        execution_config.resolved_backend_buckets,
+        execution_config.on_axis_backend_buckets,
     )
     buffer_capacity = stream_batch_size + inner_count
     buffers: dict[int, _PredictionRowBuffer] = {
@@ -2485,9 +2491,9 @@ def _stream_resolved_candidate_predictions(
     prediction_flushes = 0
 
     def maybe_clear_cache() -> None:
-        if execution_config.resolved_cache_clear_every < 1:
+        if execution_config.prediction_cache_clear_every < 1:
             return
-        if prediction_flushes % execution_config.resolved_cache_clear_every == 0:
+        if prediction_flushes % execution_config.prediction_cache_clear_every == 0:
             _clear_backend_cache_with_profile(profile)
 
     for candidate_id, members in enumerate(candidate_set.members):
@@ -2503,11 +2509,11 @@ def _stream_resolved_candidate_predictions(
         pixel_idxs = _bitset_to_indices(eligible_words, inner_count)
         extract_seconds = time.perf_counter() - started
         if profile is not None:
-            profile.point_prediction_eligibility_intersection_seconds += (
+            profile.on_axis_prediction_eligibility_intersection_seconds += (
                 intersection_seconds
             )
-            profile.point_prediction_eligibility_extract_seconds += extract_seconds
-            profile.point_prediction_eligibility_seconds += (
+            profile.on_axis_prediction_eligibility_extract_seconds += extract_seconds
+            profile.on_axis_prediction_eligibility_seconds += (
                 intersection_seconds + extract_seconds
             )
         if len(pixel_idxs) == 0:
@@ -2518,13 +2524,13 @@ def _stream_resolved_candidate_predictions(
         started = time.perf_counter()
         buffer.append(pixel_idxs, int(candidate_id))
         if profile is not None:
-            profile.point_prediction_buffer_seconds += time.perf_counter() - started
+            profile.on_axis_prediction_buffer_seconds += time.perf_counter() - started
         evaluated_rows += int(len(pixel_idxs))
         while buffer.size >= stream_batch_size:
             batch_pixel_idxs, batch_candidate_ids, _, _ = buffer.head(
                 stream_batch_size
             )
-            _flush_resolved_prediction_rows(
+            _flush_on_axis_prediction_rows(
                 runtime,
                 execution_config,
                 num_stars=num_stars,
@@ -2555,7 +2561,7 @@ def _stream_resolved_candidate_predictions(
                 memory_pressure_callback()
     for num_stars, buffer in buffers.items():
         batch_pixel_idxs, batch_candidate_ids, _, _ = buffer.arrays()
-        _flush_resolved_prediction_rows(
+        _flush_on_axis_prediction_rows(
             runtime,
             execution_config,
             num_stars=num_stars,
@@ -2584,7 +2590,7 @@ def _stream_resolved_candidate_predictions(
             maybe_clear_cache()
             if memory_pressure_callback is not None:
                 memory_pressure_callback()
-    if execution_config.resolved_cache_clear_every > 0:
+    if execution_config.prediction_cache_clear_every > 0:
         _clear_backend_cache_with_profile(profile)
     if structure_profile is not None:
         structure_profile.context_pair_rows = int(evaluated_rows)
@@ -2637,7 +2643,7 @@ def _stream_recovered_candidate_predictions(
     ) ** 2
     stream_batch_size = _stream_batch_size(
         execution_config.prediction_batch_size,
-        execution_config.resolved_backend_buckets,
+        execution_config.on_axis_backend_buckets,
     )
     buffer_capacity = stream_batch_size
     buffers: dict[int, _PredictionRowBuffer] = {
@@ -2648,9 +2654,9 @@ def _stream_recovered_candidate_predictions(
     prediction_flushes = 0
 
     def maybe_clear_cache() -> None:
-        if execution_config.resolved_cache_clear_every < 1:
+        if execution_config.prediction_cache_clear_every < 1:
             return
-        if prediction_flushes % execution_config.resolved_cache_clear_every == 0:
+        if prediction_flushes % execution_config.prediction_cache_clear_every == 0:
             _clear_backend_cache_with_profile(profile)
 
     def flush_buffer(num_stars: int, rows: int | None = None) -> None:
@@ -2664,7 +2670,7 @@ def _stream_recovered_candidate_predictions(
         )
         if len(batch_pixel_idxs) == 0:
             return
-        _flush_resolved_prediction_rows(
+        _flush_on_axis_prediction_rows(
             runtime,
             execution_config,
             num_stars=num_stars,
@@ -2748,7 +2754,7 @@ def _stream_recovered_candidate_predictions(
                 flush_buffer(num_stars, stream_batch_size)
     for num_stars in _enabled_candidate_orders(runtime):
         flush_buffer(num_stars)
-    if prediction_flushes > 0 and execution_config.resolved_cache_clear_every > 0:
+    if prediction_flushes > 0 and execution_config.prediction_cache_clear_every > 0:
         _clear_backend_cache_with_profile(profile)
     return recovered_rows
 
@@ -2871,7 +2877,7 @@ def _fill_regularized_winner_fields(
         for index, candidate_id in enumerate(np.asarray(retained_candidate_ids, dtype=np.int64))
     }
     winner_ids = np.full((len(inner),), -1, dtype=np.int64)
-    winner_ee_resolved = np.asarray(inner["winner_ee_resolved"], dtype=np.float64).copy()
+    on_axis_winner_ee = np.asarray(inner["on_axis_winner_ee"], dtype=np.float64).copy()
     winner_pointing_x = np.full((len(inner),), np.nan, dtype=np.float64)
     winner_pointing_y = np.full((len(inner),), np.nan, dtype=np.float64)
     label_array = np.asarray(labels, dtype=np.int64)
@@ -2889,8 +2895,8 @@ def _fill_regularized_winner_fields(
         has_match = valid & np.any(matches, axis=1)
         match_positions = np.argmax(matches, axis=1)
         row_indexes = np.arange(len(label_array), dtype=np.int64)
-        winner_ee_resolved[has_match] = np.fmax(
-            winner_ee_resolved[has_match],
+        on_axis_winner_ee[has_match] = np.fmax(
+            on_axis_winner_ee[has_match],
             top_ee[
                 row_indexes[has_match],
                 match_positions[has_match],
@@ -2905,7 +2911,7 @@ def _fill_regularized_winner_fields(
             match_positions[has_match],
         ]
     inner["winner_asterism_id"] = winner_ids
-    inner["winner_ee_resolved"] = winner_ee_resolved
+    inner["on_axis_winner_ee"] = on_axis_winner_ee
     return candidate_to_asterism_id, winner_pointing_x, winner_pointing_y
 
 
@@ -3005,7 +3011,7 @@ def _build_retained_asterism_table(
     return _to_persisted_asterisms(raw)
 
 
-def _update_regularized_winner_averaged_ee(
+def _update_regularized_field_averaged_winner_ee(
     runtime: PredictRuntime,
     execution_config: TraversalExecutionConfig,
     inner: Table,
@@ -3033,13 +3039,13 @@ def _update_regularized_winner_averaged_ee(
     prediction_flushes = 0
     stream_batch_size = _stream_batch_size(
         execution_config.prediction_batch_size,
-        execution_config.averaged_backend_buckets,
+        execution_config.legacy_field_averaged_backend_buckets,
     )
 
     def maybe_clear_cache() -> None:
-        if execution_config.resolved_cache_clear_every < 1:
+        if execution_config.prediction_cache_clear_every < 1:
             return
-        if prediction_flushes % execution_config.resolved_cache_clear_every == 0:
+        if prediction_flushes % execution_config.prediction_cache_clear_every == 0:
             _clear_backend_cache_with_profile(profile)
 
     for pixel_idx in winner_pixel_idxs:
@@ -3053,10 +3059,10 @@ def _update_regularized_winner_averaged_ee(
         candidate_ids = buffer["candidate_ids"]
         if not pixel_idxs:
             continue
-        model = get_mean_model(
+        model = _get_legacy_field_averaged_model(
             runtime,
             num_stars,
-            device=execution_config.averaged_prediction_device,
+            device=execution_config.device,
         )
         for start_idx in range(0, len(pixel_idxs), stream_batch_size):
             end_idx = min(start_idx + stream_batch_size, len(pixel_idxs))
@@ -3080,7 +3086,7 @@ def _update_regularized_winner_averaged_ee(
                 ],
             )
             prediction_telemetry = _new_prediction_telemetry(profile, structure_profile)
-            predicted_ee_averaged = predict_field_mean_arrays(
+            predicted_field_averaged_ee = _predict_legacy_field_averaged_arrays(
                 runtime,
                 num_stars=num_stars,
                 model=model,
@@ -3089,24 +3095,24 @@ def _update_regularized_winner_averaged_ee(
                 ngs_mag=ngs_mag,
                 backend_row_count=_backend_row_count(
                     len(ngs_zd),
-                    execution_config.averaged_backend_buckets,
+                    execution_config.legacy_field_averaged_backend_buckets,
                 ),
                 feature_buffer_row_count=_backend_buffer_row_count(
-                    execution_config.averaged_backend_buckets,
+                    execution_config.legacy_field_averaged_backend_buckets,
                 ),
                 prediction_telemetry=prediction_telemetry,
             )
-            current_ee_averaged = np.asarray(
-                inner["winner_ee_averaged"],
+            current_field_averaged_ee = np.asarray(
+                inner["field_averaged_winner_ee"],
                 dtype=np.float64,
             )[batch_pixel_idxs]
-            inner["winner_ee_averaged"][batch_pixel_idxs] = np.fmax(
-                current_ee_averaged,
-                predicted_ee_averaged,
+            inner["field_averaged_winner_ee"][batch_pixel_idxs] = np.fmax(
+                current_field_averaged_ee,
+                predicted_field_averaged_ee,
             )
             _record_prediction_telemetry(
                 prediction_telemetry,
-                resolved=False,
+                on_axis=False,
                 profile=profile,
                 structure_profile=structure_profile,
             )
@@ -3114,7 +3120,7 @@ def _update_regularized_winner_averaged_ee(
             maybe_clear_cache()
             if memory_pressure_callback is not None:
                 memory_pressure_callback()
-    if execution_config.resolved_cache_clear_every > 0:
+    if execution_config.prediction_cache_clear_every > 0:
         _clear_backend_cache_with_profile(profile)
 
 
@@ -3247,7 +3253,7 @@ def build_traversal_products(
         top_pointing_y = np.full(top_shape, np.nan, dtype=np.float64)
 
         started = time.perf_counter()
-        _stream_resolved_candidate_predictions(
+        _stream_on_axis_candidate_predictions(
             runtime,
             execution_config,
             candidate_set,
@@ -3316,7 +3322,7 @@ def build_traversal_products(
         inner["best_sr"] = best_sr
         inner["best_fwhm"] = best_fwhm
         if profile is not None:
-            profile.point_prediction_seconds += time.perf_counter() - started
+            profile.on_axis_prediction_seconds += time.perf_counter() - started
         if structure_profile is not None:
             structure_profile.winner_payload_rows = int(np.count_nonzero(top_refs[:, 0] >= 0))
             structure_profile.search_star_rows_peak = int(len(stars))
@@ -3326,8 +3332,8 @@ def build_traversal_products(
             structure_profile.winner_payload_rows_peak = int(structure_profile.winner_payload_rows)
         _sample_memory(
             memory_profile,
-            "rss_after_point_prediction_mb",
-            "peak_rss_after_point_prediction_mb",
+            "rss_after_on_axis_prediction_mb",
+            "peak_rss_after_on_axis_prediction_mb",
             rss_sampler=rss_sampler,
             peak_sampler=peak_sampler,
         )
@@ -3374,7 +3380,7 @@ def build_traversal_products(
             structure_profile.local_asterism_rows_peak = int(len(retained_asterisms))
 
         started = time.perf_counter()
-        _update_regularized_winner_averaged_ee(
+        _update_regularized_field_averaged_winner_ee(
             runtime,
             execution_config,
             inner,
@@ -3392,25 +3398,25 @@ def build_traversal_products(
             memory_pressure_callback=memory_pressure_callback,
         )
         if profile is not None:
-            profile.field_mean_prediction_seconds += time.perf_counter() - started
-        if execution_config.resolved_cache_clear_every == 0:
+            profile.field_averaged_prediction_seconds += time.perf_counter() - started
+        if execution_config.prediction_cache_clear_every == 0:
             _clear_backend_cache_with_profile(profile)
         _sample_memory(
             memory_profile,
-            "rss_after_field_mean_mb",
-            "peak_rss_after_field_mean_mb",
+            "rss_after_field_averaged_mb",
+            "peak_rss_after_field_averaged_mb",
             rss_sampler=rss_sampler,
             peak_sampler=peak_sampler,
         )
 
     started = time.perf_counter()
-    inner["coverage_resolved"] = (
-        np.asarray(inner["winner_ee_resolved"], dtype=np.float64)
-        >= runtime.coverage_ee_threshold_resolved
+    inner["on_axis_coverage"] = (
+        np.asarray(inner["on_axis_winner_ee"], dtype=np.float64)
+        >= runtime.on_axis_ee_threshold
     )
-    inner["coverage_averaged"] = (
-        np.asarray(inner["winner_ee_averaged"], dtype=np.float64)
-        >= runtime.coverage_ee_threshold_averaged
+    inner["field_averaged_coverage"] = (
+        np.asarray(inner["field_averaged_winner_ee"], dtype=np.float64)
+        >= runtime.field_averaged_ee_threshold
     )
     if profile is not None:
         profile.coverage_seconds += time.perf_counter() - started

@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 from astropy.table import Table
 
+import ao_sky.predict as predict
 from ao_sky import __version__, describe_package
 from ao_sky.asterisms import (
     AsterismExportSummary,
@@ -25,12 +26,18 @@ from ao_sky.build import (
     BuildPaths,
     check_runtime_roots,
     fetch_gaia_data,
-    inspect_build,
     init_build,
+    inspect_build,
     load_build_definition,
     show_build,
 )
-from ao_sky.gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore, apply_proper_motion, fetch_gaia_store
+from ao_sky.gaia import (
+    GaiaHealpixStore,
+    GaiaStoreConfig,
+    GaiaSummaryStore,
+    apply_proper_motion,
+    fetch_gaia_store,
+)
 
 
 def test_package_root_exports_version() -> None:
@@ -64,6 +71,16 @@ def test_gaia_surface_is_importable() -> None:
     assert fetch_gaia_store is not None
     assert load_build_definition is not None
     assert show_build is not None
+
+
+def test_prediction_public_api_exposes_only_the_production_model_family() -> None:
+    assert callable(predict.get_model)
+    assert callable(predict.predict_arrays)
+    assert predict.PredictionArrayTelemetry is not None
+    assert not hasattr(predict, "get_point_model")
+    assert not hasattr(predict, "predict_point_arrays")
+    assert not hasattr(predict, "_get_legacy_field_averaged_model")
+    assert not hasattr(predict, "_predict_legacy_field_averaged_arrays")
 
 
 def test_module_cli_reports_version() -> None:
@@ -157,7 +174,7 @@ def test_module_cli_can_init_and_show_build(tmp_path: Path) -> None:
     config = tmp_path / "build.yaml"
     config.write_text(
         """
-schema_version: 2
+schema_version: 3
 ao_system:
   band: R
   fov_arcsec: 120.0
@@ -169,11 +186,11 @@ ao_system:
   min_sep_arcsec: 5.0
 prediction:
   wavelength_micron: 1.654
-  resolved_models:
+  models:
     1star: point_one
     2star: point_two
     3star: point_three
-  averaged_models:
+  legacy_field_averaged_models:
     1star: mean_one
     2star: mean_two
     3star: mean_three
@@ -196,8 +213,8 @@ best:
     ee: 0.02
     fwhm_mas: 650.0
 coverage:
-  resolved_ee_threshold: 0.4
-  averaged_ee_threshold: 0.3
+  on_axis_ee_threshold: 0.4
+  field_averaged_ee_threshold: 0.3
 """.lstrip(),
         encoding="utf-8",
     )

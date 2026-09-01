@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-import re
 
 import h5py
 import numpy as np
@@ -16,11 +16,11 @@ from ._constants import (
     BUILD_FILENAME,
     BUILD_LAYOUT_VERSION,
     BUILD_LOG_FILENAME,
-    BUILD_PHASE_GAIA_LOADING,
     BUILD_PHASE_AUGMENTATION,
+    BUILD_PHASE_GAIA_LOADING,
     BUILD_PHASE_TRAVERSAL,
-    BUILD_STATUS_INITIALIZED,
     BUILD_STATUS_COMPLETED,
+    BUILD_STATUS_INITIALIZED,
     MAPS_FILENAME_TEMPLATE,
     MODEL_SNAPSHOT_MANIFEST_FILENAME,
     RUNTIME_CONFIG_FILENAME,
@@ -34,6 +34,11 @@ from ._constants import (
 )
 from ._exceptions import BuildError
 from ._models import BuildDefinition, BuildInspection, BuildPaths
+from ._schema_compat import (
+    read_build_layout_version,
+    require_current_build_layout,
+    require_current_build_layout_if_present,
+)
 
 
 def _write_scalar_dataset(group: h5py.Group, name: str, value: object) -> None:
@@ -70,6 +75,10 @@ def _encode_fixed_bytes(
 def append_build_log(build_path: Path, message: str) -> None:
     """Append one timestamped execution line to the build log."""
 
+    require_current_build_layout_if_present(
+        build_path,
+        operation="append to the build log",
+    )
     with (build_path / BUILD_LOG_FILENAME).open("a", encoding="utf-8") as handle:
         handle.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
 
@@ -261,6 +270,7 @@ def load_build_roots(build_path: Path) -> BuildPaths:
 def set_model_root(build_path: Path, model_root: Path) -> None:
     """Update the persisted model root for one build."""
 
+    require_current_build_layout(build_path, operation="update model metadata for")
     persisted = _build_relative_or_resolved_path(build_path, Path(model_root))
     with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
         dataset = handle["metadata"]["config"]["model_root"]
@@ -270,6 +280,7 @@ def set_model_root(build_path: Path, model_root: Path) -> None:
 def set_dust_root(build_path: Path, dust_root: Path) -> None:
     """Update the persisted dust root for one build."""
 
+    require_current_build_layout(build_path, operation="update dust metadata for")
     persisted = _build_relative_or_resolved_path(build_path, Path(dust_root))
     with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
         dataset = handle["metadata"]["config"]["dust_root"]
@@ -295,6 +306,7 @@ def load_survey_extent_overlay_sources(build_path: Path) -> tuple:
 def set_survey_extent_overlays(build_path: Path, overlays: tuple) -> None:
     """Update persisted survey overlay metadata for one build."""
 
+    require_current_build_layout(build_path, operation="update survey metadata for")
     definition = load_build_definition(build_path)
     updated = BuildDefinition(
         lineage_name=definition.lineage_name,
@@ -336,6 +348,7 @@ def load_state(build_path: Path) -> np.ndarray:
 def update_state_row(build_path: Path, outer_pix: int, **updates: object) -> None:
     """Update one row in the central outer-pixel state table."""
 
+    require_current_build_layout(build_path, operation="update state for")
     with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
         dataset = handle["state"]["outer_pixels"]
         row = dataset[int(outer_pix)]
@@ -362,6 +375,7 @@ def write_state_rows(
 
     if len(row_indexes) == 0:
         return
+    require_current_build_layout(build_path, operation="write state for")
     with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
         dataset = handle["state"]["outer_pixels"]
         dataset[row_indexes] = state[row_indexes]
@@ -370,6 +384,7 @@ def write_state_rows(
 def set_build_status(build_path: Path, status: str) -> None:
     """Update the persisted build-level status."""
 
+    require_current_build_layout(build_path, operation="update status for")
     with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
         dataset = handle["metadata"]["config"]["build_status"]
         dataset[()] = np.asarray(status, dtype=h5py.string_dtype("utf-8"))
@@ -386,6 +401,7 @@ def load_current_phase(build_path: Path) -> str:
 def set_current_phase(build_path: Path, phase: str) -> None:
     """Update the persisted current build phase."""
 
+    require_current_build_layout(build_path, operation="update phase for")
     with h5py.File(build_path / BUILD_FILENAME, "r+") as handle:
         dataset = handle["metadata"]["config"]["current_phase"]
         dataset[()] = np.asarray(phase, dtype=h5py.string_dtype("utf-8"))
@@ -428,6 +444,7 @@ def inspect_build(build_path: Path) -> BuildInspection:
     """Inspect one build root without repairing or mutating artifacts."""
 
     build_path = Path(build_path).expanduser().resolve()
+    layout_version = read_build_layout_version(build_path)
     state = load_state(build_path)
     with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
         config_group = handle["metadata"]["config"]
@@ -496,6 +513,7 @@ def inspect_build(build_path: Path) -> BuildInspection:
 
     return BuildInspection(
         build_path=build_path,
+        layout_version=layout_version,
         build_status=build_status,
         current_stage=current_stage,
         stage_counts=stage_counts,

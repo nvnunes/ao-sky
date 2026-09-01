@@ -6,8 +6,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from astropy.table import Table
 import numpy as np
+from astropy.table import Table
 
 from ..build._constants import ASTERISMS_DTYPE, WORK_STATUS_DONE
 from ..build.artifacts import read_outer_products
@@ -15,10 +15,9 @@ from ..build.control import load_build_definition, load_state, outer_artifact_fi
 from ..spatial import get_pixel_skycoord
 from ._exceptions import AsterismError
 
-
 ASTERISM_LOOKUP_MEAN_FIELDS: tuple[str, ...] = (
-    "winner_ee_resolved",
-    "winner_ee_averaged",
+    "on_axis_winner_ee",
+    "field_averaged_winner_ee",
     "gaia_A0",
 )
 ASTERISM_LOOKUP_COLUMNS: tuple[str, ...] = (
@@ -64,10 +63,10 @@ class AsterismLookupFilters:
     max_member_mag: float | None = None
     min_inner_pixel_count: int | None = None
     max_inner_pixel_count: int | None = None
-    min_winner_ee_resolved: float | None = None
-    max_winner_ee_resolved: float | None = None
-    min_winner_ee_averaged: float | None = None
-    max_winner_ee_averaged: float | None = None
+    min_on_axis_winner_ee: float | None = None
+    max_on_axis_winner_ee: float | None = None
+    min_field_averaged_winner_ee: float | None = None
+    max_field_averaged_winner_ee: float | None = None
     min_gaia_A0: float | None = None
     max_gaia_A0: float | None = None
 
@@ -99,14 +98,14 @@ class AsterismLookupFilters:
         ):
             raise AsterismError("min_member_mag cannot exceed max_member_mag")
         _validate_float_bound_pair(
-            self.min_winner_ee_resolved,
-            self.max_winner_ee_resolved,
-            "winner_ee_resolved",
+            self.min_on_axis_winner_ee,
+            self.max_on_axis_winner_ee,
+            "on_axis_winner_ee",
         )
         _validate_float_bound_pair(
-            self.min_winner_ee_averaged,
-            self.max_winner_ee_averaged,
-            "winner_ee_averaged",
+            self.min_field_averaged_winner_ee,
+            self.max_field_averaged_winner_ee,
+            "field_averaged_winner_ee",
         )
         _validate_float_bound_pair(self.min_gaia_A0, self.max_gaia_A0, "gaia_A0")
 
@@ -223,15 +222,15 @@ def _passes_lookup_metric_filters(
     return (
         _passes_float_bounds(
             row,
-            "winner_ee_resolved",
-            filters.min_winner_ee_resolved,
-            filters.max_winner_ee_resolved,
+            "on_axis_winner_ee",
+            filters.min_on_axis_winner_ee,
+            filters.max_on_axis_winner_ee,
         )
         and _passes_float_bounds(
             row,
-            "winner_ee_averaged",
-            filters.min_winner_ee_averaged,
-            filters.max_winner_ee_averaged,
+            "field_averaged_winner_ee",
+            filters.min_field_averaged_winner_ee,
+            filters.max_field_averaged_winner_ee,
         )
         and _passes_float_bounds(row, "gaia_A0", filters.min_gaia_A0, filters.max_gaia_A0)
     )
@@ -278,7 +277,6 @@ def _lookup_outer_pixel_asterisms(
 ) -> list[dict[str, object]]:
     definition = load_build_definition(build_path)
     state = load_state(build_path)
-    max_outer_pix = len(state) - 1
     accumulators: dict[tuple[int, ...], _LookupAccumulator] = {}
 
     for observation in _iter_lookup_observations(

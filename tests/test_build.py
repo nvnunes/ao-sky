@@ -6,31 +6,31 @@ import importlib.util
 import io
 import json
 import sys
-from pathlib import Path
 from gzip import open as gzip_open
+from pathlib import Path
 
-import h5py
 import astropy.units as u
+import h5py
 import numpy as np
 import pytest
 import yaml
 from astropy.table import Table
 from mocpy import MOC
 
+import ao_sky.build.aggregation as aggregation_module
 from ao_sky._hdf5 import HDF5_BLOSC_FILTER_ID, HDF5_BLOSC_LEVEL
 from ao_sky.build import (
     check_runtime_roots,
     fetch_gaia_data,
     inspect_build,
-    init_build as real_init_build,
     restart_build,
     run_build,
     run_build_outer_pixels,
     show_build,
 )
-import ao_sky.build.aggregation as aggregation_module
-from ao_sky.build.augmentation import build_survey_extent_layers
-from ao_sky.build.aggregation import aggregate_maps, build_maps
+from ao_sky.build import (
+    init_build as real_init_build,
+)
 from ao_sky.build._constants import (
     BUILD_FILENAME,
     BUILD_PHASE_AGGREGATION,
@@ -48,8 +48,23 @@ from ao_sky.build._constants import (
     WORK_STATUS_RUNNING,
 )
 from ao_sky.build._exceptions import BuildError
+from ao_sky.build._models import (
+    BuildDefinition,
+    DynamicTraversalSchedule,
+    TraversalExecutionConfig,
+    TraversalTaskResult,
+)
+from ao_sky.build.aggregation import aggregate_maps, build_maps
+from ao_sky.build.artifacts import (
+    write_maps_artifact,
+    write_outer_artifact,
+    write_outer_artifact_profiled,
+)
+from ao_sky.build.augmentation import build_survey_extent_layers
 from ao_sky.build.config import (
     load_build_definition as load_build_definition_yaml,
+)
+from ao_sky.build.config import (
     resolve_gaia_root_only,
     resolve_runtime_root_candidates,
     resolve_traversal_execution_config,
@@ -66,31 +81,24 @@ from ao_sky.build.control import (
     summarize_build,
     update_state_row,
 )
-from ao_sky.build.runtime_config import load_runtime_config, runtime_to_config, write_runtime_config
 from ao_sky.build.model_snapshot import fetch_model_data
-from ao_sky.build.survey_snapshot import fetch_survey_data
-from ao_sky.build.scheduler import OuterPixelScheduler
 from ao_sky.build.regional import (
     build_dynamic_work_batches,
     build_regional_worker_plans,
     dynamic_outer_pixel_seconds,
     order_region_outer_pixs,
 )
-from ao_sky.build.artifacts import (
-    write_outer_artifact,
-    write_outer_artifact_profiled,
-    write_maps_artifact,
+from ao_sky.build.runtime_config import (
+    load_runtime_config,
+    runtime_to_config,
+    write_runtime_config,
 )
-from ao_sky.build._models import (
-    BuildDefinition,
-    DynamicTraversalSchedule,
-    TraversalExecutionConfig,
-    TraversalTaskResult,
-)
+from ao_sky.build.scheduler import OuterPixelScheduler
+from ao_sky.build.survey_snapshot import fetch_survey_data
 from ao_sky.dust import gaia_tge_a0_cache_filename, prepare_gaia_tge_a0_cache
 from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
-from ao_sky.spatial import get_pixel_skycoord
 from ao_sky.predict import AOSystemRuntime, PredictRuntime
+from ao_sky.spatial import get_pixel_skycoord
 
 
 @pytest.fixture(autouse=True)
@@ -110,7 +118,7 @@ def _write_build_definition(
     survey_overlays: list[dict[str, object]] | None = None,
 ) -> Path:
     payload: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "build": {},
         "ao_system": {
             "band": "R",
@@ -124,12 +132,12 @@ def _write_build_definition(
         },
         "prediction": {
             "wavelength_micron": 1.654,
-            "resolved_models": {
+            "models": {
                 "1star": "point_one",
                 "2star": "point_two",
                 "3star": "point_three",
             },
-            "averaged_models": {
+            "legacy_field_averaged_models": {
                 "1star": "mean_one",
                 "2star": "mean_two",
                 "3star": "mean_three",
@@ -158,8 +166,8 @@ def _write_build_definition(
             },
         },
         "coverage": {
-            "resolved_ee_threshold": 0.4,
-            "averaged_ee_threshold": 0.3,
+            "on_axis_ee_threshold": 0.4,
+            "field_averaged_ee_threshold": 0.3,
         },
     }
     if survey_overlays is not None:
@@ -189,7 +197,7 @@ ao_systems:
       3star: mean_three
 asterisms_max_bright_star_mag: 8.0
 asterisms_max_overlap: 0.66
-coverage_ee_threshold_resolved: 0.4
+on_axis_ee_threshold: 0.4
 coverage_ee_threshold_mean: 0.3
 """.strip()
     path.write_text(text + "\n", encoding="utf-8")
@@ -216,7 +224,7 @@ ao_systems:
       3star: shared_three
 asterisms_max_bright_star_mag: 8.0
 asterisms_max_overlap: 0.66
-coverage_ee_threshold_resolved: 0.4
+on_axis_ee_threshold: 0.4
 coverage_ee_threshold_mean: 0.3
 """.strip()
         + "\n",
@@ -258,11 +266,11 @@ def load_native_runtime(
         winner_ee_epsilon=0.01,
         winner_top_k=3,
         prediction_wavelength=1.654 * u.micron,
-        resolved_models={
+        models={
             str(key): str(value)
             for key, value in (system.get("point_models") or {}).items()
         },
-        averaged_models={
+        legacy_field_averaged_models={
             str(key): str(value)
             for key, value in (system.get("models") or {}).items()
         },
@@ -270,10 +278,10 @@ def load_native_runtime(
         seeing_reference_sr=0.0,
         seeing_reference_ee=0.02,
         seeing_reference_fwhm=650.0,
-        coverage_ee_threshold_resolved=float(
-            raw.get("coverage_ee_threshold_resolved", 0.25)
+        on_axis_ee_threshold=float(
+            raw.get("on_axis_ee_threshold", 0.25)
         ),
-        coverage_ee_threshold_averaged=float(raw.get("coverage_ee_threshold_mean", 0.25)),
+        field_averaged_ee_threshold=float(raw.get("coverage_ee_threshold_mean", 0.25)),
         model_root=Path(model_root).resolve(),
     )
 
@@ -344,8 +352,8 @@ def init_build(
         model_root=effective_model_root,
     )
     if ensure_model_files:
-        for model_name in set(runtime.resolved_models.values()) | set(
-            runtime.averaged_models.values()
+        for model_name in set(runtime.models.values()) | set(
+            runtime.legacy_field_averaged_models.values()
         ):
             _write_required_model_files(effective_model_root, model_name)
     build_config = yaml.safe_load(Path(definition_filename).read_text(encoding="utf-8"))
@@ -425,10 +433,10 @@ def _make_inner(
     best_sr: float = np.nan,
     best_fwhm: float = np.nan,
     winner_asterism_id: int = -1,
-    winner_ee_resolved: float = np.nan,
-    winner_ee_averaged: float = np.nan,
-    coverage_resolved: bool = False,
-    coverage_averaged: bool = False,
+    on_axis_winner_ee: float = np.nan,
+    field_averaged_winner_ee: float = np.nan,
+    on_axis_coverage: bool = False,
+    field_averaged_coverage: bool = False,
 ) -> Table:
     pix_values = np.asarray([0, 1, 2, 3] if pixs is None else pixs, dtype=np.int64)
     nrows = len(pix_values)
@@ -442,10 +450,10 @@ def _make_inner(
             np.full(nrows, best_sr, dtype=np.float64),
             np.full(nrows, best_fwhm, dtype=np.float64),
             np.full(nrows, winner_asterism_id, dtype=np.int64),
-            np.full(nrows, winner_ee_resolved, dtype=np.float64),
-            np.full(nrows, winner_ee_averaged, dtype=np.float64),
-            np.full(nrows, coverage_resolved, dtype=np.bool_),
-            np.full(nrows, coverage_averaged, dtype=np.bool_),
+            np.full(nrows, on_axis_winner_ee, dtype=np.float64),
+            np.full(nrows, field_averaged_winner_ee, dtype=np.float64),
+            np.full(nrows, on_axis_coverage, dtype=np.bool_),
+            np.full(nrows, field_averaged_coverage, dtype=np.bool_),
         ],
         names=(
             "pix",
@@ -456,10 +464,10 @@ def _make_inner(
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_ee_resolved",
-            "winner_ee_averaged",
-            "coverage_resolved",
-            "coverage_averaged",
+            "on_axis_winner_ee",
+            "field_averaged_winner_ee",
+            "on_axis_coverage",
+            "field_averaged_coverage",
         ),
     )
 
@@ -631,6 +639,12 @@ def test_init_build_creates_root_and_full_sky_state(tmp_path: Path) -> None:
     assert load_runtime_config_source_path(build_path) == definition.resolve()
     assert "source" not in runtime_payload
     assert "build" not in runtime_payload
+    assert runtime_payload["schema_version"] == 3
+    assert runtime_payload["prediction"]["models"]
+    assert "resolved_models" not in runtime_payload["prediction"]
+    assert "averaged_models" not in runtime_payload["prediction"]
+    with h5py.File(build_path / BUILD_FILENAME, "r") as handle:
+        assert int(handle["metadata"]["config"]["layout_version"][()]) == 3
     assert runtime.ao_system.band == "R"
 
 
@@ -822,8 +836,7 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
                 "gaia_cache_entries: 128",
                 "gaia_cache_mb: 4096",
                 "prediction:",
-                "  resolved_device: gpu",
-                "  averaged_device: gpu",
+                "  device: gpu",
             )
         )
         + "\n",
@@ -840,8 +853,7 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         gaia_cache_mb=4096,
         region_level=3,
         parent_memory_limit_mb=12288,
-        prediction_device="gpu",
-        averaged_prediction_device="gpu",
+        device="gpu",
     )
 
     override = resolve_traversal_execution_config(
@@ -861,8 +873,7 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         gaia_cache_mb=2048,
         region_level=4,
         parent_memory_limit_mb=8192,
-        prediction_device="gpu",
-        averaged_prediction_device="gpu",
+        device="gpu",
     )
 
     conf.write_text(
@@ -870,8 +881,35 @@ def test_resolve_traversal_execution_config_uses_defaults_and_ao_sky_yaml(
         encoding="utf-8",
     )
     without_device = resolve_traversal_execution_config(outer_level=6, aosky_yaml=conf)
-    assert without_device.prediction_device == "cpu"
-    assert without_device.averaged_prediction_device == "cpu"
+    assert without_device.device == "cpu"
+
+
+def test_resolve_traversal_execution_config_accepts_discovered_merged_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conf = tmp_path / "ao-sky.yaml"
+    conf.write_text(
+        """\
+schema_version: 3
+build:
+  workers: 2
+prediction:
+  device: gpu
+  wavelength_micron: 1.654
+  models:
+    1star: point-one
+  legacy_field_averaged_models:
+    1star: mean-one
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    config = resolve_traversal_execution_config(outer_level=2)
+
+    assert config.workers == 2
+    assert config.device == "gpu"
 
 
 def test_resolve_traversal_execution_config_validates_values(tmp_path: Path) -> None:
@@ -900,10 +938,17 @@ def test_resolve_traversal_execution_config_validates_values(tmp_path: Path) -> 
 
     conf = tmp_path / "ao-sky.yaml"
     conf.write_text(
-        "\n".join(("prediction:", "  resolved_device: mps")) + "\n",
+        "\n".join(("prediction:", "  device: mps")) + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(BuildError, match="prediction.resolved_device"):
+    with pytest.raises(BuildError, match="prediction.device"):
+        resolve_traversal_execution_config(outer_level=2, aosky_yaml=conf)
+
+    conf.write_text(
+        "\n".join(("prediction:", "  resolved_device: gpu")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BuildError, match="use prediction.device"):
         resolve_traversal_execution_config(outer_level=2, aosky_yaml=conf)
 
     conf.write_text(
@@ -1234,7 +1279,10 @@ def test_fetch_model_data_copies_configured_model_bundle_and_updates_metadata(
     assert manifest["runtime_config_path"] == str(load_runtime_config_path(build_path))
     models = {item["name"]: item for item in manifest["models"]}
     assert set(models) == {"point_two", "mean_two", "shared_three"}
-    assert models["shared_three"]["roles"] == ["averaged:3star", "resolved:3star"]
+    assert models["shared_three"]["roles"] == [
+        "legacy_field_averaged:3star",
+        "model:3star",
+    ]
     assert all(
         len(file_info["sha256"]) == 64
         for model_info in models.values()
@@ -1330,7 +1378,9 @@ def test_run_build_uses_build_local_model_root_after_fetch_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ao_sky.build.runtime_config import load_runtime_config as real_load_runtime_config
+    from ao_sky.build.runtime_config import (
+        load_runtime_config as real_load_runtime_config,
+    )
 
     source_root = tmp_path / "source-models"
     for model_name in ("point_two", "mean_two", "shared_three"):
@@ -1339,11 +1389,17 @@ def test_run_build_uses_build_local_model_root_after_fetch_model(
     fetch_model_data(build_path)
     seen_model_roots: list[Path] = []
 
-    def capture_runtime(runtime_config_path: Path, *, model_root: Path):
+    def capture_runtime(
+        runtime_config_path: Path,
+        *,
+        model_root: Path,
+        allow_legacy: bool,
+    ):
         seen_model_roots.append(Path(model_root).resolve())
         return real_load_runtime_config(
             runtime_config_path,
             model_root=model_root,
+            allow_legacy=allow_legacy,
         )
 
     monkeypatch.setattr("ao_sky.build.runner.load_runtime_config", capture_runtime)
@@ -1625,8 +1681,8 @@ def test_init_build_requires_matching_gaia_summary(tmp_path: Path) -> None:
         legacy_config_path=legacy,
         model_root=tmp_path / "models",
     )
-    for model_name in set(runtime.resolved_models.values()) | set(
-        runtime.averaged_models.values()
+    for model_name in set(runtime.models.values()) | set(
+        runtime.legacy_field_averaged_models.values()
     ):
         _write_required_model_files(tmp_path / "models", model_name)
 
@@ -1665,10 +1721,10 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
                 best_sr=0.4,
                 best_fwhm=0.3,
                 winner_asterism_id=7,
-                winner_ee_resolved=0.5,
-                winner_ee_averaged=0.45,
-                coverage_resolved=True,
-                coverage_averaged=True,
+                on_axis_winner_ee=0.5,
+                field_averaged_winner_ee=0.45,
+                on_axis_coverage=True,
+                field_averaged_coverage=True,
             ),
         ),
     )
@@ -1700,10 +1756,10 @@ def test_run_build_writes_outer_artifacts_and_updates_traversal_state(
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_ee_resolved",
-            "winner_ee_averaged",
-            "coverage_resolved",
-            "coverage_averaged",
+            "on_axis_winner_ee",
+            "field_averaged_winner_ee",
+            "on_axis_coverage",
+            "field_averaged_coverage",
         }
 
 
@@ -1769,7 +1825,9 @@ def test_run_build_outer_pixels_runs_selected_traversal_without_aggregation(
         dust_root=tmp_path / "dust",
         legacy_config_path=legacy,
     )
-    seen: list[int] = []
+    aosky_yaml = tmp_path / "ao-sky.yaml"
+    aosky_yaml.write_text("prediction:\n  device: gpu\n", encoding="utf-8")
+    seen: list[tuple[int, str]] = []
 
     def fake_run_outer_pixel(
         context,
@@ -1777,7 +1835,7 @@ def test_run_build_outer_pixels_runs_selected_traversal_without_aggregation(
         *,
         execution_config=None,
     ) -> TraversalTaskResult:
-        seen.append(int(outer_pix))
+        seen.append((int(outer_pix), execution_config.device))
         return TraversalTaskResult(outer_pix=int(outer_pix), success=True)
 
     monkeypatch.setattr(
@@ -1785,11 +1843,11 @@ def test_run_build_outer_pixels_runs_selected_traversal_without_aggregation(
         fake_run_outer_pixel,
     )
 
-    result = run_build_outer_pixels(build_path, [0, 1])
+    result = run_build_outer_pixels(build_path, [0, 1], aosky_yaml=aosky_yaml)
 
     state = load_state(build_path)
     assert result == build_path
-    assert seen == [0, 1]
+    assert seen == [(0, "gpu"), (1, "gpu")]
     assert state["traversal_status"][0] == WORK_STATUS_DONE
     assert state["traversal_status"][1] == WORK_STATUS_DONE
     assert state["traversal_status"][2] == WORK_STATUS_PENDING
@@ -2165,7 +2223,7 @@ def test_parent_memory_limit_reserves_gpu_driver_memory(
         runner_module._raise_if_parent_memory_limit_exceeded(
             TraversalExecutionConfig(
                 parent_memory_limit_mb=14000,
-                prediction_device="gpu",
+                device="gpu",
                 parent_gpu_driver_reserve_mb=1000.0,
             ),
             [FakeProcess()],
@@ -2187,7 +2245,7 @@ def test_parent_memory_limit_does_not_reserve_gpu_when_mps_unavailable(
     runner_module._raise_if_parent_memory_limit_exceeded(
         TraversalExecutionConfig(
             parent_memory_limit_mb=14000,
-            prediction_device="gpu",
+            device="gpu",
             parent_gpu_driver_reserve_mb=1000.0,
         ),
         [FakeProcess()],
@@ -2339,24 +2397,24 @@ def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path
                     local_selection_seconds=0.05,
                     inner_table_seconds=0.4,
                     context_seconds=0.5,
-                    point_prediction_seconds=0.6,
-                    point_prediction_eligibility_seconds=0.06,
-                    point_prediction_eligibility_intersection_seconds=0.04,
-                    point_prediction_eligibility_extract_seconds=0.02,
-                    point_prediction_buffer_seconds=0.07,
-                    point_prediction_ngs_array_seconds=0.08,
-                    point_prediction_model_seconds=0.09,
-                    point_prediction_feature_seconds=0.11,
-                    point_prediction_backend_seconds=0.22,
-                    point_prediction_scatter_seconds=0.12,
-                    point_prediction_scatter_filter_seconds=0.021,
-                    point_prediction_scatter_merge_seconds=0.022,
-                    point_prediction_scatter_sort_seconds=0.033,
-                    point_prediction_scatter_write_seconds=0.044,
-                    point_prediction_cache_clear_seconds=0.13,
-                    field_mean_prediction_seconds=0.7,
-                    field_mean_prediction_feature_seconds=0.33,
-                    field_mean_prediction_backend_seconds=0.44,
+                    on_axis_prediction_seconds=0.6,
+                    on_axis_prediction_eligibility_seconds=0.06,
+                    on_axis_prediction_eligibility_intersection_seconds=0.04,
+                    on_axis_prediction_eligibility_extract_seconds=0.02,
+                    on_axis_prediction_buffer_seconds=0.07,
+                    on_axis_prediction_ngs_array_seconds=0.08,
+                    on_axis_prediction_model_seconds=0.09,
+                    on_axis_prediction_feature_seconds=0.11,
+                    on_axis_prediction_backend_seconds=0.22,
+                    on_axis_prediction_scatter_seconds=0.12,
+                    on_axis_prediction_scatter_filter_seconds=0.021,
+                    on_axis_prediction_scatter_merge_seconds=0.022,
+                    on_axis_prediction_scatter_sort_seconds=0.033,
+                    on_axis_prediction_scatter_write_seconds=0.044,
+                    on_axis_prediction_cache_clear_seconds=0.13,
+                    field_averaged_prediction_seconds=0.7,
+                    field_averaged_prediction_feature_seconds=0.33,
+                    field_averaged_prediction_backend_seconds=0.44,
                     coverage_seconds=0.8,
                     dust_seconds=0.9,
                     persisted_asterisms_seconds=1.0,
@@ -2367,20 +2425,20 @@ def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path
                     close_pair_rows=13,
                     context_pair_rows=14,
                     winner_payload_rows=15,
-                    point_prediction_batches=3,
-                    point_prediction_rows=100,
-                    point_prediction_batch_rows_peak=40,
-                    point_feature_bytes_peak=2 * 1024 * 1024,
-                    point_mps_current_bytes_peak=5 * 1024 * 1024,
-                    point_mps_driver_bytes_peak=6 * 1024 * 1024,
-                    point_mps_recommended_bytes=7 * 1024 * 1024,
-                    field_mean_prediction_batches=4,
-                    field_mean_prediction_rows=50,
-                    field_mean_prediction_batch_rows_peak=20,
-                    field_mean_feature_bytes_peak=1024 * 1024,
-                    field_mean_mps_current_bytes_peak=8 * 1024 * 1024,
-                    field_mean_mps_driver_bytes_peak=9 * 1024 * 1024,
-                    field_mean_mps_recommended_bytes=10 * 1024 * 1024,
+                    on_axis_prediction_batches=3,
+                    on_axis_prediction_rows=100,
+                    on_axis_prediction_batch_rows_peak=40,
+                    on_axis_feature_bytes_peak=2 * 1024 * 1024,
+                    on_axis_mps_current_bytes_peak=5 * 1024 * 1024,
+                    on_axis_mps_driver_bytes_peak=6 * 1024 * 1024,
+                    on_axis_mps_recommended_bytes=7 * 1024 * 1024,
+                    field_averaged_prediction_batches=4,
+                    field_averaged_prediction_rows=50,
+                    field_averaged_prediction_batch_rows_peak=20,
+                    field_averaged_feature_bytes_peak=1024 * 1024,
+                    field_averaged_mps_current_bytes_peak=8 * 1024 * 1024,
+                    field_averaged_mps_driver_bytes_peak=9 * 1024 * 1024,
+                    field_averaged_mps_recommended_bytes=10 * 1024 * 1024,
                     close_pair_rows_peak=16,
                     context_pair_rows_peak=17,
                     winner_payload_rows_peak=18,
@@ -2400,43 +2458,43 @@ def test_regional_profile_logs_artifact_write_and_cache_telemetry(tmp_path: Path
     assert "stage_star_selection_s=0.100" in log_text
     assert "stage_filtering_s=0.300" in log_text
     assert "stage_local_selection_s=0.050" in log_text
-    assert "stage_point_prediction_s=0.600" in log_text
-    assert "stage_point_prediction_eligibility_s=0.060" in log_text
-    assert "stage_point_prediction_eligibility_intersection_s=0.040" in log_text
-    assert "stage_point_prediction_eligibility_extract_s=0.020" in log_text
-    assert "stage_point_prediction_buffer_s=0.070" in log_text
-    assert "stage_point_prediction_ngs_array_s=0.080" in log_text
-    assert "stage_point_prediction_model_s=0.090" in log_text
-    assert "stage_point_prediction_feature_s=0.110" in log_text
-    assert "stage_point_prediction_backend_s=0.220" in log_text
-    assert "stage_point_prediction_scatter_s=0.120" in log_text
-    assert "stage_point_prediction_scatter_filter_s=0.021" in log_text
-    assert "stage_point_prediction_scatter_merge_s=0.022" in log_text
-    assert "stage_point_prediction_scatter_sort_s=0.033" in log_text
-    assert "stage_point_prediction_scatter_write_s=0.044" in log_text
-    assert "stage_point_prediction_cache_clear_s=0.130" in log_text
-    assert "stage_field_mean_prediction_feature_s=0.330" in log_text
-    assert "stage_field_mean_prediction_backend_s=0.440" in log_text
+    assert "stage_on_axis_prediction_s=0.600" in log_text
+    assert "stage_on_axis_prediction_eligibility_s=0.060" in log_text
+    assert "stage_on_axis_prediction_eligibility_intersection_s=0.040" in log_text
+    assert "stage_on_axis_prediction_eligibility_extract_s=0.020" in log_text
+    assert "stage_on_axis_prediction_buffer_s=0.070" in log_text
+    assert "stage_on_axis_prediction_ngs_array_s=0.080" in log_text
+    assert "stage_on_axis_prediction_model_s=0.090" in log_text
+    assert "stage_on_axis_prediction_feature_s=0.110" in log_text
+    assert "stage_on_axis_prediction_backend_s=0.220" in log_text
+    assert "stage_on_axis_prediction_scatter_s=0.120" in log_text
+    assert "stage_on_axis_prediction_scatter_filter_s=0.021" in log_text
+    assert "stage_on_axis_prediction_scatter_merge_s=0.022" in log_text
+    assert "stage_on_axis_prediction_scatter_sort_s=0.033" in log_text
+    assert "stage_on_axis_prediction_scatter_write_s=0.044" in log_text
+    assert "stage_on_axis_prediction_cache_clear_s=0.130" in log_text
+    assert "stage_field_averaged_prediction_feature_s=0.330" in log_text
+    assert "stage_field_averaged_prediction_backend_s=0.440" in log_text
     assert "stage_dust_s=0.900" in log_text
     assert "artifact_write_s=0.500" in log_text
     assert "avg_artifact_write_s=0.250" in log_text
     assert "artifact_inner_input_mib=2.0" in log_text
     assert "artifact_asterism_structured_mib=4.0" in log_text
     assert "search_star_rows=11" in log_text
-    assert "point_prediction_batches=3" in log_text
-    assert "point_prediction_rows=100" in log_text
-    assert "point_prediction_batch_rows_peak=40" in log_text
-    assert "point_feature_mib_peak=2.000" in log_text
-    assert "point_mps_current_mib_peak=5.000" in log_text
-    assert "point_mps_driver_mib_peak=6.000" in log_text
-    assert "point_mps_recommended_mib=7.000" in log_text
-    assert "field_mean_prediction_batches=4" in log_text
-    assert "field_mean_prediction_rows=50" in log_text
-    assert "field_mean_prediction_batch_rows_peak=20" in log_text
-    assert "field_mean_feature_mib_peak=1.000" in log_text
-    assert "field_mean_mps_current_mib_peak=8.000" in log_text
-    assert "field_mean_mps_driver_mib_peak=9.000" in log_text
-    assert "field_mean_mps_recommended_mib=10.000" in log_text
+    assert "on_axis_prediction_batches=3" in log_text
+    assert "on_axis_prediction_rows=100" in log_text
+    assert "on_axis_prediction_batch_rows_peak=40" in log_text
+    assert "on_axis_feature_mib_peak=2.000" in log_text
+    assert "on_axis_mps_current_mib_peak=5.000" in log_text
+    assert "on_axis_mps_driver_mib_peak=6.000" in log_text
+    assert "on_axis_mps_recommended_mib=7.000" in log_text
+    assert "field_averaged_prediction_batches=4" in log_text
+    assert "field_averaged_prediction_rows=50" in log_text
+    assert "field_averaged_prediction_batch_rows_peak=20" in log_text
+    assert "field_averaged_feature_mib_peak=1.000" in log_text
+    assert "field_averaged_mps_current_mib_peak=8.000" in log_text
+    assert "field_averaged_mps_driver_mib_peak=9.000" in log_text
+    assert "field_averaged_mps_recommended_mib=10.000" in log_text
     assert "close_pair_rows_peak=16" in log_text
     assert "context_pair_rows_peak=17" in log_text
     assert "winner_payload_rows_peak=18" in log_text
@@ -2472,15 +2530,15 @@ def test_detailed_traversal_telemetry_writes_memory_diagnostics(tmp_path: Path) 
                     rss_after_context_mb=150.0,
                     context_pair_rows=123,
                         winner_payload_rows=45,
-                        point_prediction_batches=2,
-                        point_prediction_rows=77,
-                        point_prediction_batch_rows_peak=40,
-                        point_prediction_backend_rows=80,
-                        point_prediction_backend_batch_rows_peak=50,
-                        point_prediction_backend_bucket_counts="40:1;50:1",
-                        point_prediction_backend_bucket_rows="40:30;50:47",
-                        point_feature_mib_peak=3.5,
-                        point_mps_driver_mib_peak=4.5,
+                        on_axis_prediction_batches=2,
+                        on_axis_prediction_rows=77,
+                        on_axis_prediction_batch_rows_peak=40,
+                        on_axis_prediction_backend_rows=80,
+                        on_axis_prediction_backend_batch_rows_peak=50,
+                        on_axis_prediction_backend_bucket_counts="40:1;50:1",
+                        on_axis_prediction_backend_bucket_rows="40:30;50:47",
+                        on_axis_feature_mib_peak=3.5,
+                        on_axis_mps_driver_mib_peak=4.5,
                 ),
             ),
             diagnostics_writer=writer,
@@ -2491,10 +2549,10 @@ def test_detailed_traversal_telemetry_writes_memory_diagnostics(tmp_path: Path) 
     assert "outer_pix,worker_id,success" in text
     assert "7,2,1" in text
     assert ",123,45," in text
-    assert "point_prediction_batches" in text
-    assert "point_prediction_batch_rows_peak" in text
-    assert "point_prediction_backend_bucket_counts" in text
-    assert "point_mps_driver_mib_peak" in text
+    assert "on_axis_prediction_batches" in text
+    assert "on_axis_prediction_batch_rows_peak" in text
+    assert "on_axis_prediction_backend_bucket_counts" in text
+    assert "on_axis_mps_driver_mib_peak" in text
     assert "4.500" in text
     assert ",2,77,40,80,50,40:1;50:1,40:30;50:47,3.500," in text
 
@@ -3020,10 +3078,10 @@ def test_run_build_auto_advances_to_aggregation_and_writes_maps(
                 best_ee=0.5,
                 best_sr=0.4,
                 best_fwhm=0.3,
-                winner_ee_resolved=0.5,
-                winner_ee_averaged=0.45,
-                coverage_resolved=True,
-                coverage_averaged=False,
+                on_axis_winner_ee=0.5,
+                field_averaged_winner_ee=0.45,
+                on_axis_coverage=True,
+                field_averaged_coverage=False,
             ),
         ),
     )
@@ -3073,10 +3131,10 @@ def test_run_build_auto_advances_to_augmentation_when_overlays_exist(
                 best_ee=0.5,
                 best_sr=0.4,
                 best_fwhm=0.3,
-                winner_ee_resolved=0.5,
-                winner_ee_averaged=0.45,
-                coverage_resolved=True,
-                coverage_averaged=False,
+                on_axis_winner_ee=0.5,
+                field_averaged_winner_ee=0.45,
+                on_axis_coverage=True,
+                field_averaged_coverage=False,
             ),
         ),
     )
@@ -3410,6 +3468,118 @@ def test_show_build_omits_phase_counts_for_augmentation(tmp_path: Path) -> None:
     assert "survey manifest: present" in text
 
 
+def test_schema_v2_inspect_and_show_are_read_only(schema_v2_build: Path) -> None:
+    original = _snapshot_file_tree(schema_v2_build)
+
+    inspection = inspect_build(schema_v2_build)
+    text = show_build(schema_v2_build)
+
+    assert inspection.layout_version == 2
+    assert inspection.build_status == "completed"
+    assert "layout version: 2" in text
+    assert _snapshot_file_tree(schema_v2_build) == original
+
+
+@pytest.mark.parametrize("layout_version", [3.9, True, "3"])
+def test_build_layout_version_must_be_an_exact_integer(
+    schema_v2_build: Path,
+    layout_version: object,
+) -> None:
+    with h5py.File(schema_v2_build / BUILD_FILENAME, "r+") as handle:
+        config = handle["metadata"]["config"]
+        del config["layout_version"]
+        config.create_dataset("layout_version", data=layout_version)
+
+    with pytest.raises(BuildError, match="Invalid build layout_version"):
+        inspect_build(schema_v2_build)
+
+
+def test_schema_v2_build_rejects_all_build_mutation_boundaries(
+    schema_v2_build: Path,
+) -> None:
+    from ao_sky.build.aggregation import write_maps
+    from ao_sky.build.augmentation import build_survey_extent_layers
+    from ao_sky.build.control import (
+        append_build_log,
+        set_build_status,
+        set_current_phase,
+        set_dust_root,
+        set_model_root,
+        set_survey_extent_overlays,
+        update_state_row,
+        write_state_rows,
+    )
+
+    runtime = load_runtime_config(
+        schema_v2_build / "build.yaml",
+        model_root=schema_v2_build / "models",
+        allow_legacy=True,
+    )
+    state = load_state(schema_v2_build)
+    operations = {
+        "run": lambda: run_build(schema_v2_build),
+        "restart": lambda: restart_build(
+            lineage_name="legacy",
+            build_root=schema_v2_build.parent,
+        ),
+        "selected traversal": lambda: run_build_outer_pixels(
+            schema_v2_build,
+            0,
+            force=True,
+        ),
+        "model refresh": lambda: fetch_model_data(schema_v2_build),
+        "survey refresh": lambda: fetch_survey_data(schema_v2_build),
+        "aggregation write": lambda: write_maps(
+            schema_v2_build,
+            level_maps={0: np.zeros(12, dtype=MAPS_DTYPE)},
+        ),
+        "augmentation": lambda: build_survey_extent_layers(schema_v2_build),
+        "runtime config write": lambda: write_runtime_config(
+            schema_v2_build,
+            runtime,
+        ),
+        "log append": lambda: append_build_log(schema_v2_build, "mutated"),
+        "model-root update": lambda: set_model_root(
+            schema_v2_build,
+            schema_v2_build / "replacement-models",
+        ),
+        "dust-root update": lambda: set_dust_root(
+            schema_v2_build,
+            schema_v2_build / "replacement-dust",
+        ),
+        "survey metadata update": lambda: set_survey_extent_overlays(
+            schema_v2_build,
+            (),
+        ),
+        "state-row update": lambda: update_state_row(
+            schema_v2_build,
+            0,
+            traversal_status=0,
+        ),
+        "state-table write": lambda: write_state_rows(
+            schema_v2_build,
+            np.asarray([0], dtype=np.int64),
+            state,
+        ),
+        "status update": lambda: set_build_status(schema_v2_build, "running"),
+        "phase update": lambda: set_current_phase(schema_v2_build, "traversal"),
+    }
+    original = _snapshot_file_tree(schema_v2_build)
+
+    for operation, mutate in operations.items():
+        with pytest.raises(BuildError, match="schema-version-2.*read-only"):
+            mutate()
+        assert _snapshot_file_tree(schema_v2_build) == original, operation
+
+
+def _snapshot_file_tree(root: Path) -> dict[Path, bytes]:
+    return {
+        filename.relative_to(root): filename.read_bytes()
+        for filename in sorted(root.rglob("*"))
+        if filename.is_file()
+    }
+
+
 def test_update_state_row_rejects_overlong_error_message(tmp_path: Path) -> None:
     definition = _write_build_definition(tmp_path / "build.yaml")
     legacy = _write_legacy_config(tmp_path / "legacy.yaml")
@@ -3481,10 +3651,10 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_ee_resolved",
-            "winner_ee_averaged",
-            "coverage_resolved",
-            "coverage_averaged",
+            "on_axis_winner_ee",
+            "field_averaged_winner_ee",
+            "on_axis_coverage",
+            "field_averaged_coverage",
         ),
     )
     write_outer_artifact(
@@ -3529,7 +3699,7 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(
     assert level1["gaia_A0"][:3].tolist() == [0.5, 1.5, 2.5]
     assert np.isnan(level1["gaia_A0"][3])
     assert level1["star_count"][:4].tolist() == [1, 2, 3, 4]
-    assert level1["coverage_resolved"][:4].tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert level1["on_axis_coverage"][:4].tolist() == [1.0, 0.0, 1.0, 0.0]
     assert level1["winner_asterism_count"][:4].tolist() == [2, 1, 0, 0]
 
     level0 = level_maps[0]
@@ -3540,10 +3710,32 @@ def test_aggregate_maps_recomputes_dust_and_reduces_fields_by_type(
     assert float(level0["best_ee"][0]) == pytest.approx((0.1 + 0.2 + 0.4) / 3.0)
     assert float(level0["best_sr"][0]) == pytest.approx(2.5)
     assert float(level0["best_fwhm"][0]) == pytest.approx(25.0)
-    assert float(level0["winner_ee_resolved"][0]) == pytest.approx(0.45)
-    assert float(level0["winner_ee_averaged"][0]) == pytest.approx(0.85)
-    assert float(level0["coverage_resolved"][0]) == pytest.approx(0.5)
-    assert float(level0["coverage_averaged"][0]) == pytest.approx(0.5)
+    assert float(level0["on_axis_winner_ee"][0]) == pytest.approx(0.45)
+    assert float(level0["field_averaged_winner_ee"][0]) == pytest.approx(0.85)
+    assert float(level0["on_axis_coverage"][0]) == pytest.approx(0.5)
+    assert float(level0["field_averaged_coverage"][0]) == pytest.approx(0.5)
+
+
+def test_schema_v2_outer_artifact_aggregates_in_memory_with_canonical_fields(
+    schema_v2_build: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = next((schema_v2_build / "hpx0-1").rglob("outer.h5"))
+    original = source.read_bytes()
+    monkeypatch.setattr(
+        aggregation_module,
+        "sample_gaia_a0_for_outer_pixel",
+        lambda **kwargs: np.zeros(4, dtype=np.float64),
+    )
+
+    level_maps = aggregate_maps(schema_v2_build, outer_pixs=[0])
+
+    assert float(level_maps[0]["on_axis_winner_ee"][0]) == pytest.approx(0.425)
+    assert float(level_maps[0]["field_averaged_winner_ee"][0]) == pytest.approx(
+        0.325
+    )
+    assert float(level_maps[0]["on_axis_coverage"][0]) == pytest.approx(1.0)
+    assert source.read_bytes() == original
 
 
 def test_winner_asterism_count_accumulates_center_owner_pixels_globally() -> None:
@@ -3594,10 +3786,10 @@ def test_build_maps_writes_dense_maps_artifacts_with_expected_contract(tmp_path:
                 best_ee=0.5,
                 best_sr=0.4,
                 best_fwhm=0.3,
-                winner_ee_resolved=0.5,
-                winner_ee_averaged=0.45,
-                coverage_resolved=True,
-                coverage_averaged=False,
+                on_axis_winner_ee=0.5,
+                field_averaged_winner_ee=0.45,
+                on_axis_coverage=True,
+                field_averaged_coverage=False,
             ),
             asterisms=_make_asterisms(empty=True),
         )

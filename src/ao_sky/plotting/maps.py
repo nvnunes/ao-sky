@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
-import re
 from typing import Any
 
-from astropy.table import Table
 import astropy.units as u
 import h5py
-from matplotlib import pyplot as plt
 import numpy as np
 import yaml
+from astropy.table import Table
+from matplotlib import pyplot as plt
 
 from ao_sky.build._constants import (
     BUILD_FILENAME,
@@ -26,7 +26,6 @@ from ao_sky.spatial import get_pixel_area
 from ._exceptions import PlottingError
 from .fields import FieldConvention, get_field_convention, prepare_field_values
 from .healpix import get_level, get_npix, get_pixel_skycoord, plot_healpix
-
 
 _MAPS_FILENAME_RE = re.compile(r"^maps-hpx(?P<level>\d+)\.h5$")
 
@@ -176,10 +175,6 @@ def _map_field_values(
     level: int,
     filename: Path,
 ) -> np.ndarray:
-    if field == "coverage_mean":
-        if "coverage_averaged" not in table.colnames:
-            raise PlottingError(f"Map field 'coverage_mean' requires 'coverage_averaged' in {filename}")
-        return np.asarray(table["coverage_averaged"])
     if field in table.colnames:
         return np.asarray(table[field])
     if field == "stellar_density":

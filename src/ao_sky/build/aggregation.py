@@ -10,6 +10,7 @@ import numpy as np
 from ..dust import sample_gaia_a0_for_outer_pixel
 from ._constants import MAPS_DTYPE, MAPS_MEAN_FIELDS, MAPS_SUM_FIELDS
 from ._exceptions import BuildError
+from ._schema_compat import require_current_build_layout
 from .artifacts import read_outer_aggregation_products, write_maps_artifact
 from .control import (
     load_build_definition,
@@ -132,10 +133,10 @@ def aggregate_maps(
             "best_sr": np.asarray(inner["best_sr"], dtype=np.float64)[order],
             "best_ee": np.asarray(inner["best_ee"], dtype=np.float64)[order],
             "best_fwhm": np.asarray(inner["best_fwhm"], dtype=np.float64)[order],
-            "winner_ee_resolved": np.asarray(inner["winner_ee_resolved"], dtype=np.float64)[order],
-            "winner_ee_averaged": np.asarray(inner["winner_ee_averaged"], dtype=np.float64)[order],
-            "coverage_resolved": np.asarray(inner["coverage_resolved"], dtype=np.float64)[order],
-            "coverage_averaged": np.asarray(inner["coverage_averaged"], dtype=np.float64)[order],
+            "on_axis_winner_ee": np.asarray(inner["on_axis_winner_ee"], dtype=np.float64)[order],
+            "field_averaged_winner_ee": np.asarray(inner["field_averaged_winner_ee"], dtype=np.float64)[order],
+            "on_axis_coverage": np.asarray(inner["on_axis_coverage"], dtype=np.float64)[order],
+            "field_averaged_coverage": np.asarray(inner["field_averaged_coverage"], dtype=np.float64)[order],
         }
 
         current_pix = global_pix
@@ -166,6 +167,7 @@ def write_maps(
 ) -> None:
     """Persist dense all-sky maps for the given levels."""
 
+    require_current_build_layout(build_path, operation="write maps for")
     for level, maps in sorted(level_maps.items()):
         write_maps_artifact(maps_artifact_filename(build_path, level), maps=maps)
 
@@ -177,6 +179,7 @@ def build_maps(
 ) -> dict[int, np.ndarray]:
     """Aggregate and persist all-sky maps."""
 
+    require_current_build_layout(build_path, operation="build maps for")
     level_maps = aggregate_maps(build_path, outer_pixs=outer_pixs)
     write_maps(build_path, level_maps=level_maps)
     return level_maps

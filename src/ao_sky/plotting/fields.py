@@ -106,8 +106,8 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
         vmax=350.0,
         cbar_format="%.3g",
     ),
-    "winner_ee_resolved": FieldConvention(
-        title="Winner EE Resolved",
+    "on_axis_winner_ee": FieldConvention(
+        title="On-Axis Winner EE",
         title_uses_prediction_wavelength=True,
         unit="EE",
         cmap="viridis",
@@ -116,8 +116,8 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
         vmax=0.5,
         cbar_format="%.2f",
     ),
-    "winner_ee_averaged": FieldConvention(
-        title="Winner EE Averaged",
+    "field_averaged_winner_ee": FieldConvention(
+        title="Field-Averaged Winner EE",
         title_uses_prediction_wavelength=True,
         unit="EE",
         cmap="viridis",
@@ -126,8 +126,8 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
         vmax=0.5,
         cbar_format="%.2f",
     ),
-    "coverage_resolved": FieldConvention(
-        title="Coverage Resolved",
+    "on_axis_coverage": FieldConvention(
+        title="On-Axis Coverage",
         unit="fraction",
         cmap="viridis",
         norm="linear",
@@ -135,17 +135,8 @@ FIELD_CONVENTIONS: dict[str, FieldConvention] = {
         vmax=1.0,
         cbar_format="%.2f",
     ),
-    "coverage_mean": FieldConvention(
-        title="Coverage Mean",
-        unit="fraction",
-        cmap="viridis",
-        norm="linear",
-        vmin=0.0,
-        vmax=1.0,
-        cbar_format="%.2f",
-    ),
-    "coverage_averaged": FieldConvention(
-        title="Coverage Averaged",
+    "field_averaged_coverage": FieldConvention(
+        title="Field-Averaged Coverage",
         unit="fraction",
         cmap="viridis",
         norm="linear",

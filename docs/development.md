@@ -96,15 +96,21 @@ The current public build surface is centered on:
 - `ao-sky restart`
 - `ao-sky show`
 
-`init` takes one merged build-config YAML file. The config filename identifies
-the build lineage, while the AO-system, prediction, traversal, Gaia, maps,
-asterism, best, and coverage sections define the runtime policy.
-`survey_overlays` is optional.
+`init` takes one build-config YAML file. By default that file is
+`./ao-sky.yaml`, so a single file may contain both scientific build policy and
+runtime-only root and execution settings. The config filename identifies the
+build lineage. The AO-system, prediction model assignments, traversal, Gaia,
+maps, asterism, best, coverage, and optional `survey_overlays` sections define
+scientific build policy.
+
+`init` accepts schema version 3 only. Completed schema-version-2 builds remain
+available for read-only inspection and analysis, but cannot be resumed or
+modified.
 
 Example build config:
 
 ```yaml
-schema_version: 2
+schema_version: 3
 build:
   workers: 9
   scheduler: dynamic
@@ -123,14 +129,13 @@ ao_system:
   max_mag: 18.5
   min_sep_arcsec: 5.0
 prediction:
-  resolved_device: gpu
-  averaged_device: gpu
+  device: gpu
   wavelength_micron: 1.654
-  resolved_models:
+  models:
     1star: point_one
     2star: point_two
     3star: point_three
-  averaged_models:
+  legacy_field_averaged_models:
     1star: mean_one
     2star: mean_two
     3star: mean_three
@@ -153,8 +158,8 @@ best:
     ee: 0.02
     fwhm_mas: 650.0
 coverage:
-  resolved_ee_threshold: 0.4
-  averaged_ee_threshold: 0.3
+  on_axis_ee_threshold: 0.4
+  field_averaged_ee_threshold: 0.3
 survey_overlays:
   - name: ews
     moc_files:
@@ -173,7 +178,9 @@ CLI root flags can still override roots for tests and ad hoc runs.
 `pyproject.toml`. `init`, `run`, `restart`, `check`, and `fetch-gaia` can use
 that discovered file
 automatically. Otherwise pass the root flags explicitly. The execution settings
-are runtime defaults only and are not persisted into build metadata. Traversal
+in `ao-sky.yaml`—including `build.workers`, `build.scheduler`,
+`build.memory_limit_mb`, and `prediction.device`—are runtime defaults only and
+are not persisted into build metadata. Traversal
 derives its regional worker-assignment level from `outer_level` and `workers`;
 there is no user-facing region-level setting. The current derivation targets at
 least `max(4, workers * 4)` outer pixels per region, clamped by `outer_level`.
@@ -229,12 +236,15 @@ Explicit root flags remain available for tests and ad hoc runs:
   --parent-memory-limit-mb 12288
 ```
 
-`init` copies the runtime policy from the merged build config into build-local
-`build.yaml`; `run` and `restart` read that build-local config.
-`ao-sky.yaml` remains path-only configuration. `init` also snapshots the
-configured model files into `<build>/models`, writes the build-local Gaia TGE
-A0 cache into `<build>/dust`, and updates the build to use those snapshots. For
-builds with configured survey overlays, `init` resolves
+At `init`, `ao-sky` validates and writes the scientific policy from the input
+config as build-local `build.yaml`; later `run` and `restart` read that
+normalized build-local policy. Each command separately rediscovers
+`ao-sky.yaml` for external roots and non-persisted execution defaults such as
+worker count, scheduler, memory limit, and prediction device. Those runtime
+defaults are not copied into build-local scientific policy. `init` also
+snapshots the configured model files into `<build>/models`, writes the
+build-local Gaia TGE A0 cache into `<build>/dust`, and updates the build to use
+those snapshots. For builds with configured survey overlays, `init` resolves
 each `moc_files` entry as a filename under `survey_root`, copies it under
 `<build>/surveys`, and updates the build to use build-root-relative
 `surveys/<filename>` paths.

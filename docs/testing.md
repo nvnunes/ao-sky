@@ -52,6 +52,18 @@ Smoke-check the installed CLI entrypoint with:
 ./.conda/bin/ao-sky --version
 ```
 
+The accepted completed schema-version-2 build is an opt-in integration
+fixture. Audit its full normalized read surface without modifying it with:
+
+```bash
+AOSKY_SCHEMA_V2_BUILD=/path/to/completed/schema-v2-build \
+AOSKY_SCHEMA_V2_OUTER_PIX=41430 \
+./.conda/bin/python -m pytest tests/test_schema_v2_integration.py -q
+```
+
+The default suite skips this test because the external build is not a package
+dependency.
+
 When the runtime-root CLI surface changes, also smoke-check the preflight
 commands:
 
@@ -71,7 +83,7 @@ rather than calling the live Gaia archive or downloading dust.
 ```bash
 tmpdir="$(mktemp -d)"
 cat >"$tmpdir/build.yaml" <<'YAML'
-schema_version: 2
+schema_version: 3
 ao_system:
   band: R
   fov_arcsec: 120.0
@@ -83,11 +95,11 @@ ao_system:
   min_sep_arcsec: 5.0
 prediction:
   wavelength_micron: 1.654
-  resolved_models:
+  models:
     1star: point_one
     2star: point_two
     3star: point_three
-  averaged_models:
+  legacy_field_averaged_models:
     1star: mean_one
     2star: mean_two
     3star: mean_three
@@ -110,8 +122,8 @@ best:
     ee: 0.02
     fwhm_mas: 650.0
 coverage:
-  resolved_ee_threshold: 0.4
-  averaged_ee_threshold: 0.3
+  on_axis_ee_threshold: 0.4
+  field_averaged_ee_threshold: 0.3
 YAML
 mkdir -p "$tmpdir/models"
 ./.conda/bin/python - "$tmpdir" <<'PY'
@@ -195,8 +207,7 @@ The current full-build operating default on the local workstation is:
 - `build.workers: 9`
 - `build.scheduler: dynamic`
 - `build.memory_limit_mb: 26624`
-- `prediction.resolved_device: gpu`
-- `prediction.averaged_device: gpu`
+- `prediction.device: gpu`
 - `build.roots.gaia: /Users/nelsonnunes/ao-sky-cache/gaia`
 - artifact writes go directly to the build tree on `/Volumes/Data/Galaxy/aosky`
 - repo-owned HDF5 writes use Blosc Zstd level 5 compression, including

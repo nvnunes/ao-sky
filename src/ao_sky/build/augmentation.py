@@ -9,6 +9,7 @@ import numpy as np
 from ..survey import build_survey_extent_dataset
 from ._constants import SURVEY_EXTENT_DATASET
 from ._exceptions import BuildError
+from ._schema_compat import require_current_build_layout
 from .artifacts import write_maps_family_dataset
 from .control import load_build_definition, maps_artifact_filename
 
@@ -18,6 +19,7 @@ def build_survey_extent_layers(
 ) -> dict[int, np.ndarray]:
     """Build and persist dense survey-extent layers for all aggregated levels."""
 
+    require_current_build_layout(build_path, operation="augment")
     definition = load_build_definition(build_path)
     if not definition.survey_extent_overlays:
         return {}

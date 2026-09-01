@@ -11,6 +11,7 @@ from astropy.io import fits
 from astropy.table import Table
 from mocpy import MOC
 
+import ao_sky.asterisms.search as search_module
 from ao_sky._paths import get_outer_pixel_bucket_path
 from ao_sky.asterisms import (
     ASTERISM_TABLE_COLUMNS,
@@ -24,20 +25,25 @@ from ao_sky.asterisms import (
 from ao_sky.build._constants import (
     ASTERISMS_DTYPE,
     BUILD_FILENAME,
+    BUILD_LAYOUT_VERSION,
     INNER_DTYPE,
     STATE_DTYPE,
     WORK_STATUS_DONE,
     WORK_STATUS_PENDING,
 )
 from ao_sky.build.artifacts import write_outer_artifact
-import ao_sky.asterisms.search as search_module
 from ao_sky.gaia import (
     GAIA_SCHEMA_COLUMNS,
     GaiaHealpixStore,
     GaiaStoreConfig,
     compute_r_magnitude,
 )
-from ao_sky.spatial import get_parent_pixel, get_pixel_skycoord, get_pixel_neighbours, get_subpixels
+from ao_sky.spatial import (
+    get_parent_pixel,
+    get_pixel_neighbours,
+    get_pixel_skycoord,
+    get_subpixels,
+)
 
 
 def _empty_gaia_table() -> Table:
@@ -344,6 +350,7 @@ def _write_lookup_build_root(
     with h5py.File(build_path / BUILD_FILENAME, "w") as handle:
         metadata = handle.create_group("metadata")
         config = metadata.create_group("config")
+        config.create_dataset("layout_version", data=BUILD_LAYOUT_VERSION)
         config.create_dataset("lineage_name", data="lookup", dtype=h5py.string_dtype("utf-8"))
         config.create_dataset("gaia_release", data="dr3", dtype=h5py.string_dtype("utf-8"))
         config.create_dataset("outer_level", data=0)
@@ -363,10 +370,10 @@ def _write_lookup_outer(
     asterism_pixs: tuple[int, ...] | None = None,
     member_mags: tuple[tuple[float, float, float], ...] | None = None,
     winner_ids: tuple[int, ...] = (7, 7, -1, -1),
-    winner_ee_resolved: tuple[float, ...] = (0.2, 0.4, np.nan, np.nan),
-    winner_ee_averaged: tuple[float, ...] = (0.3, 0.5, np.nan, np.nan),
-    coverage_resolved: tuple[bool, ...] = (False, True, False, False),
-    coverage_averaged: tuple[bool, ...] = (True, True, False, False),
+    on_axis_winner_ee: tuple[float, ...] = (0.2, 0.4, np.nan, np.nan),
+    field_averaged_winner_ee: tuple[float, ...] = (0.3, 0.5, np.nan, np.nan),
+    on_axis_coverage: tuple[bool, ...] = (False, True, False, False),
+    field_averaged_coverage: tuple[bool, ...] = (True, True, False, False),
 ) -> None:
     inner = np.zeros(4, dtype=INNER_DTYPE)
     inner["pix"] = np.arange(4, dtype=np.int64)
@@ -375,10 +382,10 @@ def _write_lookup_outer(
     inner["best_sr"] = np.asarray([0.04, 0.06, 0.01, 0.02], dtype=np.float64)
     inner["best_fwhm"] = np.asarray([100.0, 80.0, 200.0, 180.0], dtype=np.float64)
     inner["winner_asterism_id"] = np.asarray(winner_ids, dtype=np.int64)
-    inner["winner_ee_resolved"] = np.asarray(winner_ee_resolved, dtype=np.float64)
-    inner["winner_ee_averaged"] = np.asarray(winner_ee_averaged, dtype=np.float64)
-    inner["coverage_resolved"] = np.asarray(coverage_resolved, dtype=np.bool_)
-    inner["coverage_averaged"] = np.asarray(coverage_averaged, dtype=np.bool_)
+    inner["on_axis_winner_ee"] = np.asarray(on_axis_winner_ee, dtype=np.float64)
+    inner["field_averaged_winner_ee"] = np.asarray(field_averaged_winner_ee, dtype=np.float64)
+    inner["on_axis_coverage"] = np.asarray(on_axis_coverage, dtype=np.bool_)
+    inner["field_averaged_coverage"] = np.asarray(field_averaged_coverage, dtype=np.bool_)
 
     asterisms = np.zeros(len(local_ids), dtype=ASTERISMS_DTYPE)
     asterisms["asterism_id"] = np.asarray(local_ids, dtype=np.int64)
@@ -558,8 +565,8 @@ def test_find_asterisms_reads_supported_winners_from_done_outer_pixel(tmp_path: 
         "representative_outer_pix",
         "representative_asterism_id",
         "inner_pixel_count",
-        "winner_ee_resolved",
-        "winner_ee_averaged",
+        "on_axis_winner_ee",
+        "field_averaged_winner_ee",
         "gaia_A0",
     ]
     assert int(result["global_asterism_id"][0]) == 1
@@ -567,9 +574,36 @@ def test_find_asterisms_reads_supported_winners_from_done_outer_pixel(tmp_path: 
     assert int(result["representative_asterism_id"][0]) == 7
     assert int(result["inner_pixel_count"][0]) == 2
     assert int(result["star1_source_id"][0]) == 101
-    assert np.isclose(float(result["winner_ee_resolved"][0]), 0.3)
-    assert np.isclose(float(result["winner_ee_averaged"][0]), 0.4)
+    assert np.isclose(float(result["on_axis_winner_ee"][0]), 0.3)
+    assert np.isclose(float(result["field_averaged_winner_ee"][0]), 0.4)
     assert np.isclose(float(result["gaia_A0"][0]), 0.15)
+
+
+def test_schema_v2_lookup_and_export_emit_canonical_fields(
+    schema_v2_build: Path,
+    tmp_path: Path,
+) -> None:
+    source_files = [
+        schema_v2_build / "build.h5",
+        next((schema_v2_build / "hpx0-1").rglob("outer.h5")),
+    ]
+    original = {path: path.read_bytes() for path in source_files}
+
+    found = find_asterisms(schema_v2_build, outer_pixels=0)
+    output = tmp_path / "legacy-asterisms.h5"
+    summary = export_asterisms(
+        schema_v2_build,
+        output,
+        outer_pixels=0,
+    )
+    exported = _read_hdf5_asterism_export(output)
+
+    assert len(found) == 1
+    assert summary.exported_asterism_count == 1
+    assert "on_axis_winner_ee" in found.colnames
+    assert "field_averaged_winner_ee" in exported.colnames
+    assert "winner_ee_resolved" not in exported.colnames
+    assert all(path.read_bytes() == content for path, content in original.items())
 
 
 def test_find_asterisms_deduplicates_physical_asterisms_across_outer_pixels(tmp_path: Path) -> None:
@@ -588,8 +622,8 @@ def test_find_asterisms_deduplicates_physical_asterisms_across_outer_pixels(tmp_
         local_ids=(99,),
         source_ids=((202, 101, -1),),
         winner_ids=(99, -1, -1, -1),
-        winner_ee_resolved=(0.8, np.nan, np.nan, np.nan),
-        winner_ee_averaged=(0.7, np.nan, np.nan, np.nan),
+        on_axis_winner_ee=(0.8, np.nan, np.nan, np.nan),
+        field_averaged_winner_ee=(0.7, np.nan, np.nan, np.nan),
     )
 
     result = find_asterisms(build_path, outer_pixels=[0, 1])
@@ -598,7 +632,7 @@ def test_find_asterisms_deduplicates_physical_asterisms_across_outer_pixels(tmp_
     assert int(result["inner_pixel_count"][0]) == 3
     assert int(result["representative_outer_pix"][0]) == 0
     assert int(result["representative_asterism_id"][0]) == 7
-    assert np.isclose(float(result["winner_ee_resolved"][0]), (0.2 + 0.4 + 0.8) / 3.0)
+    assert np.isclose(float(result["on_axis_winner_ee"][0]), (0.2 + 0.4 + 0.8) / 3.0)
 
 
 def test_find_asterisms_rejects_incomplete_outer_pixels(tmp_path: Path) -> None:
@@ -664,8 +698,8 @@ def test_find_asterisms_moc_aggregates_selected_support_only(tmp_path: Path) -> 
         source_ids=((101, 202, -1), (202, 101, -1), (303, 404, -1)),
         asterism_pixs=(3, 0, 1),
         winner_ids=(7, 8, 9, 7),
-        winner_ee_resolved=(0.2, 0.4, 0.8, 1.0),
-        winner_ee_averaged=(0.3, 0.5, 0.9, 1.1),
+        on_axis_winner_ee=(0.2, 0.4, 0.8, 1.0),
+        field_averaged_winner_ee=(0.3, 0.5, 0.9, 1.1),
     )
     moc = _write_lookup_moc(tmp_path / "region.fits", level=1, pixs=[0, 1])
 
@@ -677,8 +711,8 @@ def test_find_asterisms_moc_aggregates_selected_support_only(tmp_path: Path) -> 
     assert int(result["inner_pixel_count"][0]) == 2
     assert int(result["star1_source_id"][0]) == 101
     assert int(result["star2_source_id"][0]) == 202
-    assert float(result["winner_ee_resolved"][0]) == pytest.approx(0.3)
-    assert float(result["winner_ee_averaged"][0]) == pytest.approx(0.4)
+    assert float(result["on_axis_winner_ee"][0]) == pytest.approx(0.3)
+    assert float(result["field_averaged_winner_ee"][0]) == pytest.approx(0.4)
     assert float(result["gaia_A0"][0]) == pytest.approx(0.15)
 
 
@@ -768,8 +802,8 @@ def test_find_asterisms_filters_by_lookup_summary_fields(tmp_path: Path) -> None
         local_ids=(7, 8),
         source_ids=((101, 202, -1), (303, 404, -1)),
         winner_ids=(7, 7, 8, -1),
-        winner_ee_resolved=(0.2, 0.4, 0.8, np.nan),
-        winner_ee_averaged=(0.3, 0.5, 0.9, np.nan),
+        on_axis_winner_ee=(0.2, 0.4, 0.8, np.nan),
+        field_averaged_winner_ee=(0.3, 0.5, 0.9, np.nan),
     )
 
     count_result = find_asterisms(
@@ -780,12 +814,12 @@ def test_find_asterisms_filters_by_lookup_summary_fields(tmp_path: Path) -> None
     resolved_result = find_asterisms(
         build_path,
         outer_pixels=0,
-        filters=AsterismLookupFilters(min_winner_ee_resolved=0.7),
+        filters=AsterismLookupFilters(min_on_axis_winner_ee=0.7),
     )
     averaged_result = find_asterisms(
         build_path,
         outer_pixels=0,
-        filters=AsterismLookupFilters(min_winner_ee_averaged=0.8),
+        filters=AsterismLookupFilters(min_field_averaged_winner_ee=0.8),
     )
     dust_result = find_asterisms(
         build_path,
@@ -808,10 +842,10 @@ def test_find_asterisms_filters_by_lookup_summary_fields(tmp_path: Path) -> None
         (AsterismLookupFilters(max_member_mag=14.0), [7, 8]),
         (AsterismLookupFilters(min_inner_pixel_count=2), [8]),
         (AsterismLookupFilters(max_inner_pixel_count=1), [7, 9]),
-        (AsterismLookupFilters(min_winner_ee_resolved=0.7), [9]),
-        (AsterismLookupFilters(max_winner_ee_resolved=0.3), [7]),
-        (AsterismLookupFilters(min_winner_ee_averaged=0.8), [9]),
-        (AsterismLookupFilters(max_winner_ee_averaged=0.4), [7]),
+        (AsterismLookupFilters(min_on_axis_winner_ee=0.7), [9]),
+        (AsterismLookupFilters(max_on_axis_winner_ee=0.3), [7]),
+        (AsterismLookupFilters(min_field_averaged_winner_ee=0.8), [9]),
+        (AsterismLookupFilters(max_field_averaged_winner_ee=0.4), [7]),
         (AsterismLookupFilters(min_gaia_A0=0.3), [9]),
         (AsterismLookupFilters(max_gaia_A0=0.15), [7]),
     ],
@@ -830,8 +864,8 @@ def test_find_asterisms_filter_options_cover_each_bound(
         source_ids=((101, -1, -1), (202, 303, -1), (404, 505, 606)),
         member_mags=((12.0, 99.0, 99.0), (13.0, 14.0, 99.0), (15.0, 16.0, 17.0)),
         winner_ids=(7, 8, 8, 9),
-        winner_ee_resolved=(0.2, 0.4, 0.6, 0.8),
-        winner_ee_averaged=(0.3, 0.5, 0.7, 0.9),
+        on_axis_winner_ee=(0.2, 0.4, 0.6, 0.8),
+        field_averaged_winner_ee=(0.3, 0.5, 0.7, 0.9),
     )
 
     result = find_asterisms(build_path, outer_pixels=0, filters=filters)
@@ -911,11 +945,11 @@ def test_asterism_lookup_filters_validate_bounds() -> None:
     with pytest.raises(AsterismError, match="min_inner_pixel_count cannot exceed"):
         AsterismLookupFilters(min_inner_pixel_count=3, max_inner_pixel_count=2)
 
-    with pytest.raises(AsterismError, match="min_winner_ee_resolved cannot exceed"):
-        AsterismLookupFilters(min_winner_ee_resolved=0.8, max_winner_ee_resolved=0.7)
+    with pytest.raises(AsterismError, match="min_on_axis_winner_ee cannot exceed"):
+        AsterismLookupFilters(min_on_axis_winner_ee=0.8, max_on_axis_winner_ee=0.7)
 
-    with pytest.raises(AsterismError, match="min_winner_ee_averaged cannot exceed"):
-        AsterismLookupFilters(min_winner_ee_averaged=0.8, max_winner_ee_averaged=0.7)
+    with pytest.raises(AsterismError, match="min_field_averaged_winner_ee cannot exceed"):
+        AsterismLookupFilters(min_field_averaged_winner_ee=0.8, max_field_averaged_winner_ee=0.7)
 
     with pytest.raises(AsterismError, match="min_gaia_A0 cannot exceed"):
         AsterismLookupFilters(min_gaia_A0=0.3, max_gaia_A0=0.2)
@@ -930,8 +964,8 @@ def test_export_asterisms_hdf5_exports_done_pixels_and_catalog_chunks(tmp_path: 
         local_ids=(7, 8),
         source_ids=((101, 202, -1), (303, -1, -1)),
         winner_ids=(7, 7, 8, -1),
-        winner_ee_resolved=(0.2, 0.4, 0.6, np.nan),
-        winner_ee_averaged=(0.3, 0.5, 0.7, np.nan),
+        on_axis_winner_ee=(0.2, 0.4, 0.6, np.nan),
+        field_averaged_winner_ee=(0.3, 0.5, 0.7, np.nan),
     )
     _write_lookup_outer(
         build_path,
@@ -939,8 +973,8 @@ def test_export_asterisms_hdf5_exports_done_pixels_and_catalog_chunks(tmp_path: 
         local_ids=(99,),
         source_ids=((202, 101, -1),),
         winner_ids=(99, -1, -1, -1),
-        winner_ee_resolved=(0.8, np.nan, np.nan, np.nan),
-        winner_ee_averaged=(0.9, np.nan, np.nan, np.nan),
+        on_axis_winner_ee=(0.8, np.nan, np.nan, np.nan),
+        field_averaged_winner_ee=(0.9, np.nan, np.nan, np.nan),
     )
     _write_lookup_outer(
         build_path,
@@ -948,8 +982,8 @@ def test_export_asterisms_hdf5_exports_done_pixels_and_catalog_chunks(tmp_path: 
         local_ids=(5,),
         source_ids=((404, 505, 606),),
         winner_ids=(5, -1, -1, -1),
-        winner_ee_resolved=(1.0, np.nan, np.nan, np.nan),
-        winner_ee_averaged=(1.1, np.nan, np.nan, np.nan),
+        on_axis_winner_ee=(1.0, np.nan, np.nan, np.nan),
+        field_averaged_winner_ee=(1.1, np.nan, np.nan, np.nan),
     )
     output = tmp_path / "asterisms.h5"
 
@@ -978,16 +1012,16 @@ def test_export_asterisms_hdf5_exports_done_pixels_and_catalog_chunks(tmp_path: 
         "star3_dec",
         "star3_mag",
         "inner_pixel_count",
-        "winner_ee_resolved",
-        "winner_ee_averaged",
+        "on_axis_winner_ee",
+        "field_averaged_winner_ee",
         "gaia_A0",
     ]
     assert result["asterism_id"].tolist() == [1, 2, 3]
     assert "pix" not in result.colnames
     assert "global_asterism_id" not in result.colnames
     assert int(result["inner_pixel_count"][0]) == 3
-    assert float(result["winner_ee_resolved"][0]) == pytest.approx((0.2 + 0.4 + 0.8) / 3.0)
-    assert float(result["winner_ee_averaged"][0]) == pytest.approx((0.3 + 0.5 + 0.9) / 3.0)
+    assert float(result["on_axis_winner_ee"][0]) == pytest.approx((0.2 + 0.4 + 0.8) / 3.0)
+    assert float(result["field_averaged_winner_ee"][0]) == pytest.approx((0.3 + 0.5 + 0.9) / 3.0)
     assert float(result["gaia_A0"][0]) == pytest.approx((0.1 + 0.2 + 0.1) / 3.0)
     with h5py.File(output, "r") as handle:
         assert list(sorted(handle["chunks"])) == ["chunk_000001", "chunk_000002"]
@@ -1030,8 +1064,8 @@ def test_export_asterisms_filters_match_find_asterisms(tmp_path: Path) -> None:
         local_ids=(7, 8, 9),
         source_ids=((101, -1, -1), (202, 303, -1), (404, 505, 606)),
         winner_ids=(7, 8, 8, 9),
-        winner_ee_resolved=(0.2, 0.4, 0.6, 0.8),
-        winner_ee_averaged=(0.3, 0.5, 0.7, 0.9),
+        on_axis_winner_ee=(0.2, 0.4, 0.6, 0.8),
+        field_averaged_winner_ee=(0.3, 0.5, 0.7, 0.9),
     )
     filters = AsterismLookupFilters(min_inner_pixel_count=2)
     output = tmp_path / "filtered.h5"

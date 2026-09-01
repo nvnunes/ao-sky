@@ -8,10 +8,12 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-from astropy.table import Table, vstack
-from matplotlib import pyplot as plt
+import astropy.units as u
 import numpy as np
 import pytest
+from astropy.coordinates import SkyCoord
+from astropy.table import Table, vstack
+from matplotlib import pyplot as plt
 
 from ao_sky._paths import get_outer_pixel_bucket_path
 from ao_sky.build._constants import ASTERISMS_DTYPE, INNER_DTYPE, MAPS_DTYPE
@@ -29,12 +31,18 @@ from ao_sky.plotting import (
     read_build_winner_ee,
 )
 from ao_sky.plotting.fields import FIELD_CONVENTIONS, prepare_field_values
-from ao_sky.plotting.healpix import _remap_dense_values_to_mapcoord, get_healpix_from_skycoord, get_pixel_skycoord
-from ao_sky.plotting.maps import MapPlotOptions, maps_artifact_path, plot_map_artifact_field, read_map_layer
+from ao_sky.plotting.healpix import (
+    _remap_dense_values_to_mapcoord,
+    get_healpix_from_skycoord,
+    get_pixel_skycoord,
+)
+from ao_sky.plotting.maps import (
+    MapPlotOptions,
+    maps_artifact_path,
+    plot_map_artifact_field,
+    read_map_layer,
+)
 from ao_sky.spatial import get_pixel_area
-from astropy.coordinates import SkyCoord
-import astropy.units as u
-
 
 
 def test_field_conventions_cover_all_map_data_fields() -> None:
@@ -56,10 +64,10 @@ def test_best_metric_field_conventions_use_validation_ranges() -> None:
 
 
 def test_winner_ee_field_conventions_match_best_ee_range() -> None:
-    assert FIELD_CONVENTIONS["winner_ee_averaged"].vmin == FIELD_CONVENTIONS["best_ee"].vmin
-    assert FIELD_CONVENTIONS["winner_ee_averaged"].vmax == FIELD_CONVENTIONS["best_ee"].vmax
-    assert FIELD_CONVENTIONS["winner_ee_resolved"].vmin == FIELD_CONVENTIONS["best_ee"].vmin
-    assert FIELD_CONVENTIONS["winner_ee_resolved"].vmax == FIELD_CONVENTIONS["best_ee"].vmax
+    assert FIELD_CONVENTIONS["field_averaged_winner_ee"].vmin == FIELD_CONVENTIONS["best_ee"].vmin
+    assert FIELD_CONVENTIONS["field_averaged_winner_ee"].vmax == FIELD_CONVENTIONS["best_ee"].vmax
+    assert FIELD_CONVENTIONS["on_axis_winner_ee"].vmin == FIELD_CONVENTIONS["best_ee"].vmin
+    assert FIELD_CONVENTIONS["on_axis_winner_ee"].vmax == FIELD_CONVENTIONS["best_ee"].vmax
 
 
 def test_stellar_density_uses_symlog_norm() -> None:
@@ -84,11 +92,11 @@ def test_configure_matplotlib_cache_respects_existing_env(tmp_path: Path, monkey
 def test_read_map_layer_selects_native_field(tmp_path: Path) -> None:
     artifact = _write_synthetic_maps(tmp_path, level=0)
 
-    layer = read_map_layer(artifact, field="winner_ee_averaged")
+    layer = read_map_layer(artifact, field="field_averaged_winner_ee")
 
     assert layer.filename == artifact
     assert layer.level == 0
-    assert layer.field == "winner_ee_averaged"
+    assert layer.field == "field_averaged_winner_ee"
     assert np.allclose(layer.values, np.linspace(0.1, 0.9, 12))
 
 
@@ -114,13 +122,34 @@ def test_read_map_layer_derives_ngs_density(tmp_path: Path) -> None:
     assert np.allclose(layer.values, expected)
 
 
-def test_read_map_layer_supports_coverage_mean_alias(tmp_path: Path) -> None:
+def test_read_map_layer_selects_field_averaged_coverage(tmp_path: Path) -> None:
     artifact = _write_synthetic_maps(tmp_path, level=0)
 
-    layer = read_map_layer(artifact, field="coverage_mean")
+    layer = read_map_layer(artifact, field="field_averaged_coverage")
 
-    assert layer.field == "coverage_mean"
+    assert layer.field == "field_averaged_coverage"
     assert np.allclose(layer.values, np.linspace(0.0, 1.0, 12))
+
+
+def test_schema_v2_map_and_winner_plot_readers_use_canonical_fields(
+    schema_v2_build: Path,
+) -> None:
+    layer = read_map_layer(
+        schema_v2_build,
+        level=0,
+        field="field_averaged_winner_ee",
+    )
+    center = get_pixel_skycoord(0, 0)
+    inner = read_build_winner_ee(
+        schema_v2_build,
+        center=center,
+        width=120.0 * u.deg,
+    )
+
+    assert np.allclose(layer.values, np.linspace(0.3, 0.41, 12))
+    assert "on_axis_winner_ee" in inner.colnames
+    assert "field_averaged_winner_ee" in inner.colnames
+    assert "winner_ee_resolved" not in inner.colnames
 
 
 def test_read_map_layer_raises_for_missing_field(tmp_path: Path) -> None:
@@ -175,11 +204,11 @@ def test_galactic_remap_samples_icrs_values_at_galactic_pixel_coordinates() -> N
 
 def test_plot_map_artifact_field_renders_png(tmp_path: Path) -> None:
     artifact = _write_synthetic_maps(tmp_path, level=0)
-    output_path = tmp_path / "plots" / "winner_ee_averaged-hpx0.png"
+    output_path = tmp_path / "plots" / "field_averaged_winner_ee-hpx0.png"
 
     plot_map_artifact_field(
         artifact,
-        field="winner_ee_averaged",
+        field="field_averaged_winner_ee",
         output_path=output_path,
     )
 
@@ -223,11 +252,11 @@ def test_plot_map_artifact_field_reads_wavelength_from_build_h5_metadata(tmp_pat
 
 def test_plot_map_artifact_field_renders_contours(tmp_path: Path) -> None:
     artifact = _write_synthetic_maps(tmp_path, level=1)
-    output_path = tmp_path / "plots" / "coverage_mean-dust-contours-hpx1.png"
+    output_path = tmp_path / "plots" / "field-averaged-coverage-dust-contours-hpx1.png"
 
     plot_map_artifact_field(
         artifact,
-        field="coverage_mean",
+        field="field_averaged_coverage",
         contour_field="gaia_A0",
         options=MapPlotOptions(projection="cartesian", contour_levels=(0.5, 1.0, 1.5)),
         output_path=output_path,
@@ -251,11 +280,11 @@ def test_plot_map_artifact_field_renders_surveys_and_points(tmp_path: Path) -> N
             ]
         )
     )
-    output_path = tmp_path / "plots" / "coverage_mean-overlays-hpx1.png"
+    output_path = tmp_path / "plots" / "field-averaged-coverage-overlays-hpx1.png"
 
     plot_map_artifact_field(
         artifact,
-        field="coverage_mean",
+        field="field_averaged_coverage",
         options=MapPlotOptions(
             projection="cartesian",
             surveys=[[str(survey_path), {"edgecolor": "red"}, "TEST"]],
@@ -541,7 +570,12 @@ def test_plot_winner_ee_renders_smoothed_field(tmp_path: Path) -> None:
 def test_plot_build_winner_ee_renders_smoothed_field(tmp_path: Path) -> None:
     center = _write_synthetic_asterism_build(tmp_path)
 
-    fig = plot_build_winner_ee(tmp_path, center=center, width=120.0 * u.deg, ee_kind="averaged")
+    fig = plot_build_winner_ee(
+        tmp_path,
+        center=center,
+        width=120.0 * u.deg,
+        ee_kind="field_averaged_winner_ee",
+    )
 
     try:
         ax = fig.axes[0]
@@ -556,13 +590,18 @@ def test_plot_winner_ee_validates_kind_and_columns() -> None:
     inner_pixels = Table()
     inner_pixels["ra"] = [150.0]
     inner_pixels["dec"] = [2.0]
-    inner_pixels["winner_ee_resolved"] = [0.2]
+    inner_pixels["on_axis_winner_ee"] = [0.2]
 
     with pytest.raises(PlottingError, match="ee_kind"):
         plot_winner_ee(inner_pixels, center=center, width=1.0 * u.deg, ee_kind="bad")
 
     with pytest.raises(PlottingError, match="missing required columns"):
-        plot_winner_ee(inner_pixels, center=center, width=1.0 * u.deg, ee_kind="averaged")
+        plot_winner_ee(
+            inner_pixels,
+            center=center,
+            width=1.0 * u.deg,
+            ee_kind="field_averaged_winner_ee",
+        )
 
 
 def _single_asterism_table(center: SkyCoord) -> Table:
@@ -612,10 +651,10 @@ def _write_synthetic_maps(root: Path, *, level: int) -> Path:
     maps["best_sr"] = np.linspace(0.05, 0.5, npix)
     maps["best_ee"] = np.linspace(0.1, 0.8, npix)
     maps["best_fwhm"] = np.linspace(0.5, 0.05, npix)
-    maps["winner_ee_resolved"] = np.linspace(0.1, 0.7, npix)
-    maps["winner_ee_averaged"] = np.linspace(0.1, 0.9, npix)
-    maps["coverage_resolved"] = np.linspace(0.0, 1.0, npix)
-    maps["coverage_averaged"] = np.linspace(0.0, 1.0, npix)
+    maps["on_axis_winner_ee"] = np.linspace(0.1, 0.7, npix)
+    maps["field_averaged_winner_ee"] = np.linspace(0.1, 0.9, npix)
+    maps["on_axis_coverage"] = np.linspace(0.0, 1.0, npix)
+    maps["field_averaged_coverage"] = np.linspace(0.0, 1.0, npix)
 
     filename = root / f"maps-hpx{level}.h5"
     write_maps_artifact(filename, maps=maps)
@@ -637,7 +676,7 @@ def _write_synthetic_asterism_build(
 def _write_synthetic_asterism_config(root: Path) -> None:
     (root / "build.yaml").write_text(
         """
-schema_version: 2
+schema_version: 3
 ao_system:
   band: R
   fov_arcsec: 120.0
@@ -671,8 +710,8 @@ def _write_synthetic_asterism_outer(
     inner = Table(np.zeros(4, dtype=INNER_DTYPE))
     inner["pix"] = np.arange(4, dtype=np.int64)
     inner["winner_asterism_id"] = [1, 1, 2, 3]
-    inner["winner_ee_resolved"] = [0.22, 0.30, 0.38, 0.44]
-    inner["winner_ee_averaged"] = [0.20, 0.28, 0.34, 0.40]
+    inner["on_axis_winner_ee"] = [0.22, 0.30, 0.38, 0.44]
+    inner["field_averaged_winner_ee"] = [0.20, 0.28, 0.34, 0.40]
     if empty:
         asterisms = Table(np.zeros(0, dtype=ASTERISMS_DTYPE))
     else:

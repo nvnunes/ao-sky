@@ -6,21 +6,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import astropy.units as u
+import numpy as np
+import yaml
 from astropy.coordinates import SkyCoord
 from astropy.table import Table, unique, vstack
 from astropy.table.row import Row
-import astropy.units as u
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle, PathPatch
 from matplotlib.path import Path as MplPath
-import numpy as np
 from scipy.interpolate import griddata
-import yaml
 
 from ao_sky.build._constants import RUNTIME_CONFIG_FILENAME
-from ao_sky.spatial import get_pixel_from_skycoord, get_pixel_neighbours, get_pixel_skycoord
+from ao_sky.spatial import (
+    get_pixel_from_skycoord,
+    get_pixel_neighbours,
+    get_pixel_skycoord,
+)
 
 from ._exceptions import PlottingError
 
@@ -351,7 +355,7 @@ def plot_winner_ee(
     *,
     center: SkyCoord,
     width: u.Quantity,
-    ee_kind: str = "resolved",
+    ee_kind: str = "on_axis_winner_ee",
     ax: Axes | None = None,
     cmap: str = "plasma",
     vmin: float = 0.0,
@@ -362,14 +366,14 @@ def plot_winner_ee(
     """Plot a smoothed local winner-EE field from normalized inner pixels.
 
     Args:
-        inner_pixels: Table with `ra`, `dec`, `winner_ee_resolved`, and
-            `winner_ee_averaged` columns. Values are interpreted as inner-pixel
+        inner_pixels: Table with `ra`, `dec`, `on_axis_winner_ee`, and
+            `field_averaged_winner_ee` columns. Values are interpreted as inner-pixel
             centers and the winner performance assigned to each center.
         center: Scalar sky coordinate at the centre of the plotted field. The
             coordinate is interpreted in ICRS after any frame transform.
         width: Angular side length of the square field.
-        ee_kind: Winner EE field to plot. Accepted values are `resolved`,
-            `averaged`, `winner_ee_resolved`, and `winner_ee_averaged`.
+        ee_kind: Canonical winner-EE field to plot: `on_axis_winner_ee` or
+            `field_averaged_winner_ee`.
         ax: Optional Matplotlib axes to draw into. When omitted, a new figure
             and axes are created.
         cmap: Matplotlib colormap name.
@@ -425,7 +429,7 @@ def plot_build_winner_ee(
     *,
     center: SkyCoord,
     width: u.Quantity,
-    ee_kind: str = "resolved",
+    ee_kind: str = "on_axis_winner_ee",
     ax: Axes | None = None,
     cmap: str = "plasma",
     vmin: float = 0.0,
@@ -440,8 +444,8 @@ def plot_build_winner_ee(
         center: Scalar sky coordinate at the centre of the plotted field. The
             coordinate is interpreted in ICRS after any frame transform.
         width: Angular side length of the square field.
-        ee_kind: Winner EE field to plot. Accepted values are `resolved`,
-            `averaged`, `winner_ee_resolved`, and `winner_ee_averaged`.
+        ee_kind: Canonical winner-EE field to plot: `on_axis_winner_ee` or
+            `field_averaged_winner_ee`.
         ax: Optional Matplotlib axes to draw into. When omitted, a new figure
             and axes are created.
         cmap: Matplotlib colormap name.
@@ -876,12 +880,12 @@ def _physical_asterism_key(row) -> tuple[int, ...]:  # noqa: ANN001
 
 def _winner_ee_field_name(ee_kind: str) -> str:
     value = str(ee_kind).strip().lower()
-    if value in {"resolved", "winner_ee_resolved"}:
-        return "winner_ee_resolved"
-    if value in {"averaged", "winner_ee_averaged"}:
-        return "winner_ee_averaged"
+    if value == "on_axis_winner_ee":
+        return "on_axis_winner_ee"
+    if value == "field_averaged_winner_ee":
+        return "field_averaged_winner_ee"
     raise PlottingError(
-        "ee_kind must be one of: resolved, averaged, winner_ee_resolved, winner_ee_averaged"
+        "ee_kind must be one of: on_axis_winner_ee, field_averaged_winner_ee"
     )
 
 

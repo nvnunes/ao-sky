@@ -6,25 +6,26 @@ from dataclasses import replace
 from gzip import open as gzip_open
 from pathlib import Path
 
+import astropy.units as u
 import numpy as np
 import pytest
 import yaml
-import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
 
 from ao_sky.build import init_build as real_init_build
-from ao_sky.build._models import BuildDefinition, TraversalExecutionConfig
 from ao_sky.build._exceptions import BuildError
+from ao_sky.build._models import BuildDefinition, TraversalExecutionConfig
+from ao_sky.build._schema_compat import normalize_runtime_config_payload
 from ao_sky.build.config import load_build_definition as load_build_definition_yaml
 from ao_sky.build.control import load_build_roots
-from ao_sky.build.runtime_gaia import RUNTIME_HPX_COLUMN, RuntimeGaiaHealpixStore
 from ao_sky.build.runtime_config import (
     load_runtime_config,
     runtime_config_filename,
     runtime_to_config,
     write_runtime_config,
 )
+from ao_sky.build.runtime_gaia import RUNTIME_HPX_COLUMN, RuntimeGaiaHealpixStore
 from ao_sky.build.traversal import (
     DEFAULT_BACKEND_BUCKETS,
     TraversalGeometry,
@@ -33,33 +34,33 @@ from ao_sky.build.traversal import (
     _backend_row_count,
     _build_candidate_graph_from_ngs,
     _build_candidate_set,
-    _build_retained_asterism_table,
     _build_regional_candidate_graph,
+    _build_retained_asterism_table,
     _candidate_enclosing_fov_center,
     _fill_regularized_winner_fields,
+    _local_neighbor_index_matrix,
+    _max_regional_combination_work,
     _MulticoverSelection,
     _nearest_feasible_pointing,
     _nearest_feasible_pointing_generic,
-    _StarForCoverage,
-    _local_neighbor_index_matrix,
-    _max_regional_combination_work,
-    _regularize_winner_labels,
     _regional_selector_max_depth,
+    _regularize_winner_labels,
     _select_ngs_for_multicover,
-    _stream_recovered_candidate_predictions,
+    _StarForCoverage,
     _stream_batch_size,
-    _update_regularized_winner_averaged_ee,
+    _stream_recovered_candidate_predictions,
+    _update_regularized_field_averaged_winner_ee,
     build_base_inner_table,
-    prepare_search_inputs,
     build_traversal_products,
+    prepare_search_inputs,
 )
 from ao_sky.gaia import GaiaStoreConfig, GaiaSummaryStore
 from ao_sky.gaia._constants import GAIA_SCHEMA_COLUMNS
 from ao_sky.predict import PredictError
 from ao_sky.predict import backend as predict_backend
 from ao_sky.predict import service as predict_service
+from ao_sky.predict._models import AOSystemRuntime, PredictionBatch, PredictRuntime
 from ao_sky.predict.service import build_model_x_from_ngs_arrays
-from ao_sky.predict._models import AOSystemRuntime, PointPredictionBatch, PredictRuntime
 from ao_sky.spatial import get_parent_pixel, get_pixel_from_skycoord, get_pixel_skycoord
 
 
@@ -82,7 +83,7 @@ ao_systems:
     models:
       2star: mean_two
       3star: mean_three
-coverage_ee_threshold_resolved: 0.4
+on_axis_ee_threshold: 0.4
 coverage_ee_threshold_mean: 0.3
 """.strip()
     path.write_text(text + "\n", encoding="utf-8")
@@ -93,7 +94,7 @@ def _write_build_definition(path: Path) -> Path:
     path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "build": {},
                 "ao_system": {
                     "band": "R",
@@ -107,12 +108,12 @@ def _write_build_definition(path: Path) -> Path:
                 },
                 "prediction": {
                     "wavelength_micron": 1.654,
-                    "resolved_models": {
+                    "models": {
                         "1star": "point_one",
                         "2star": "point_two",
                         "3star": "point_three",
                     },
-                    "averaged_models": {
+                    "legacy_field_averaged_models": {
                         "1star": "mean_one",
                         "2star": "mean_two",
                         "3star": "mean_three",
@@ -141,8 +142,8 @@ def _write_build_definition(path: Path) -> Path:
                     },
                 },
                 "coverage": {
-                    "resolved_ee_threshold": 0.4,
-                    "averaged_ee_threshold": 0.3,
+                    "on_axis_ee_threshold": 0.4,
+                    "field_averaged_ee_threshold": 0.3,
                 },
             },
             sort_keys=False,
@@ -190,21 +191,21 @@ def load_native_runtime(
         winner_ee_epsilon=0.01,
         winner_top_k=3,
         prediction_wavelength=1.654 * u.micron,
-        resolved_models={
+        models={
             str(key): str(value)
             for key, value in (system.get("point_models") or {}).items()
         },
-        averaged_models={
+        legacy_field_averaged_models={
             str(key): str(value) for key, value in (system.get("models") or {}).items()
         },
         seeing_reference_wavelength=0.5 * u.micron,
         seeing_reference_sr=0.0,
         seeing_reference_ee=0.02,
         seeing_reference_fwhm=650.0,
-        coverage_ee_threshold_resolved=float(
-            raw.get("coverage_ee_threshold_resolved", 0.25)
+        on_axis_ee_threshold=float(
+            raw.get("on_axis_ee_threshold", 0.25)
         ),
-        coverage_ee_threshold_averaged=float(raw.get("coverage_ee_threshold_mean", 0.25)),
+        field_averaged_ee_threshold=float(raw.get("coverage_ee_threshold_mean", 0.25)),
         model_root=Path(model_root).resolve(),
     )
 
@@ -272,8 +273,8 @@ def init_build(
         legacy_config_path=legacy_config_path,
         model_root=effective_model_root,
     )
-    for model_name in set(runtime.resolved_models.values()) | set(
-        runtime.averaged_models.values()
+    for model_name in set(runtime.models.values()) | set(
+        runtime.legacy_field_averaged_models.values()
     ):
         _write_required_model_files(effective_model_root, model_name)
     build_config = yaml.safe_load(Path(definition_filename).read_text(encoding="utf-8"))
@@ -394,11 +395,11 @@ def test_load_native_runtime_applies_defaults_and_model_root(tmp_path: Path) -> 
     assert runtime.model_root == (tmp_path / "models").resolve()
     assert runtime.prediction_wavelength.to_value() == pytest.approx(1.654)
     assert runtime.seeing_reference_wavelength.to_value() == pytest.approx(0.5)
-    assert runtime.coverage_ee_threshold_resolved == pytest.approx(0.4)
-    assert runtime.coverage_ee_threshold_averaged == pytest.approx(0.3)
+    assert runtime.on_axis_ee_threshold == pytest.approx(0.4)
+    assert runtime.field_averaged_ee_threshold == pytest.approx(0.3)
     assert len(runtime.ao_system.lgs) == 4
-    assert runtime.resolved_models == {"2star": "point_two", "3star": "point_three"}
-    assert runtime.averaged_models == {"2star": "mean_two", "3star": "mean_three"}
+    assert runtime.models == {"2star": "point_two", "3star": "point_three"}
+    assert runtime.legacy_field_averaged_models == {"2star": "mean_two", "3star": "mean_three"}
 
 
 def test_runtime_config_round_trips_native_policy(tmp_path: Path) -> None:
@@ -423,10 +424,15 @@ def test_runtime_config_round_trips_native_policy(tmp_path: Path) -> None:
     assert filename == runtime_config_filename(tmp_path / "build")
     assert "source" not in payload
     assert "build" not in payload
+    assert payload["schema_version"] == 3
+    assert "resolved_models" not in payload["prediction"]
+    assert "averaged_models" not in payload["prediction"]
+    assert "resolved_ee_threshold" not in payload["coverage"]
+    assert "averaged_ee_threshold" not in payload["coverage"]
     assert loaded.model_root == (tmp_path / "models-b").resolve()
     assert loaded.ao_system.fov.to_value(u.arcsec) == pytest.approx(120.0)
-    assert loaded.resolved_models == runtime.resolved_models
-    assert loaded.averaged_models == runtime.averaged_models
+    assert loaded.models == runtime.models
+    assert loaded.legacy_field_averaged_models == runtime.legacy_field_averaged_models
     assert loaded.outer_level == runtime.outer_level
     assert loaded.inner_level == runtime.inner_level
     assert loaded.max_bright_star_exclusion.to_value(u.arcsec) == pytest.approx(
@@ -435,6 +441,72 @@ def test_runtime_config_round_trips_native_policy(tmp_path: Path) -> None:
     assert loaded.winner_ee_epsilon == pytest.approx(runtime.winner_ee_epsilon)
     assert loaded.winner_top_k == runtime.winner_top_k
     assert loaded.prediction_wavelength.to_value(u.micron) == pytest.approx(1.654)
+
+
+def test_schema_v2_runtime_config_cannot_seed_new_computation(
+    schema_v2_build: Path,
+) -> None:
+    with pytest.raises(BuildError, match="read-only"):
+        load_runtime_config(
+            schema_v2_build / "build.yaml",
+            model_root=schema_v2_build / "models",
+        )
+
+
+@pytest.mark.parametrize("schema_version", [3.9, 3.0, "3", True])
+def test_runtime_config_schema_version_must_be_an_exact_integer(
+    schema_version: object,
+) -> None:
+    with pytest.raises(BuildError, match="Invalid runtime config schema_version"):
+        normalize_runtime_config_payload({"schema_version": schema_version})
+
+
+def test_schema_v2_runtime_normalization_discards_obsolete_device_fields() -> None:
+    payload = {
+        "schema_version": 2,
+        "prediction": {
+            "resolved_models": {"1star": "point-one"},
+            "averaged_models": {"1star": "mean-one"},
+            "resolved_device": "gpu",
+            "averaged_device": "cpu",
+        },
+    }
+
+    normalized = normalize_runtime_config_payload(payload, allow_legacy=True)
+
+    assert normalized["prediction"] == {
+        "models": {"1star": "point-one"},
+        "legacy_field_averaged_models": {"1star": "mean-one"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("section_name", "field_name", "value"),
+    [
+        ("prediction", "resolved_models", {"1star": "legacy-point"}),
+        ("prediction", "averaged_models", {"1star": "legacy-mean"}),
+        ("prediction", "resolved_device", "gpu"),
+        ("prediction", "averaged_device", "gpu"),
+        ("coverage", "resolved_ee_threshold", 0.4),
+        ("coverage", "averaged_ee_threshold", 0.3),
+    ],
+)
+def test_schema_v3_runtime_config_rejects_legacy_fields(
+    tmp_path: Path,
+    section_name: str,
+    field_name: str,
+    value: object,
+) -> None:
+    filename = write_runtime_config(
+        tmp_path / "build",
+        _make_predict_runtime(model_root=tmp_path / "models"),
+    )
+    payload = yaml.safe_load(filename.read_text(encoding="utf-8"))
+    payload[section_name][field_name] = value
+    filename.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(BuildError, match=rf"{section_name}\.{field_name}"):
+        load_runtime_config(filename, model_root=tmp_path / "models")
 
 
 def test_load_runtime_config_rejects_missing_nested_values(tmp_path: Path) -> None:
@@ -533,20 +605,20 @@ def test_backend_missing_dependency_raises_clear_error(
 def test_clear_backend_cache_releases_loaded_backend_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    predict_service._POINT_MODEL_CACHE.clear()
-    predict_service._MEAN_MODEL_CACHE.clear()
+    predict_service._MODEL_CACHE.clear()
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE.clear()
     point_model = object()
     mean_model = object()
-    predict_service._POINT_MODEL_CACHE["point:test:2star"] = point_model
-    predict_service._MEAN_MODEL_CACHE["mean:test:3star"] = mean_model
+    predict_service._MODEL_CACHE["point:test:2star"] = point_model
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE["mean:test:3star"] = mean_model
     cleared: list[object] = []
     monkeypatch.setattr(predict_service.backend, "clear_cache", lambda model: cleared.append(model))
 
     predict_service.clear_backend_cache()
 
     assert cleared == [point_model, mean_model]
-    assert predict_service._POINT_MODEL_CACHE == {"point:test:2star": point_model}
-    assert predict_service._MEAN_MODEL_CACHE == {"mean:test:3star": mean_model}
+    assert predict_service._MODEL_CACHE == {"point:test:2star": point_model}
+    assert predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE == {"mean:test:3star": mean_model}
 
 
 def _make_predict_runtime(
@@ -578,11 +650,11 @@ def _make_predict_runtime(
         winner_ee_epsilon=0.01,
         winner_top_k=3,
         prediction_wavelength=1.654 * u.micron,
-        resolved_models={
+        models={
             f"{count}star": point_model
             for count in range(min_wfs, max_wfs + 1)
         },
-        averaged_models={
+        legacy_field_averaged_models={
             f"{count}star": mean_model
             for count in range(min_wfs, max_wfs + 1)
         },
@@ -590,8 +662,8 @@ def _make_predict_runtime(
         seeing_reference_sr=0.0,
         seeing_reference_ee=0.0,
         seeing_reference_fwhm=0.0,
-        coverage_ee_threshold_resolved=0.25,
-        coverage_ee_threshold_averaged=0.25,
+        on_axis_ee_threshold=0.25,
+        field_averaged_ee_threshold=0.25,
         model_root=model_root,
     )
 
@@ -925,11 +997,11 @@ def test_recovered_prediction_uses_nearest_valid_pointing(
     seen: dict[str, np.ndarray] = {}
 
     monkeypatch.setattr(
-        "ao_sky.build.traversal.get_point_model",
+        "ao_sky.build.traversal.get_model",
         lambda runtime, num_stars, **kwargs: object(),
     )
 
-    def fake_predict_point_arrays(
+    def fake_predict_arrays(
         runtime,
         num_stars,
         model,
@@ -947,7 +1019,7 @@ def test_recovered_prediction_uses_nearest_valid_pointing(
                 0.0,
                 row_count=len(ngs_zd),
             )
-        return PointPredictionBatch(
+        return PredictionBatch(
             sr=np.asarray([0.5], dtype=np.float64),
             ee=np.asarray([0.7], dtype=np.float64),
             fwhm=np.asarray([100.0], dtype=np.float64),
@@ -955,8 +1027,8 @@ def test_recovered_prediction_uses_nearest_valid_pointing(
         )
 
     monkeypatch.setattr(
-        "ao_sky.build.traversal.predict_point_arrays",
-        fake_predict_point_arrays,
+        "ao_sky.build.traversal.predict_arrays",
+        fake_predict_arrays,
     )
 
     best_ee = np.full(2, np.nan, dtype=np.float64)
@@ -972,7 +1044,7 @@ def test_recovered_prediction_uses_nearest_valid_pointing(
 
     recovered_rows = _stream_recovered_candidate_predictions(
         runtime,
-        TraversalExecutionConfig(resolved_backend_buckets=()),
+        TraversalExecutionConfig(on_axis_backend_buckets=()),
         candidate_set,
         np.asarray([[1], [1]], dtype=np.uint64),
         np.asarray([1], dtype=np.uint64),
@@ -995,7 +1067,7 @@ def test_recovered_prediction_uses_nearest_valid_pointing(
     )
 
     assert recovered_rows == 1
-    assert structure_profile.to_stats().recovered_point_prediction_rows == 1
+    assert structure_profile.to_stats().recovered_on_axis_prediction_rows == 1
     assert int(top_refs[0, 0]) == -1
     assert int(top_refs[1, 0]) == 0
     assert float(top_pointing_x[1, 0]) == pytest.approx(0.0)
@@ -1021,13 +1093,13 @@ def test_recovery_skips_candidates_failing_wide_fov_prefilter(
     graph = _build_candidate_graph_from_ngs(stars, runtime)
     candidate_set = _build_candidate_set(graph, runtime)
     monkeypatch.setattr(
-        "ao_sky.build.traversal.predict_point_arrays",
+        "ao_sky.build.traversal.predict_arrays",
         lambda *args, **kwargs: pytest.fail("recovery should not run prediction"),
     )
 
     recovered_rows = _stream_recovered_candidate_predictions(
         runtime,
-        TraversalExecutionConfig(resolved_backend_buckets=()),
+        TraversalExecutionConfig(on_axis_backend_buckets=()),
         candidate_set,
         np.asarray([[1], [0]], dtype=np.uint64),
         np.asarray([1], dtype=np.uint64),
@@ -1089,19 +1161,19 @@ def test_averaged_prediction_uses_selected_pointing(
             "best_sr",
             "best_fwhm",
             "winner_asterism_id",
-            "winner_ee_resolved",
-            "winner_ee_averaged",
-            "coverage_resolved",
-            "coverage_averaged",
+            "on_axis_winner_ee",
+            "field_averaged_winner_ee",
+            "on_axis_coverage",
+            "field_averaged_coverage",
         ),
     )
     seen: dict[str, np.ndarray] = {}
     monkeypatch.setattr(
-        "ao_sky.build.traversal.get_mean_model",
+        "ao_sky.build.traversal._get_legacy_field_averaged_model",
         lambda runtime, num_stars, **kwargs: object(),
     )
 
-    def fake_predict_field_mean_arrays(
+    def fake__predict_legacy_field_averaged_arrays(
         runtime,
         num_stars,
         model,
@@ -1122,14 +1194,14 @@ def test_averaged_prediction_uses_selected_pointing(
         return np.asarray([0.6], dtype=np.float64)
 
     monkeypatch.setattr(
-        "ao_sky.build.traversal.predict_field_mean_arrays",
-        fake_predict_field_mean_arrays,
+        "ao_sky.build.traversal._predict_legacy_field_averaged_arrays",
+        fake__predict_legacy_field_averaged_arrays,
     )
     pointing_y = np.sqrt(60.0**2 - 58.0**2)
 
-    _update_regularized_winner_averaged_ee(
+    _update_regularized_field_averaged_winner_ee(
         runtime,
-        TraversalExecutionConfig(averaged_backend_buckets=()),
+        TraversalExecutionConfig(legacy_field_averaged_backend_buckets=()),
         inner,
         np.asarray([0], dtype=np.int64),
         candidate_set,
@@ -1143,7 +1215,7 @@ def test_averaged_prediction_uses_selected_pointing(
     )
 
     assert seen["ngs_zd"][0].tolist() == pytest.approx([60.0, 60.0])
-    assert float(inner["winner_ee_averaged"][0]) == pytest.approx(0.7)
+    assert float(inner["field_averaged_winner_ee"][0]) == pytest.approx(0.7)
 
 
 def test_regional_candidate_graph_keeps_exact_tractable_region(
@@ -1181,7 +1253,7 @@ def test_regional_candidate_graph_keeps_exact_tractable_region(
     assert stats.for_optimized_regions == 0
     assert stats.max_regional_combination_work == 64
     assert stats.exact_combination_work == 14
-    assert stats.final_resolved_inferences == 14
+    assert stats.final_on_axis_inferences == 14
     assert graph.final_count == 4
     assert graph.candidate_count == 14
     assert len(candidate_set.members) == 14
@@ -1221,7 +1293,7 @@ def test_regional_candidate_graph_uses_for_selection_at_dense_floor(
     assert stats.exact_regions == 0
     assert stats.for_optimized_regions == 1
     assert stats.exact_combination_work == 0
-    assert stats.final_resolved_inferences == 7
+    assert stats.final_on_axis_inferences == 7
     assert np.asarray(graph.sorted_ngs["source_id"], dtype=np.int64).tolist() == [
         100,
         101,
@@ -1285,7 +1357,7 @@ def test_regional_candidate_graph_uses_unbounded_for_selection_under_budget(
     assert stats.exact_regions == 0
     assert stats.for_optimized_regions == 1
     assert stats.incomplete_for_regions == 0
-    assert stats.final_resolved_inferences == 32
+    assert stats.final_on_axis_inferences == 32
     assert np.asarray(graph.sorted_ngs["source_id"], dtype=np.int64).tolist() == [
         100,
         101,
@@ -1576,7 +1648,7 @@ def test_vectorized_prediction_records_feature_and_backend_telemetry(
     monkeypatch.setattr(predict_service.backend, "get_prediction", fake_get_prediction)
 
     telemetry = predict_service.PredictionArrayTelemetry()
-    result = predict_service.predict_field_mean_arrays(
+    result = predict_service._predict_legacy_field_averaged_arrays(
         runtime,
         num_stars=2,
         model=object(),
@@ -1609,7 +1681,7 @@ def test_vectorized_prediction_requires_num_stars_to_match_arrays(
     )
 
     with pytest.raises(PredictError, match="num_stars must match"):
-        predict_service.predict_point_arrays(
+        predict_service.predict_arrays(
             runtime,
             num_stars=3,
             model=object(),
@@ -1619,7 +1691,7 @@ def test_vectorized_prediction_requires_num_stars_to_match_arrays(
         )
 
     with pytest.raises(PredictError, match="num_stars must match"):
-        predict_service.predict_field_mean_arrays(
+        predict_service._predict_legacy_field_averaged_arrays(
             runtime,
             num_stars=3,
             model=object(),
@@ -1655,7 +1727,7 @@ def test_vectorized_prediction_can_use_fixed_backend_shape(
     monkeypatch.setattr(predict_service.backend, "get_prediction", fake_get_prediction)
 
     telemetry = predict_service.PredictionArrayTelemetry()
-    result = predict_service.predict_point_arrays(
+    result = predict_service.predict_arrays(
         runtime,
         num_stars=2,
         model=object(),
@@ -1699,7 +1771,7 @@ def test_vectorized_prediction_reuses_fixed_backend_feature_buffer(
 
     model = object()
     for scale in (1.0, 2.0):
-        predict_service.predict_point_arrays(
+        predict_service.predict_arrays(
             runtime,
             num_stars=2,
             model=model,
@@ -1739,7 +1811,7 @@ def test_vectorized_prediction_slices_one_larger_feature_buffer(
     monkeypatch.setattr(predict_service.backend, "get_prediction", fake_get_prediction)
     model = object()
 
-    predict_service.predict_point_arrays(
+    predict_service.predict_arrays(
         runtime,
         num_stars=2,
         model=model,
@@ -1757,7 +1829,7 @@ def test_vectorized_prediction_slices_one_larger_feature_buffer(
         ),
         backend_row_count=5,
     )
-    predict_service.predict_point_arrays(
+    predict_service.predict_arrays(
         runtime,
         num_stars=2,
         model=model,
@@ -1805,7 +1877,7 @@ def test_vectorized_prediction_records_mps_memory_telemetry(
     )
 
     telemetry = predict_service.PredictionArrayTelemetry()
-    predict_service.predict_field_mean_arrays(
+    predict_service._predict_legacy_field_averaged_arrays(
         runtime,
         num_stars=2,
         model=object(),
@@ -1993,15 +2065,15 @@ def test_build_base_inner_table_initializes_winners_to_seeing_baseline(tmp_path:
     baseline = predict_service.get_seeing_baseline_performance(runtime)
 
     assert np.allclose(inner["best_ee"], baseline.ee)
-    assert np.allclose(inner["winner_ee_resolved"], baseline.ee)
-    assert np.allclose(inner["winner_ee_averaged"], baseline.ee)
+    assert np.allclose(inner["on_axis_winner_ee"], baseline.ee)
+    assert np.allclose(inner["field_averaged_winner_ee"], baseline.ee)
     assert np.all(np.asarray(inner["winner_asterism_id"], dtype=np.int64) == -1)
 
 
 def test_regularized_winner_resolved_ee_keeps_seeing_floor() -> None:
     inner = Table()
     inner["winner_asterism_id"] = np.asarray([-1, -1], dtype=np.int64)
-    inner["winner_ee_resolved"] = np.asarray([0.5, 0.5], dtype=np.float64)
+    inner["on_axis_winner_ee"] = np.asarray([0.5, 0.5], dtype=np.float64)
 
     _fill_regularized_winner_fields(
         inner,
@@ -2014,7 +2086,7 @@ def test_regularized_winner_resolved_ee_keeps_seeing_floor() -> None:
     )
 
     assert np.asarray(inner["winner_asterism_id"], dtype=np.int64).tolist() == [1, 2]
-    assert np.asarray(inner["winner_ee_resolved"], dtype=np.float64).tolist() == pytest.approx(
+    assert np.asarray(inner["on_axis_winner_ee"], dtype=np.float64).tolist() == pytest.approx(
         [0.5, 0.8]
     )
 
@@ -2068,8 +2140,8 @@ def test_model_cache_key_includes_model_root_and_model_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    predict_service._POINT_MODEL_CACHE.clear()
-    predict_service._MEAN_MODEL_CACHE.clear()
+    predict_service._MODEL_CACHE.clear()
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE.clear()
     loaded: list[tuple[Path, str, bool]] = []
 
     def fake_load_model(
@@ -2088,10 +2160,10 @@ def test_model_cache_key_includes_model_root_and_model_name(
         point_model="point-c.pt",
     )
 
-    assert predict_service.get_point_model(runtime_a, 2) == "models-a:point-a.pt"
-    assert predict_service.get_point_model(runtime_b, 2) == "models-b:point-a.pt"
-    assert predict_service.get_point_model(runtime_c, 2) == "models-a:point-c.pt"
-    assert predict_service.get_point_model(runtime_a, 2) == "models-a:point-a.pt"
+    assert predict_service.get_model(runtime_a, 2) == "models-a:point-a.pt"
+    assert predict_service.get_model(runtime_b, 2) == "models-b:point-a.pt"
+    assert predict_service.get_model(runtime_c, 2) == "models-a:point-c.pt"
+    assert predict_service.get_model(runtime_a, 2) == "models-a:point-a.pt"
 
     assert loaded == [
         (tmp_path / "models-a", "point-a.pt", True),
@@ -2104,8 +2176,8 @@ def test_model_cache_key_includes_backend_device_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    predict_service._POINT_MODEL_CACHE.clear()
-    predict_service._MEAN_MODEL_CACHE.clear()
+    predict_service._MODEL_CACHE.clear()
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE.clear()
     loaded: list[bool] = []
 
     def fake_load_model(
@@ -2119,19 +2191,19 @@ def test_model_cache_key_includes_backend_device_policy(
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
     runtime = _make_predict_runtime(model_root=tmp_path / "models")
 
-    assert predict_service.get_point_model(runtime, 2, device="cpu") == "force_cpu=True"
+    assert predict_service.get_model(runtime, 2, device="cpu") == "force_cpu=True"
 
-    assert predict_service.get_point_model(runtime, 2, device="gpu") == "force_cpu=False"
+    assert predict_service.get_model(runtime, 2, device="gpu") == "force_cpu=False"
 
     assert loaded == [True, False]
 
 
-def test_mean_model_stays_on_cpu_when_resolved_allows_auto_device(
+def test_legacy_field_averaged_model_defaults_to_cpu(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    predict_service._POINT_MODEL_CACHE.clear()
-    predict_service._MEAN_MODEL_CACHE.clear()
+    predict_service._MODEL_CACHE.clear()
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE.clear()
     loaded: list[bool] = []
 
     def fake_load_model(
@@ -2145,16 +2217,16 @@ def test_mean_model_stays_on_cpu_when_resolved_allows_auto_device(
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
     runtime = _make_predict_runtime(model_root=tmp_path / "models")
 
-    assert predict_service.get_mean_model(runtime, 2) == "force_cpu=True"
+    assert predict_service._get_legacy_field_averaged_model(runtime, 2) == "force_cpu=True"
     assert loaded == [True]
 
 
-def test_mean_model_can_use_auto_device_when_explicitly_enabled(
+def test_legacy_field_averaged_model_uses_explicit_gpu_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    predict_service._POINT_MODEL_CACHE.clear()
-    predict_service._MEAN_MODEL_CACHE.clear()
+    predict_service._MODEL_CACHE.clear()
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE.clear()
     loaded: list[bool] = []
 
     def fake_load_model(
@@ -2168,7 +2240,7 @@ def test_mean_model_can_use_auto_device_when_explicitly_enabled(
     monkeypatch.setattr(predict_service.backend, "load_model", fake_load_model)
     runtime = _make_predict_runtime(model_root=tmp_path / "models")
 
-    assert predict_service.get_mean_model(runtime, 2, device="gpu") == "force_cpu=False"
+    assert predict_service._get_legacy_field_averaged_model(runtime, 2, device="gpu") == "force_cpu=False"
     assert loaded == [False]
 
 
@@ -2176,30 +2248,65 @@ def test_model_device_policy_rejects_unknown_value(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    predict_service._POINT_MODEL_CACHE.clear()
-    predict_service._MEAN_MODEL_CACHE.clear()
+    predict_service._MODEL_CACHE.clear()
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE.clear()
 
     with pytest.raises(PredictError, match="device"):
-        predict_service.get_point_model(
+        predict_service.get_model(
             _make_predict_runtime(model_root=tmp_path / "models"),
             2,
             device="mps",
         )
 
 
-def test_mean_model_validates_averaged_device_policy_value(
+def test_legacy_field_averaged_model_validates_device_policy_value(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    predict_service._POINT_MODEL_CACHE.clear()
-    predict_service._MEAN_MODEL_CACHE.clear()
+    predict_service._MODEL_CACHE.clear()
+    predict_service._LEGACY_FIELD_AVERAGED_MODEL_CACHE.clear()
 
     with pytest.raises(PredictError, match="device"):
-        predict_service.get_mean_model(
+        predict_service._get_legacy_field_averaged_model(
             _make_predict_runtime(model_root=tmp_path / "models"),
             2,
             device="mps",
         )
+
+
+def test_warm_model_cache_uses_one_device_policy_for_both_model_families(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_predict_runtime(
+        model_root=tmp_path / "models",
+        min_wfs=2,
+        max_wfs=3,
+    )
+    calls: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        predict_service,
+        "get_model",
+        lambda runtime, num_stars, *, device: calls.append(
+            ("model", num_stars, device)
+        ),
+    )
+    monkeypatch.setattr(
+        predict_service,
+        "_get_legacy_field_averaged_model",
+        lambda runtime, num_stars, *, device: calls.append(
+            ("legacy_field_averaged", num_stars, device)
+        ),
+    )
+
+    predict_service.warm_model_cache(runtime, device="gpu")
+
+    assert calls == [
+        ("model", 2, "gpu"),
+        ("legacy_field_averaged", 2, "gpu"),
+        ("model", 3, "gpu"),
+        ("legacy_field_averaged", 3, "gpu"),
+    ]
 
 
 def test_configure_inference_threads_sets_backend_thread_limits(
@@ -2292,24 +2399,24 @@ def test_build_traversal_products_retains_regularized_winners(
                 "best_sr",
                 "best_fwhm",
                 "winner_asterism_id",
-                "winner_ee_resolved",
-                "winner_ee_averaged",
-                "coverage_resolved",
-                "coverage_averaged",
+                "on_axis_winner_ee",
+                "field_averaged_winner_ee",
+                "on_axis_coverage",
+                "field_averaged_coverage",
             ),
         )
 
     monkeypatch.setattr("ao_sky.build.traversal.build_base_inner_table", fake_build_base_inner_table)
     monkeypatch.setattr(
-        "ao_sky.build.traversal.get_point_model",
+        "ao_sky.build.traversal.get_model",
         lambda runtime, num_stars, **kwargs: object(),
     )
     monkeypatch.setattr(
-        "ao_sky.build.traversal.get_mean_model",
+        "ao_sky.build.traversal._get_legacy_field_averaged_model",
         lambda runtime, num_stars, **kwargs: object(),
     )
 
-    def fake_predict_point_arrays(
+    def fake_predict_arrays(
         runtime,
         num_stars,
         model,
@@ -2322,7 +2429,7 @@ def test_build_traversal_products_retains_regularized_winners(
     ):
         seen["resolved_num_stars"] = num_stars
         seen["resolved_payload_count"] = len(ngs_zd)
-        return PointPredictionBatch(
+        return PredictionBatch(
             sr=np.full(len(ngs_zd), 0.5, dtype=np.float64),
             ee=np.full(len(ngs_zd), 0.7, dtype=np.float64),
             fwhm=np.full(len(ngs_zd), 100.0, dtype=np.float64),
@@ -2330,11 +2437,11 @@ def test_build_traversal_products_retains_regularized_winners(
         )
 
     monkeypatch.setattr(
-        "ao_sky.build.traversal.predict_point_arrays",
-        fake_predict_point_arrays,
+        "ao_sky.build.traversal.predict_arrays",
+        fake_predict_arrays,
     )
 
-    def fake_predict_field_mean_arrays(
+    def fake__predict_legacy_field_averaged_arrays(
         runtime,
         num_stars,
         model,
@@ -2350,8 +2457,8 @@ def test_build_traversal_products_retains_regularized_winners(
         return np.full(len(ngs_zd), 0.6, dtype=np.float64)
 
     monkeypatch.setattr(
-        "ao_sky.build.traversal.predict_field_mean_arrays",
-        fake_predict_field_mean_arrays,
+        "ao_sky.build.traversal._predict_legacy_field_averaged_arrays",
+        fake__predict_legacy_field_averaged_arrays,
     )
     monkeypatch.setattr("ao_sky.build.traversal.add_gaia_a0_to_inner", lambda inner, **kwargs: inner)
     cleared_backend_cache: list[None] = []
@@ -2366,7 +2473,7 @@ def test_build_traversal_products_retains_regularized_winners(
         runtime,
         0,
         execution_config=TraversalExecutionConfig(
-            resolved_cache_clear_every=cache_clear_every,
+            prediction_cache_clear_every=cache_clear_every,
         ),
         dust_root=tmp_path / "dust",
         max_data_level=2,
@@ -2390,11 +2497,11 @@ def test_build_traversal_products_retains_regularized_winners(
         ]
     ) == [101, 102]
     assert float(result_inner["best_ee"][0]) == pytest.approx(0.7)
-    assert float(result_inner["winner_ee_resolved"][0]) == pytest.approx(0.7)
-    assert float(result_inner["winner_ee_averaged"][0]) == pytest.approx(0.6)
+    assert float(result_inner["on_axis_winner_ee"][0]) == pytest.approx(0.7)
+    assert float(result_inner["field_averaged_winner_ee"][0]) == pytest.approx(0.6)
     assert int(result_inner["winner_asterism_id"][0]) == 1
-    assert bool(result_inner["coverage_resolved"][0])
-    assert bool(result_inner["coverage_averaged"][0])
+    assert bool(result_inner["on_axis_coverage"][0])
+    assert bool(result_inner["field_averaged_coverage"][0])
     assert np.all(np.asarray(result_inner["winner_asterism_id"][1:], dtype=np.int64) == -1)
     assert structure_stats.raw_asterism_rows_peak == 1
     assert structure_stats.winner_payload_rows_peak == 1

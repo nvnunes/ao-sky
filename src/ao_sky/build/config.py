@@ -11,7 +11,6 @@ from ..survey import SurveyError, normalize_survey_extent_overlays
 from ._exceptions import BuildError
 from ._models import BuildDefinition, BuildPaths, TraversalExecutionConfig
 
-
 DEFAULT_GAIA_CACHE_ENTRIES = 16
 DEFAULT_GAIA_CACHE_MB = 256
 AO_SKY_CONFIG_FILENAME = "ao-sky.yaml"
@@ -300,7 +299,7 @@ def resolve_traversal_execution_config(
 
     conf_data = _load_aosky_yaml(aosky_yaml=aosky_yaml, cwd=cwd)
     build_data = conf_data.get("build") if isinstance(conf_data.get("build"), dict) else {}
-    prediction_devices = _resolve_prediction_device_defaults(conf_data)
+    device = _resolve_prediction_device_default(conf_data)
     resolved_workers = _resolve_int_setting(
         workers,
         build_data.get("workers"),
@@ -385,37 +384,30 @@ def resolve_traversal_execution_config(
         ),
         parent_memory_limit_mb=resolved_parent_memory_limit_mb,
         telemetry=resolved_telemetry,
-        prediction_device=prediction_devices[0],
-        averaged_prediction_device=prediction_devices[1],
+        device=device,
     )
 
 
-def _resolve_prediction_device_defaults(
+def _resolve_prediction_device_default(
     conf_data: dict[str, object],
-) -> tuple[str, str]:
+) -> str:
     prediction_raw = conf_data.get("prediction")
     if not isinstance(prediction_raw, dict):
-        return "cpu", "cpu"
-
-    resolved_device = prediction_raw.get("resolved_device")
-    averaged_device = prediction_raw.get("averaged_device")
-    shared_device = prediction_raw.get("device", "cpu")
-    if shared_device is None:
-        shared_device = "cpu"
-    if resolved_device is None:
-        resolved_device = shared_device
-    if averaged_device is None:
-        averaged_device = shared_device
-
-    return (
-        _validate_prediction_device_default(
-            resolved_device,
-            field_name="prediction.resolved_device",
-        ),
-        _validate_prediction_device_default(
-            averaged_device,
-            field_name="prediction.averaged_device",
-        ),
+        return "cpu"
+    legacy_device_fields = sorted(
+        field
+        for field in ("resolved_device", "averaged_device")
+        if field in prediction_raw
+    )
+    if legacy_device_fields:
+        raise BuildError(
+            "Unsupported legacy prediction device fields: "
+            + ", ".join(legacy_device_fields)
+            + "; use prediction.device"
+        )
+    return _validate_prediction_device_default(
+        prediction_raw.get("device", "cpu"),
+        field_name="prediction.device",
     )
 
 
@@ -423,9 +415,9 @@ def _validate_prediction_device_default(
     value: object,
     *,
     field_name: str,
-) -> str | None:
+) -> str:
     if value is None:
-        return None
+        value = "cpu"
     normalized = str(value).strip().lower()
     if normalized not in {"cpu", "gpu"}:
         raise BuildError(f"{field_name} must be either 'cpu' or 'gpu'")

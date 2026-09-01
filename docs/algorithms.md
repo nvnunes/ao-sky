@@ -5,22 +5,22 @@ the legacy context it replaced. It is authoritative for algorithm intent and
 implementation decisions around candidate generation, dense-field handling,
 per-inner-pixel winner selection, and retained asterism catalog construction.
 
-This document uses `resolved` for performance predicted at the inner-pixel
-center, equivalent to the earlier "on-axis" language. It uses `averaged` for
-performance predicted as a mean over the science field of view, equivalent to
-the earlier "FOV-mean" language. Rotation or orientation of the guide-star
-configuration is not part of the algorithm.
+This document uses on-axis performance for the position-dependent-model result
+at the inner-pixel center and field-averaged performance for the mean over the
+science field of view. The field-averaged model named below is the explicitly
+legacy model family retained temporarily for behavior parity. Rotation or
+orientation of the guide-star configuration is not part of the algorithm.
 
 Use [`architecture.md`](architecture.md) for package boundaries and persisted
-artifact ownership, [`plan.md`](plan.md) for migration sequencing, and
-`docs/benchmarking.md` for measured runtime and memory evidence.
+artifact ownership, and `docs/benchmarking.md` for measured runtime and memory
+evidence.
 
 ## Legacy Compatible Algorithm
 
 The legacy-compatible Traversal path is the known-good behavior from before the
 winner-map asterism selection and NGS pre-selection replacement. It is retained
 here as design context for comparisons against saved legacy products, not as
-the active schema-version-2 algorithm.
+the active Traversal algorithm.
 
 For each outer pixel, legacy Traversal:
 
@@ -40,11 +40,12 @@ For each outer pixel, legacy Traversal:
    asterism-center counts.
 9. Builds a full materialized inner-pixel/asterism candidate-pair table from
    the expanded candidate set.
-10. Runs resolved-model prediction for candidate pairs and updates per-pixel
+10. Runs position-dependent-model prediction for candidate pairs and updates per-pixel
     `best_sr`, `best_ee`, and `best_fwhm`.
 11. Updates `winner_*` only from local asterisms, even though expanded
     non-local asterisms can influence `best_*`.
-12. Runs averaged prediction only for selected winners and computes coverage.
+12. Runs legacy field-averaged-model prediction only for selected winners and
+    computes coverage.
 
 The legacy path has known weaknesses that motivated replacement:
 
@@ -77,7 +78,7 @@ The replacement algorithm is:
 4. Build field-of-regard coverage for all configured NGS rows.
 5. Partition the outer pixel into working regions. Use all configured NGS in
    regions whose exact candidate graph keeps cumulative outer-pixel
-   resolved-inference work tractable, subdivide regions that are too dense, and
+   on-axis-inference work tractable, subdivide regions that are too dense, and
    apply NGS pre-selection only in regions that remain too dense at the minimum
    working scale.
 6. Deduplicate regional candidate identities by exact Gaia source-id set.
@@ -87,12 +88,13 @@ The replacement algorithm is:
    `ao_system.min_wfs..ao_system.max_wfs`.
 9. For each candidate, intersect member-star bitsets and the bright-star mask
    to determine eligible inner pixels.
-10. Stream eligible candidate-pixel rows into resolved predicted-EE inference
+10. Stream eligible candidate-pixel rows into on-axis predicted-EE inference
    batches.
 11. Maintain per-inner-pixel `best_*` and a bounded top-K shortlist.
 12. Filter each top-K shortlist by `winner_ee_epsilon`.
 13. Regularize the winner field using local inner-pixel neighbors.
-14. Run averaged prediction only for final regularized winners.
+14. Run legacy field-averaged-model prediction only for final regularized
+    winners.
 15. Persist unique regularized winning asterisms and write final inner
     winner/coverage fields.
 
@@ -143,7 +145,7 @@ max_bright_star_exclusion_arcsec is null or positive
 ```
 
 `asterism.max_overlap` is legacy-only. It is not used by the replacement
-algorithm and should not be accepted as an active version 2 runtime setting.
+algorithm and is not accepted by the schema-version-3 runtime contract.
 
 Internal defaults should remain non-public until benchmark evidence says they
 need to be exposed:
@@ -156,7 +158,7 @@ winner_regularization_passes = 3
 `max_regional_combination_work` is an internal dense-field tractability
 threshold for complete regional candidate enumeration. For the default
 `outer_level=6`, `inner_level=14` grid, it is `65,536`. It is not a final
-outer-pixel cap on candidate identities or resolved inference rows. Prediction
+outer-pixel cap on candidate identities or on-axis inference rows. Prediction
 batch sizing should use the model/traversal default rather than a new public
 setting.
 
@@ -198,9 +200,9 @@ above.
 
 `max_regional_combination_work` controls local complete-enumeration decisions
 only. Final outer-pixel candidate identities may exceed this value after
-regional graphs are merged and deduplicated, and final resolved inference rows
+regional graphs are merged and deduplicated, and final on-axis inference rows
 may exceed it because one candidate identity can be valid for many inner
-pixels. Final resolved inference rows are telemetry, not a normal-path pruning
+pixels. Final on-axis inference rows are telemetry, not a normal-path pruning
 target.
 
 Candidate identities from all regions are deduplicated by exact Gaia
@@ -231,9 +233,10 @@ When `min_wfs=1` and `max_wfs=3`, all enabled orders compete directly:
 3-star candidates
 ```
 
-Runtime model mappings must include every enabled star count for both resolved
-and averaged models. For example, `min_wfs=1` requires configured 1-star
-resolved and averaged models.
+Runtime model mappings must include every enabled star count for both the
+production position-dependent models and the transitional legacy
+field-averaged models. For example, `min_wfs=1` requires both configured
+1-star model families.
 
 Predicted EE is considered the same physical quantity across 1-, 2-, and
 3-star models, so no per-order normalization or preference is applied.
@@ -319,23 +322,24 @@ Traversal executes this rule in two paths:
    which is necessary for any shared pointing center to exist. The recovery
    path then projects each surviving no-winner pixel center onto the candidate's
    feasible pointing-center region, the intersection of 1-3 guide-star disks,
-   and runs one additional resolved-prediction pass for recovered
+   and runs one additional on-axis-prediction pass for recovered
    candidate-pixel rows.
 
 The optimized pointing center is internal top-K state. It is used for recovered
-resolved prediction and later averaged prediction, but it is not a persisted
+on-axis prediction and later legacy field-averaged-model prediction, but it is
+not a persisted
 inner-table field.
 
-### Resolved Best Fields
+### On-Axis Best Fields
 
-Resolved predicted EE drives selection. `best_*` is the continuous
+On-axis predicted EE drives selection. `best_*` is the continuous
 best-performance field and is tied to the candidate, or seeing baseline, with
-the highest resolved EE.
+the highest on-axis EE.
 
 For an AO candidate:
 
 ```text
-best_ee = resolved predicted EE of the EE-best candidate
+best_ee = on-axis predicted EE of the EE-best candidate
 best_sr = SR of that same candidate
 best_fwhm = FWHM of that same candidate
 ```
@@ -345,11 +349,11 @@ minimized.
 
 Seeing baseline is retained for continuous maps. If no AO candidate exists,
 persist the seeing baseline in `best_*`, leave `winner_asterism_id = -1`, and
-persist the seeing baseline in `winner_ee_resolved` and `winner_ee_averaged`.
+persist the seeing baseline in `on_axis_winner_ee` and `field_averaged_winner_ee`.
 
 If an AO candidate exists but performs below seeing in EE, `best_*` may remain
 the seeing baseline while `winner_asterism_id` still records the selected AO
-asterism. Persisted `winner_ee_resolved` and `winner_ee_averaged` are floored at
+asterism. Persisted `on_axis_winner_ee` and `field_averaged_winner_ee` are floored at
 the seeing baseline, so a recovered or regularized AO winner does not create a
 lower-than-seeing discontinuity in winner-EE maps.
 
@@ -404,24 +408,24 @@ Tie-breakers are:
 1. higher local predicted EE
 2. smaller stable candidate key
 
-After regularization, `winner_ee_resolved` is filled from the chosen label's
-resolved predicted EE for that pixel, floored at the existing seeing-baseline
+After regularization, `on_axis_winner_ee` is filled from the chosen label's
+on-axis predicted EE for that pixel, floored at the existing seeing-baseline
 fallback value.
 
-### Averaged Winners
+### Field-Averaged Winners
 
-Averaged prediction is not run for every candidate-pixel row. It is run only
-after regularization, for final winner-pixel pairs.
+Legacy field-averaged-model prediction is not run for every candidate-pixel
+row. It is run only after regularization, for final winner-pixel pairs.
 
 For final regularized winners:
 
 1. Group winner-pixel pairs by star count.
 2. Rebuild NGS payloads from retained candidate member coordinates and the
    selected internal pointing centers.
-3. Run the averaged model in batches.
-4. Fill `winner_ee_averaged`, floored at the existing seeing-baseline fallback
+3. Run the legacy field-averaged model in batches.
+4. Fill `field_averaged_winner_ee`, floored at the existing seeing-baseline fallback
    value.
-5. Compute averaged coverage.
+5. Compute field-averaged coverage.
 
 This avoids storing Python NGS payload objects during candidate streaming.
 
@@ -447,17 +451,17 @@ and mean winner fields for returned retained asterisms.
 
 The inner HEALPix grid is the source of truth for physical statistics. Each
 inner pixel represents one candidate pointing center and stores the best
-resolved performance field plus the regularized winning asterism and its
-resolved and averaged EE values.
+on-axis performance field plus the regularized winning asterism and its
+on-axis and field-averaged EE values.
 
-The first-class coverage metric for physical validation should be averaged EE
+The first-class coverage metric for physical validation should be field-averaged EE
 from the final regularized winner:
 
 ```text
-M(x) = winner_ee_averaged(x)
+M(x) = field_averaged_winner_ee(x)
 ```
 
-Resolved EE remains useful as a diagnostic, but averaged EE is the natural
+On-axis EE remains useful as a diagnostic, but field-averaged EE is the natural
 field-usable quantity because it measures mean performance over the science
 field of view for the selected pointing.
 
@@ -471,13 +475,13 @@ lower-is-better:  C(tau) = count(M(x) <= tau) / count(x)
 
 Because inner HEALPix pixels are equal-area, this is a simple fraction within
 one outer pixel or any footprint selected directly from inner-pixel centers.
-Configured inner fields such as `coverage_resolved` and `coverage_averaged`
+Configured inner fields such as `on_axis_coverage` and `field_averaged_coverage`
 are threshold booleans; aggregating them over a footprint gives the
 corresponding area coverage fraction for the configured thresholds.
 
 These booleans are computed from the final regularized winner fields:
-`coverage_resolved` from `winner_ee_resolved`, and `coverage_averaged` from
-`winner_ee_averaged`. They are not computed from raw `best_ee`.
+`on_axis_coverage` from `on_axis_winner_ee`, and `field_averaged_coverage` from
+`field_averaged_winner_ee`. They are not computed from raw `best_ee`.
 
 Coverage curves are cumulative coverage evaluated across a range of thresholds.
 They should be a validation and reporting product, not a requirement for the
@@ -490,7 +494,7 @@ curves should be area-weighted over the selected equal-area inner pixels or
 outer-pixel aggregates.
 
 Uniformity measures spatial stability across a footprint. For a metric such
-as averaged EE where higher values are better:
+as field-averaged EE where higher values are better:
 
 ```text
 IQR = Q75(M) - Q25(M)
@@ -543,10 +547,10 @@ best_ee
 best_sr
 best_fwhm
 winner_asterism_id
-winner_ee_resolved
-winner_ee_averaged
-coverage_resolved
-coverage_averaged
+on_axis_winner_ee
+field_averaged_winner_ee
+on_axis_coverage
+field_averaged_coverage
 gaia_A0
 ```
 
@@ -558,9 +562,12 @@ the map pixel at every retained map level. It is not the number of distinct
 count of each owning `outer.h5` artifact because retained asterism centers can
 fall outside the outer pixel whose inner pixels used them.
 
-The legacy-preserving Traversal artifact layout/schema is version 1. The
-replacement Traversal artifact layout/schema should be version 2 so old and new
-`outer.h5` products are not silently confused.
+New Traversal builds and artifacts use layout version 3. Standalone outer and
+map artifacts declare this version in their root `layout_version` attribute.
+Completed layout-version-2 artifacts have no per-file version attribute, so
+the centralized compatibility reader recognizes their complete legacy field
+contract and returns canonical in-memory names. Layout-version-2 files remain
+read-only.
 
 ## Dense Fields
 
@@ -596,7 +603,7 @@ Useful basic telemetry includes:
 - raw and regularized unique winners by star order
 - winner pixels changed by regularization
 - mean, p95, and max EE loss from regularization
-- averaged winner rows by star order
+- field-averaged winner rows by star order
 
 Detailed telemetry may add per-pixel or per-candidate diagnostics when needed
 for algorithm debugging and benchmark work.
@@ -619,13 +626,14 @@ Core repo-native tests should cover:
 - close-pair graph and graph-triangle candidate generation
 - field-of-regard bitset construction and set-bit extraction
 - bright-star masking before prediction
-- required resolved and averaged model mappings for every enabled star count
+- required production and legacy field-averaged model mappings for every
+  enabled star count
 - top-K insertion, eviction, and epsilon filtering
 - local neighbor-oriented regularization
 - `best_*` tied to predicted-EE selection
 - coverage booleans derived from final regularized winner fields
 - seeing baseline fallback with no AO winner
-- averaged prediction only for final regularized winners
+- legacy field-averaged-model prediction only for final regularized winners
 - retained catalog rows derived from final winners
 - removal of `asterism_count` and `winner_distance_arcsec`
 

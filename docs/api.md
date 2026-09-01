@@ -150,24 +150,26 @@ The current package-supported prediction API exposes:
 
 - `AOSystemRuntime`
 - `PredictRuntime`
-- `PointPredictionBatch`
+- `PredictionBatch`
+- `PredictionArrayTelemetry`
 - `SeeingBaselinePerformance`
 - `PredictError`
 - `configure_inference_threads`
 - `warm_model_cache`
 - `clear_backend_cache`
-- `get_point_model`
-- `get_mean_model`
-- `predict_point_arrays`
-- `predict_field_mean_arrays`
+- `get_model`
+- `predict_arrays`
 - `get_seeing_baseline_performance`
 
 These helpers are primarily the build Traversal prediction boundary. Direct
 callers should pass homogeneous, magnitude-ordered NGS arrays whose second
-dimension matches the requested star count and should obtain models through
-`get_point_model` or `get_mean_model`. Model loading defaults to CPU unless the
-caller passes `device="gpu"` explicitly. The current implementation still uses
-the temporary `girmos-aosims` backend adapter behind this native API.
+dimension matches the requested star count and should obtain the production
+position-dependent models through `get_model`. Model loading defaults to CPU
+unless the caller passes `device="gpu"` explicitly. The current implementation
+still uses the temporary `girmos-aosims` backend adapter. `PredictRuntime`
+retains the transitional `legacy_field_averaged_models` assignment, and
+`warm_model_cache` warms that family for Traversal. Direct model loading and
+prediction helpers for that family remain private.
 
 ### `ao_sky.build`
 
@@ -187,6 +189,7 @@ The current package-supported build API exposes:
 - `resolve_build_roots`
 - `restart_build`
 - `run_build`
+- `run_build_outer_pixels`
 - `show_build`
 
 ### `ao_sky.artifacts`
@@ -200,6 +203,9 @@ The current package-supported artifact-reader API exposes:
 loads build-local runtime configuration, dense map fields, per-outer `inner`
 and `asterisms` datasets, and pinned Gaia tables. It does not run build steps,
 materialize missing artifacts, or provide paper-specific compatibility columns.
+It reads layout-version-3 builds directly and normalizes completed
+layout-version-2 runtime and result fields to the canonical names documented
+here. It never rewrites a legacy source file.
 
 ### `ao_sky.plotting`
 
@@ -246,16 +252,18 @@ max_asterisms=None)` reads one current `ao-sky` build root and delegates to
 read from the canonical Gaia cache. Use `hide_stars=True` for asterism-only
 plots that do not need Gaia data.
 
-`plot_winner_ee(inner_pixels, *, center, width, ee_kind="resolved", ax=None,
+`plot_winner_ee(inner_pixels, *, center, width,
+ee_kind="on_axis_winner_ee", ax=None,
 cmap="plasma", vmin=0.0, vmax=0.6, grid_resolution=300,
 add_colorbar=True)` draws a smoothed local winner-EE field from normalized
 inner pixels. The input table must include `ra`, `dec`, and the requested
-winner-EE field. `ee_kind` accepts `resolved`, `averaged`,
-`winner_ee_resolved`, or `winner_ee_averaged`. The plotted field is interpolated
-onto a regular grid with cubic `scipy.interpolate.griddata`.
+winner-EE field. `ee_kind` accepts only `on_axis_winner_ee` or
+`field_averaged_winner_ee`. The plotted field is interpolated onto a regular
+grid with cubic `scipy.interpolate.griddata`.
 
-`plot_build_winner_ee(build_path, *, center, width, ee_kind="resolved",
-ax=None, cmap="plasma", vmin=0.0, vmax=0.6, grid_resolution=300,
+`plot_build_winner_ee(build_path, *, center, width,
+ee_kind="on_axis_winner_ee", ax=None, cmap="plasma", vmin=0.0, vmax=0.6,
+grid_resolution=300,
 add_colorbar=True)` reads one current `ao-sky` build root and delegates to
 `plot_winner_ee`.
 
@@ -369,8 +377,8 @@ Behavior:
 - add lookup provenance and support fields:
   `global_asterism_id`, `representative_outer_pix`,
   `representative_asterism_id`, `inner_pixel_count`,
-  `winner_ee_resolved`, `winner_ee_averaged`, and `gaia_A0`
-- report `winner_ee_resolved`, `winner_ee_averaged`, and `gaia_A0` as means
+  `on_axis_winner_ee`, `field_averaged_winner_ee`, and `gaia_A0`
+- report `on_axis_winner_ee`, `field_averaged_winner_ee`, and `gaia_A0` as means
   over inner pixels where the returned asterism is the retained winner
 - when `filters` is provided, apply star-count bounds, real member-star
   magnitude bounds, `inner_pixel_count` bounds, and bounds on the lookup mean
@@ -394,9 +402,9 @@ Behavior:
 - accept the same outer-pixel, MOC, and filter semantics as `find_asterisms`
 - deduplicate exported asterisms by sorted real member `source_id` set
 - assign export-local `asterism_id` values in first-seen build stream order
-- aggregate `inner_pixel_count`, `winner_ee_resolved`,
-  `winner_ee_averaged`, and `gaia_A0` over all selected support pixels for the
-  same physical asterism, including support from different outer pixels
+- aggregate `inner_pixel_count`, `on_axis_winner_ee`,
+  `field_averaged_winner_ee`, and `gaia_A0` over all selected support pixels for
+  the same physical asterism, including support from different outer pixels
 - split final output into `chunk_count` contiguous `asterism_id` ranges without
   writing empty chunks
 - export catalog-facing fields only, excluding lookup-internal identifiers and
@@ -467,8 +475,8 @@ Behavior:
 - persist the resolved roots into `build.h5`
 - copy the supplied native runtime policy into build-local `build.yaml`; later
   build execution reads that build-local config
-- copy required `.pt` and `_metadata.pkl` files for configured resolved and
-  averaged models into `<build>/models`
+- copy required `.pt` and `_metadata.pkl` files for configured production
+  models and transitional legacy field-averaged models into `<build>/models`
 - write `<build>/models/manifest.json` and update persisted `model_root` to the
   build-local snapshot
 - when `survey_overlays` are configured, resolve each `moc_files` entry as a
@@ -505,6 +513,12 @@ only; they are not persisted in the build definition, build metadata, or
 canonical Gaia files. Native build Traversal expects these runtime rows for
 inner counts, asterism search, and prediction.
 
+The shared prediction device is configured as `prediction.device` in the
+discovered or explicitly supplied `ao-sky.yaml`. It accepts `cpu` or `gpu`,
+defaults to `cpu`, and applies to both the production position-dependent models
+and the transitional field-averaged models. Like the other execution defaults,
+it is not persisted in the build-local runtime configuration.
+
 `parent_memory_limit_mb` is the Python/CLI override for the aggregate total-RAM
 safety guard configured in YAML as `build.memory_limit_mb`. A value of `0` or
 `None` disables it. When enabled, the parent process periodically checks its
@@ -525,7 +539,7 @@ Artifact writes are direct and worker-owned. SSD artifact staging was benchmarke
 and rejected as an active runtime option after Blosc Zstd made write latency
 negligible relative to Traversal compute.
 
-### `run_build_outer_pixels(build_path, outer_pixels, *, force=False) -> Path`
+### `run_build_outer_pixels(build_path, outer_pixels, *, force=False, aosky_yaml=None) -> Path`
 
 Run Traversal for an explicit set of outer pixels without advancing the build to
 aggregation. This helper is for validation and targeted rebuild workflows that
@@ -536,6 +550,8 @@ Behavior:
 - require the build to be initialized and still in the `traversal` stage
 - use the persisted build config, build-local model snapshot, Gaia root, and
   dust root
+- resolve runtime-only defaults, including `prediction.device`, through the
+  same `ao-sky.yaml` discovery used by `run_build`
 - run the selected outer pixels in-process
 - update `build.h5` traversal status and attempt counts for those selected
   pixels
@@ -557,12 +573,17 @@ Behavior:
 
 - read persisted build metadata from `build.h5`
 - report current status, stage, stage work counts, lineage, Gaia release,
-  HEALPix levels, runtime config paths, and persisted roots
+  layout version, HEALPix levels, runtime config paths, and persisted roots
 - report model and survey manifest paths and presence
 - report expected map artifact paths and presence for configured map levels
 - return `problems` for missing expected top-level artifacts
 - perform no repair, migration, artifact generation, or per-outer-pixel artifact
   scan
+
+Completed layout-version-2 builds remain inspectable and readable. Any command
+that would resume computation or modify build metadata, state, runtime
+configuration, outer artifacts, maps, snapshots, or augmentation data rejects
+them before writing. New and continued computation requires layout version 3.
 
 ### `show_build(build_path) -> str`
 

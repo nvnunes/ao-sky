@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
 import shutil
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 
@@ -17,6 +17,7 @@ from ._constants import (
     WORK_STATUS_PENDING,
 )
 from ._exceptions import BuildError
+from ._schema_compat import require_current_build_layout
 from .config import resolve_survey_root_only
 from .control import (
     load_state,
@@ -38,6 +39,7 @@ def fetch_survey_data(
     """Snapshot configured survey MOC files into one build-local surveys directory."""
 
     resolved_build_path = Path(build_path).expanduser().resolve()
+    require_current_build_layout(resolved_build_path, operation="refresh surveys for")
     _require_traversal_not_started(resolved_build_path)
 
     source_root = resolve_survey_root_only(

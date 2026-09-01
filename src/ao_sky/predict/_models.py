@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import astropy.units as u
+import numpy as np
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,25 +36,34 @@ class PredictRuntime:
     winner_ee_epsilon: float
     winner_top_k: int
     prediction_wavelength: u.Quantity
-    resolved_models: dict[str, str]
-    averaged_models: dict[str, str]
+    models: dict[str, str]
+    legacy_field_averaged_models: dict[str, str]
     seeing_reference_wavelength: u.Quantity
     seeing_reference_sr: float
     seeing_reference_ee: float
     seeing_reference_fwhm: float
-    coverage_ee_threshold_resolved: float
-    coverage_ee_threshold_averaged: float
+    on_axis_ee_threshold: float
+    field_averaged_ee_threshold: float
     model_root: Path
 
 
 @dataclass(frozen=True, slots=True)
-class PointPredictionBatch:
-    """Resolved point-performance predictions for one batch of pairs."""
+class PredictionBatch:
+    """Position-dependent outputs for one homogeneous prediction batch.
 
-    sr: object
-    ee: object
-    fwhm: object
-    ee_angle: object
+    Each array has shape `(rows,)` and preserves the input row order.
+
+    Attributes:
+        sr: Dimensionless Strehl-ratio predictions.
+        ee: Dimensionless ensquared-energy predictions.
+        fwhm: FWHM predictions in milliarcseconds.
+        ee_angle: Reserved EE-orientation output, currently filled with zeros.
+    """
+
+    sr: np.ndarray
+    ee: np.ndarray
+    fwhm: np.ndarray
+    ee_angle: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)

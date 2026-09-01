@@ -25,6 +25,7 @@ from .build.runtime_config import load_runtime_config
 from .gaia._constants import HDF5_DATASET_NAME
 from .gaia.transform import apply_proper_motion, compute_r_magnitude
 from .plotting.healpix import get_pixel_skycoord
+from .predict import PredictRuntime
 
 
 @dataclass(frozen=True)
@@ -56,13 +57,22 @@ class AoSkyArtifactStore:
         self.gaia_root = Path(gaia_root) if gaia_root is not None else self.root
         self.model_root = Path(model_root) if model_root is not None else self.root / "models"
 
-    def runtime(self, filename: Path | str | None = None):
-        """Load the build-local runtime config."""
+    def runtime(self, filename: Path | str | None = None) -> PredictRuntime:
+        """Load normalized prediction policy from the build-local config.
+
+        ``filename`` defaults to ``<root>/build.yaml``. A relative filename is
+        resolved beneath ``root``. Supported schema-version-2 fields are
+        normalized to the current in-memory names without rewriting the file.
+        """
 
         runtime_file = self.root / RUNTIME_CONFIG_FILENAME if filename is None else Path(filename)
         if not runtime_file.is_absolute():
             runtime_file = self.root / runtime_file
-        return load_runtime_config(runtime_file, model_root=self.model_root)
+        return load_runtime_config(
+            runtime_file,
+            model_root=self.model_root,
+            allow_legacy=True,
+        )
 
     def maps_filename(self, level: int) -> Path:
         """Return the dense map artifact path for a HEALPix level."""
@@ -70,7 +80,11 @@ class AoSkyArtifactStore:
         return self.root / MAPS_FILENAME_TEMPLATE.format(level=int(level))
 
     def maps_table(self, level: int, *, dataset_name: str = MAPS_DATASET) -> Table:
-        """Read a dense map artifact dataset."""
+        """Read and normalize one dataset from a dense map artifact.
+
+        Layout-version-2 result fields are returned under their current names.
+        The source artifact is never modified.
+        """
 
         return read_maps_dataset(self.maps_filename(level), dataset_name)
 
@@ -111,14 +125,14 @@ class AoSkyArtifactStore:
         )
 
     def outer_products(self, outer_pix: int, *, outer_level: int, inner_level: int) -> tuple[Table, Table]:
-        """Read both inner and retained-asterism tables for one outer pixel."""
+        """Read normalized inner and retained-asterism tables for one outer pixel."""
 
         return read_outer_products(
             self.outer_path(outer_pix, outer_level=outer_level, inner_level=inner_level)
         )
 
     def inner(self, outer_pix: int, *, outer_level: int, inner_level: int) -> Table:
-        """Read the inner table for one outer pixel."""
+        """Read the normalized inner table for one outer pixel."""
 
         return read_outer_dataset(
             self.outer_path(outer_pix, outer_level=outer_level, inner_level=inner_level),

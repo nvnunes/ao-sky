@@ -2,28 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
 import csv
-from dataclasses import dataclass, field
 import gc
 import multiprocessing
-from pathlib import Path
-from queue import Empty
 import resource
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from queue import Empty
 
 import numpy as np
 from astropy.table import Table
 
 from ..dust import prepare_gaia_tge_a0_cache
 from ..gaia import GaiaHealpixStore, GaiaStoreConfig, GaiaSummaryStore
-from ..predict import PredictRuntime, backend as predict_backend
-from ..predict import configure_inference_threads, warm_model_cache
+from ..predict import PredictRuntime, configure_inference_threads, warm_model_cache
+from ..predict import backend as predict_backend
 from ..spatial import get_parent_pixel
-from .augmentation import build_survey_extent_layers
-from .aggregation import build_maps
 from ._constants import (
     BUILD_PHASE_AGGREGATION,
     BUILD_PHASE_AUGMENTATION,
@@ -38,39 +36,6 @@ from ._constants import (
     WORK_STATUS_RUNNING,
 )
 from ._exceptions import BuildError
-from .artifacts import (
-    ArtifactMemoryProfile,
-    ArtifactWriteProfile,
-    write_outer_artifact_profiled,
-)
-from .config import (
-    load_build_definition,
-    resolve_build_root_only,
-    resolve_build_roots,
-    resolve_traversal_execution_config,
-)
-from .control import (
-    append_build_log,
-    build_artifact_root,
-    create_build_root,
-    latest_build_path,
-    load_build_definition as load_persisted_build_definition,
-    load_build_roots,
-    load_current_phase,
-    inspect_build,
-    load_runtime_config_path,
-    load_state,
-    outer_artifact_filename,
-    phase_state_fields,
-    set_current_phase,
-    set_dust_root,
-    set_build_status,
-    update_state_row,
-    write_state_rows,
-)
-from .runtime_config import load_runtime_config, write_runtime_config
-from .model_snapshot import fetch_model_data
-from .survey_snapshot import fetch_survey_data
 from ._models import (
     BuildDefinition,
     TraversalCacheStats,
@@ -81,17 +46,55 @@ from ._models import (
     TraversalTaskContext,
     TraversalTaskResult,
     TraversalWorkBatch,
-    TraversalWorkerMessage,
     TraversalWorkerMemorySample,
+    TraversalWorkerMessage,
     TraversalWorkerPlan,
     TraversalWorkerStats,
 )
+from ._schema_compat import require_current_build_layout
+from .aggregation import build_maps
+from .artifacts import (
+    ArtifactMemoryProfile,
+    ArtifactWriteProfile,
+    write_outer_artifact_profiled,
+)
+from .augmentation import build_survey_extent_layers
+from .config import (
+    load_build_definition,
+    resolve_build_root_only,
+    resolve_build_roots,
+    resolve_traversal_execution_config,
+)
+from .control import (
+    append_build_log,
+    build_artifact_root,
+    create_build_root,
+    inspect_build,
+    latest_build_path,
+    load_build_roots,
+    load_current_phase,
+    load_runtime_config_path,
+    load_state,
+    outer_artifact_filename,
+    phase_state_fields,
+    set_build_status,
+    set_current_phase,
+    set_dust_root,
+    update_state_row,
+    write_state_rows,
+)
+from .control import (
+    load_build_definition as load_persisted_build_definition,
+)
+from .model_snapshot import fetch_model_data
 from .regional import (
     build_dynamic_work_batches,
     build_regional_worker_plans,
     dynamic_model_name,
 )
+from .runtime_config import load_runtime_config, write_runtime_config
 from .runtime_gaia import RuntimeGaiaHealpixStore
+from .survey_snapshot import fetch_survey_data
 from .traversal import (
     TraversalGeometry,
     TraversalMemoryProfile,
@@ -146,6 +149,7 @@ def init_build(
     runtime = load_runtime_config(
         config_filename,
         model_root=roots.model_root,
+        allow_legacy=False,
     )
     _validate_runtime_matches_build_definition(definition, runtime)
     build_path = create_build_root(
@@ -324,24 +328,24 @@ class _TraversalStageTelemetry:
     local_selection_seconds: float = 0.0
     inner_table_seconds: float = 0.0
     context_seconds: float = 0.0
-    point_prediction_seconds: float = 0.0
-    point_prediction_eligibility_seconds: float = 0.0
-    point_prediction_eligibility_intersection_seconds: float = 0.0
-    point_prediction_eligibility_extract_seconds: float = 0.0
-    point_prediction_buffer_seconds: float = 0.0
-    point_prediction_ngs_array_seconds: float = 0.0
-    point_prediction_model_seconds: float = 0.0
-    point_prediction_feature_seconds: float = 0.0
-    point_prediction_backend_seconds: float = 0.0
-    point_prediction_scatter_seconds: float = 0.0
-    point_prediction_scatter_filter_seconds: float = 0.0
-    point_prediction_scatter_merge_seconds: float = 0.0
-    point_prediction_scatter_sort_seconds: float = 0.0
-    point_prediction_scatter_write_seconds: float = 0.0
-    point_prediction_cache_clear_seconds: float = 0.0
-    field_mean_prediction_seconds: float = 0.0
-    field_mean_prediction_feature_seconds: float = 0.0
-    field_mean_prediction_backend_seconds: float = 0.0
+    on_axis_prediction_seconds: float = 0.0
+    on_axis_prediction_eligibility_seconds: float = 0.0
+    on_axis_prediction_eligibility_intersection_seconds: float = 0.0
+    on_axis_prediction_eligibility_extract_seconds: float = 0.0
+    on_axis_prediction_buffer_seconds: float = 0.0
+    on_axis_prediction_ngs_array_seconds: float = 0.0
+    on_axis_prediction_model_seconds: float = 0.0
+    on_axis_prediction_feature_seconds: float = 0.0
+    on_axis_prediction_backend_seconds: float = 0.0
+    on_axis_prediction_scatter_seconds: float = 0.0
+    on_axis_prediction_scatter_filter_seconds: float = 0.0
+    on_axis_prediction_scatter_merge_seconds: float = 0.0
+    on_axis_prediction_scatter_sort_seconds: float = 0.0
+    on_axis_prediction_scatter_write_seconds: float = 0.0
+    on_axis_prediction_cache_clear_seconds: float = 0.0
+    field_averaged_prediction_seconds: float = 0.0
+    field_averaged_prediction_feature_seconds: float = 0.0
+    field_averaged_prediction_backend_seconds: float = 0.0
     coverage_seconds: float = 0.0
     dust_seconds: float = 0.0
     persisted_asterisms_seconds: float = 0.0
@@ -355,45 +359,45 @@ class _TraversalStageTelemetry:
         self.local_selection_seconds += stats.local_selection_seconds
         self.inner_table_seconds += stats.inner_table_seconds
         self.context_seconds += stats.context_seconds
-        self.point_prediction_seconds += stats.point_prediction_seconds
-        self.point_prediction_eligibility_seconds += (
-            stats.point_prediction_eligibility_seconds
+        self.on_axis_prediction_seconds += stats.on_axis_prediction_seconds
+        self.on_axis_prediction_eligibility_seconds += (
+            stats.on_axis_prediction_eligibility_seconds
         )
-        self.point_prediction_eligibility_intersection_seconds += (
-            stats.point_prediction_eligibility_intersection_seconds
+        self.on_axis_prediction_eligibility_intersection_seconds += (
+            stats.on_axis_prediction_eligibility_intersection_seconds
         )
-        self.point_prediction_eligibility_extract_seconds += (
-            stats.point_prediction_eligibility_extract_seconds
+        self.on_axis_prediction_eligibility_extract_seconds += (
+            stats.on_axis_prediction_eligibility_extract_seconds
         )
-        self.point_prediction_buffer_seconds += stats.point_prediction_buffer_seconds
-        self.point_prediction_ngs_array_seconds += (
-            stats.point_prediction_ngs_array_seconds
+        self.on_axis_prediction_buffer_seconds += stats.on_axis_prediction_buffer_seconds
+        self.on_axis_prediction_ngs_array_seconds += (
+            stats.on_axis_prediction_ngs_array_seconds
         )
-        self.point_prediction_model_seconds += stats.point_prediction_model_seconds
-        self.point_prediction_feature_seconds += stats.point_prediction_feature_seconds
-        self.point_prediction_backend_seconds += stats.point_prediction_backend_seconds
-        self.point_prediction_scatter_seconds += stats.point_prediction_scatter_seconds
-        self.point_prediction_scatter_filter_seconds += (
-            stats.point_prediction_scatter_filter_seconds
+        self.on_axis_prediction_model_seconds += stats.on_axis_prediction_model_seconds
+        self.on_axis_prediction_feature_seconds += stats.on_axis_prediction_feature_seconds
+        self.on_axis_prediction_backend_seconds += stats.on_axis_prediction_backend_seconds
+        self.on_axis_prediction_scatter_seconds += stats.on_axis_prediction_scatter_seconds
+        self.on_axis_prediction_scatter_filter_seconds += (
+            stats.on_axis_prediction_scatter_filter_seconds
         )
-        self.point_prediction_scatter_merge_seconds += (
-            stats.point_prediction_scatter_merge_seconds
+        self.on_axis_prediction_scatter_merge_seconds += (
+            stats.on_axis_prediction_scatter_merge_seconds
         )
-        self.point_prediction_scatter_sort_seconds += (
-            stats.point_prediction_scatter_sort_seconds
+        self.on_axis_prediction_scatter_sort_seconds += (
+            stats.on_axis_prediction_scatter_sort_seconds
         )
-        self.point_prediction_scatter_write_seconds += (
-            stats.point_prediction_scatter_write_seconds
+        self.on_axis_prediction_scatter_write_seconds += (
+            stats.on_axis_prediction_scatter_write_seconds
         )
-        self.point_prediction_cache_clear_seconds += (
-            stats.point_prediction_cache_clear_seconds
+        self.on_axis_prediction_cache_clear_seconds += (
+            stats.on_axis_prediction_cache_clear_seconds
         )
-        self.field_mean_prediction_seconds += stats.field_mean_prediction_seconds
-        self.field_mean_prediction_feature_seconds += (
-            stats.field_mean_prediction_feature_seconds
+        self.field_averaged_prediction_seconds += stats.field_averaged_prediction_seconds
+        self.field_averaged_prediction_feature_seconds += (
+            stats.field_averaged_prediction_feature_seconds
         )
-        self.field_mean_prediction_backend_seconds += (
-            stats.field_mean_prediction_backend_seconds
+        self.field_averaged_prediction_backend_seconds += (
+            stats.field_averaged_prediction_backend_seconds
         )
         self.coverage_seconds += stats.coverage_seconds
         self.dust_seconds += stats.dust_seconds
@@ -409,43 +413,43 @@ class _TraversalStageTelemetry:
             local_selection_seconds=self.local_selection_seconds,
             inner_table_seconds=self.inner_table_seconds,
             context_seconds=self.context_seconds,
-            point_prediction_seconds=self.point_prediction_seconds,
-            point_prediction_eligibility_seconds=(
-                self.point_prediction_eligibility_seconds
+            on_axis_prediction_seconds=self.on_axis_prediction_seconds,
+            on_axis_prediction_eligibility_seconds=(
+                self.on_axis_prediction_eligibility_seconds
             ),
-            point_prediction_eligibility_intersection_seconds=(
-                self.point_prediction_eligibility_intersection_seconds
+            on_axis_prediction_eligibility_intersection_seconds=(
+                self.on_axis_prediction_eligibility_intersection_seconds
             ),
-            point_prediction_eligibility_extract_seconds=(
-                self.point_prediction_eligibility_extract_seconds
+            on_axis_prediction_eligibility_extract_seconds=(
+                self.on_axis_prediction_eligibility_extract_seconds
             ),
-            point_prediction_buffer_seconds=self.point_prediction_buffer_seconds,
-            point_prediction_ngs_array_seconds=self.point_prediction_ngs_array_seconds,
-            point_prediction_model_seconds=self.point_prediction_model_seconds,
-            point_prediction_feature_seconds=self.point_prediction_feature_seconds,
-            point_prediction_backend_seconds=self.point_prediction_backend_seconds,
-            point_prediction_scatter_seconds=self.point_prediction_scatter_seconds,
-            point_prediction_scatter_filter_seconds=(
-                self.point_prediction_scatter_filter_seconds
+            on_axis_prediction_buffer_seconds=self.on_axis_prediction_buffer_seconds,
+            on_axis_prediction_ngs_array_seconds=self.on_axis_prediction_ngs_array_seconds,
+            on_axis_prediction_model_seconds=self.on_axis_prediction_model_seconds,
+            on_axis_prediction_feature_seconds=self.on_axis_prediction_feature_seconds,
+            on_axis_prediction_backend_seconds=self.on_axis_prediction_backend_seconds,
+            on_axis_prediction_scatter_seconds=self.on_axis_prediction_scatter_seconds,
+            on_axis_prediction_scatter_filter_seconds=(
+                self.on_axis_prediction_scatter_filter_seconds
             ),
-            point_prediction_scatter_merge_seconds=(
-                self.point_prediction_scatter_merge_seconds
+            on_axis_prediction_scatter_merge_seconds=(
+                self.on_axis_prediction_scatter_merge_seconds
             ),
-            point_prediction_scatter_sort_seconds=(
-                self.point_prediction_scatter_sort_seconds
+            on_axis_prediction_scatter_sort_seconds=(
+                self.on_axis_prediction_scatter_sort_seconds
             ),
-            point_prediction_scatter_write_seconds=(
-                self.point_prediction_scatter_write_seconds
+            on_axis_prediction_scatter_write_seconds=(
+                self.on_axis_prediction_scatter_write_seconds
             ),
-            point_prediction_cache_clear_seconds=(
-                self.point_prediction_cache_clear_seconds
+            on_axis_prediction_cache_clear_seconds=(
+                self.on_axis_prediction_cache_clear_seconds
             ),
-            field_mean_prediction_seconds=self.field_mean_prediction_seconds,
-            field_mean_prediction_feature_seconds=(
-                self.field_mean_prediction_feature_seconds
+            field_averaged_prediction_seconds=self.field_averaged_prediction_seconds,
+            field_averaged_prediction_feature_seconds=(
+                self.field_averaged_prediction_feature_seconds
             ),
-            field_mean_prediction_backend_seconds=(
-                self.field_mean_prediction_backend_seconds
+            field_averaged_prediction_backend_seconds=(
+                self.field_averaged_prediction_backend_seconds
             ),
             coverage_seconds=self.coverage_seconds,
             dust_seconds=self.dust_seconds,
@@ -478,30 +482,30 @@ class _TraversalStructureTelemetry:
     context_pair_rows: int = 0
     winner_rows: int = 0
     winner_payload_rows: int = 0
-    point_prediction_batches: int = 0
-    point_prediction_rows: int = 0
-    recovered_point_prediction_rows: int = 0
+    on_axis_prediction_batches: int = 0
+    on_axis_prediction_rows: int = 0
+    recovered_on_axis_prediction_rows: int = 0
     recovered_winner_pixels: int = 0
-    point_prediction_batch_rows_peak: int = 0
-    point_prediction_backend_rows: int = 0
-    point_prediction_backend_batch_rows_peak: int = 0
-    point_feature_bytes_peak: int = 0
-    point_mps_current_bytes_peak: int = 0
-    point_mps_driver_bytes_peak: int = 0
-    point_mps_recommended_bytes: int = 0
-    point_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
-    point_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
-    field_mean_prediction_batches: int = 0
-    field_mean_prediction_rows: int = 0
-    field_mean_prediction_batch_rows_peak: int = 0
-    field_mean_prediction_backend_rows: int = 0
-    field_mean_prediction_backend_batch_rows_peak: int = 0
-    field_mean_feature_bytes_peak: int = 0
-    field_mean_mps_current_bytes_peak: int = 0
-    field_mean_mps_driver_bytes_peak: int = 0
-    field_mean_mps_recommended_bytes: int = 0
-    field_mean_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
-    field_mean_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
+    on_axis_prediction_batch_rows_peak: int = 0
+    on_axis_prediction_backend_rows: int = 0
+    on_axis_prediction_backend_batch_rows_peak: int = 0
+    on_axis_feature_bytes_peak: int = 0
+    on_axis_mps_current_bytes_peak: int = 0
+    on_axis_mps_driver_bytes_peak: int = 0
+    on_axis_mps_recommended_bytes: int = 0
+    on_axis_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
+    on_axis_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
+    field_averaged_prediction_batches: int = 0
+    field_averaged_prediction_rows: int = 0
+    field_averaged_prediction_batch_rows_peak: int = 0
+    field_averaged_prediction_backend_rows: int = 0
+    field_averaged_prediction_backend_batch_rows_peak: int = 0
+    field_averaged_feature_bytes_peak: int = 0
+    field_averaged_mps_current_bytes_peak: int = 0
+    field_averaged_mps_driver_bytes_peak: int = 0
+    field_averaged_mps_recommended_bytes: int = 0
+    field_averaged_backend_bucket_counts: dict[int, int] = field(default_factory=dict)
+    field_averaged_backend_bucket_rows: dict[int, int] = field(default_factory=dict)
     search_star_rows_peak: int = 0
     ngs_rows_peak: int = 0
     close_pair_rows_peak: int = 0
@@ -523,81 +527,81 @@ class _TraversalStructureTelemetry:
         self.context_pair_rows += int(stats.context_pair_rows)
         self.winner_rows += int(stats.winner_rows)
         self.winner_payload_rows += int(stats.winner_payload_rows)
-        self.point_prediction_batches += int(stats.point_prediction_batches)
-        self.point_prediction_rows += int(stats.point_prediction_rows)
-        self.recovered_point_prediction_rows += int(
-            stats.recovered_point_prediction_rows
+        self.on_axis_prediction_batches += int(stats.on_axis_prediction_batches)
+        self.on_axis_prediction_rows += int(stats.on_axis_prediction_rows)
+        self.recovered_on_axis_prediction_rows += int(
+            stats.recovered_on_axis_prediction_rows
         )
         self.recovered_winner_pixels += int(stats.recovered_winner_pixels)
-        self.point_prediction_batch_rows_peak = max(
-            self.point_prediction_batch_rows_peak,
-            int(stats.point_prediction_batch_rows_peak),
+        self.on_axis_prediction_batch_rows_peak = max(
+            self.on_axis_prediction_batch_rows_peak,
+            int(stats.on_axis_prediction_batch_rows_peak),
         )
-        self.point_prediction_backend_rows += int(stats.point_prediction_backend_rows)
-        self.point_prediction_backend_batch_rows_peak = max(
-            self.point_prediction_backend_batch_rows_peak,
-            int(stats.point_prediction_backend_batch_rows_peak),
-        )
-        _merge_bucket_stats(
-            self.point_backend_bucket_counts,
-            dict(stats.point_prediction_backend_bucket_counts),
+        self.on_axis_prediction_backend_rows += int(stats.on_axis_prediction_backend_rows)
+        self.on_axis_prediction_backend_batch_rows_peak = max(
+            self.on_axis_prediction_backend_batch_rows_peak,
+            int(stats.on_axis_prediction_backend_batch_rows_peak),
         )
         _merge_bucket_stats(
-            self.point_backend_bucket_rows,
-            dict(stats.point_prediction_backend_bucket_rows),
-        )
-        self.point_feature_bytes_peak = max(
-            self.point_feature_bytes_peak,
-            int(stats.point_feature_bytes_peak),
-        )
-        self.point_mps_current_bytes_peak = max(
-            self.point_mps_current_bytes_peak,
-            int(stats.point_mps_current_bytes_peak),
-        )
-        self.point_mps_driver_bytes_peak = max(
-            self.point_mps_driver_bytes_peak,
-            int(stats.point_mps_driver_bytes_peak),
-        )
-        self.point_mps_recommended_bytes = max(
-            self.point_mps_recommended_bytes,
-            int(stats.point_mps_recommended_bytes),
-        )
-        self.field_mean_prediction_batches += int(stats.field_mean_prediction_batches)
-        self.field_mean_prediction_rows += int(stats.field_mean_prediction_rows)
-        self.field_mean_prediction_batch_rows_peak = max(
-            self.field_mean_prediction_batch_rows_peak,
-            int(stats.field_mean_prediction_batch_rows_peak),
-        )
-        self.field_mean_prediction_backend_rows += int(
-            stats.field_mean_prediction_backend_rows
-        )
-        self.field_mean_prediction_backend_batch_rows_peak = max(
-            self.field_mean_prediction_backend_batch_rows_peak,
-            int(stats.field_mean_prediction_backend_batch_rows_peak),
+            self.on_axis_backend_bucket_counts,
+            dict(stats.on_axis_prediction_backend_bucket_counts),
         )
         _merge_bucket_stats(
-            self.field_mean_backend_bucket_counts,
-            dict(stats.field_mean_prediction_backend_bucket_counts),
+            self.on_axis_backend_bucket_rows,
+            dict(stats.on_axis_prediction_backend_bucket_rows),
+        )
+        self.on_axis_feature_bytes_peak = max(
+            self.on_axis_feature_bytes_peak,
+            int(stats.on_axis_feature_bytes_peak),
+        )
+        self.on_axis_mps_current_bytes_peak = max(
+            self.on_axis_mps_current_bytes_peak,
+            int(stats.on_axis_mps_current_bytes_peak),
+        )
+        self.on_axis_mps_driver_bytes_peak = max(
+            self.on_axis_mps_driver_bytes_peak,
+            int(stats.on_axis_mps_driver_bytes_peak),
+        )
+        self.on_axis_mps_recommended_bytes = max(
+            self.on_axis_mps_recommended_bytes,
+            int(stats.on_axis_mps_recommended_bytes),
+        )
+        self.field_averaged_prediction_batches += int(stats.field_averaged_prediction_batches)
+        self.field_averaged_prediction_rows += int(stats.field_averaged_prediction_rows)
+        self.field_averaged_prediction_batch_rows_peak = max(
+            self.field_averaged_prediction_batch_rows_peak,
+            int(stats.field_averaged_prediction_batch_rows_peak),
+        )
+        self.field_averaged_prediction_backend_rows += int(
+            stats.field_averaged_prediction_backend_rows
+        )
+        self.field_averaged_prediction_backend_batch_rows_peak = max(
+            self.field_averaged_prediction_backend_batch_rows_peak,
+            int(stats.field_averaged_prediction_backend_batch_rows_peak),
         )
         _merge_bucket_stats(
-            self.field_mean_backend_bucket_rows,
-            dict(stats.field_mean_prediction_backend_bucket_rows),
+            self.field_averaged_backend_bucket_counts,
+            dict(stats.field_averaged_prediction_backend_bucket_counts),
         )
-        self.field_mean_feature_bytes_peak = max(
-            self.field_mean_feature_bytes_peak,
-            int(stats.field_mean_feature_bytes_peak),
+        _merge_bucket_stats(
+            self.field_averaged_backend_bucket_rows,
+            dict(stats.field_averaged_prediction_backend_bucket_rows),
         )
-        self.field_mean_mps_current_bytes_peak = max(
-            self.field_mean_mps_current_bytes_peak,
-            int(stats.field_mean_mps_current_bytes_peak),
+        self.field_averaged_feature_bytes_peak = max(
+            self.field_averaged_feature_bytes_peak,
+            int(stats.field_averaged_feature_bytes_peak),
         )
-        self.field_mean_mps_driver_bytes_peak = max(
-            self.field_mean_mps_driver_bytes_peak,
-            int(stats.field_mean_mps_driver_bytes_peak),
+        self.field_averaged_mps_current_bytes_peak = max(
+            self.field_averaged_mps_current_bytes_peak,
+            int(stats.field_averaged_mps_current_bytes_peak),
         )
-        self.field_mean_mps_recommended_bytes = max(
-            self.field_mean_mps_recommended_bytes,
-            int(stats.field_mean_mps_recommended_bytes),
+        self.field_averaged_mps_driver_bytes_peak = max(
+            self.field_averaged_mps_driver_bytes_peak,
+            int(stats.field_averaged_mps_driver_bytes_peak),
+        )
+        self.field_averaged_mps_recommended_bytes = max(
+            self.field_averaged_mps_recommended_bytes,
+            int(stats.field_averaged_mps_recommended_bytes),
         )
         self.search_star_rows_peak = max(
             self.search_star_rows_peak,
@@ -639,46 +643,46 @@ class _TraversalStructureTelemetry:
             context_pair_rows=self.context_pair_rows,
             winner_rows=self.winner_rows,
             winner_payload_rows=self.winner_payload_rows,
-            point_prediction_batches=self.point_prediction_batches,
-            point_prediction_rows=self.point_prediction_rows,
-            recovered_point_prediction_rows=self.recovered_point_prediction_rows,
+            on_axis_prediction_batches=self.on_axis_prediction_batches,
+            on_axis_prediction_rows=self.on_axis_prediction_rows,
+            recovered_on_axis_prediction_rows=self.recovered_on_axis_prediction_rows,
             recovered_winner_pixels=self.recovered_winner_pixels,
-            point_prediction_batch_rows_peak=self.point_prediction_batch_rows_peak,
-            point_prediction_backend_rows=self.point_prediction_backend_rows,
-            point_prediction_backend_batch_rows_peak=(
-                self.point_prediction_backend_batch_rows_peak
+            on_axis_prediction_batch_rows_peak=self.on_axis_prediction_batch_rows_peak,
+            on_axis_prediction_backend_rows=self.on_axis_prediction_backend_rows,
+            on_axis_prediction_backend_batch_rows_peak=(
+                self.on_axis_prediction_backend_batch_rows_peak
             ),
-            point_prediction_backend_bucket_counts=tuple(
-                sorted(self.point_backend_bucket_counts.items())
+            on_axis_prediction_backend_bucket_counts=tuple(
+                sorted(self.on_axis_backend_bucket_counts.items())
             ),
-            point_prediction_backend_bucket_rows=tuple(
-                sorted(self.point_backend_bucket_rows.items())
+            on_axis_prediction_backend_bucket_rows=tuple(
+                sorted(self.on_axis_backend_bucket_rows.items())
             ),
-            point_feature_bytes_peak=self.point_feature_bytes_peak,
-            point_mps_current_bytes_peak=self.point_mps_current_bytes_peak,
-            point_mps_driver_bytes_peak=self.point_mps_driver_bytes_peak,
-            point_mps_recommended_bytes=self.point_mps_recommended_bytes,
-            field_mean_prediction_batches=self.field_mean_prediction_batches,
-            field_mean_prediction_rows=self.field_mean_prediction_rows,
-            field_mean_prediction_batch_rows_peak=(
-                self.field_mean_prediction_batch_rows_peak
+            on_axis_feature_bytes_peak=self.on_axis_feature_bytes_peak,
+            on_axis_mps_current_bytes_peak=self.on_axis_mps_current_bytes_peak,
+            on_axis_mps_driver_bytes_peak=self.on_axis_mps_driver_bytes_peak,
+            on_axis_mps_recommended_bytes=self.on_axis_mps_recommended_bytes,
+            field_averaged_prediction_batches=self.field_averaged_prediction_batches,
+            field_averaged_prediction_rows=self.field_averaged_prediction_rows,
+            field_averaged_prediction_batch_rows_peak=(
+                self.field_averaged_prediction_batch_rows_peak
             ),
-            field_mean_prediction_backend_rows=(
-                self.field_mean_prediction_backend_rows
+            field_averaged_prediction_backend_rows=(
+                self.field_averaged_prediction_backend_rows
             ),
-            field_mean_prediction_backend_batch_rows_peak=(
-                self.field_mean_prediction_backend_batch_rows_peak
+            field_averaged_prediction_backend_batch_rows_peak=(
+                self.field_averaged_prediction_backend_batch_rows_peak
             ),
-            field_mean_prediction_backend_bucket_counts=tuple(
-                sorted(self.field_mean_backend_bucket_counts.items())
+            field_averaged_prediction_backend_bucket_counts=tuple(
+                sorted(self.field_averaged_backend_bucket_counts.items())
             ),
-            field_mean_prediction_backend_bucket_rows=tuple(
-                sorted(self.field_mean_backend_bucket_rows.items())
+            field_averaged_prediction_backend_bucket_rows=tuple(
+                sorted(self.field_averaged_backend_bucket_rows.items())
             ),
-            field_mean_feature_bytes_peak=self.field_mean_feature_bytes_peak,
-            field_mean_mps_current_bytes_peak=self.field_mean_mps_current_bytes_peak,
-            field_mean_mps_driver_bytes_peak=self.field_mean_mps_driver_bytes_peak,
-            field_mean_mps_recommended_bytes=self.field_mean_mps_recommended_bytes,
+            field_averaged_feature_bytes_peak=self.field_averaged_feature_bytes_peak,
+            field_averaged_mps_current_bytes_peak=self.field_averaged_mps_current_bytes_peak,
+            field_averaged_mps_driver_bytes_peak=self.field_averaged_mps_driver_bytes_peak,
+            field_averaged_mps_recommended_bytes=self.field_averaged_mps_recommended_bytes,
             search_star_rows_peak=self.search_star_rows_peak,
             ngs_rows_peak=self.ngs_rows_peak,
             close_pair_rows_peak=self.close_pair_rows_peak,
@@ -724,10 +728,10 @@ class _TraversalDiagnosticsWriter:
         "peak_rss_after_filtering_mb",
         "rss_after_context_mb",
         "peak_rss_after_context_mb",
-        "rss_after_point_prediction_mb",
-        "peak_rss_after_point_prediction_mb",
-        "rss_after_field_mean_mb",
-        "peak_rss_after_field_mean_mb",
+        "rss_after_on_axis_prediction_mb",
+        "peak_rss_after_on_axis_prediction_mb",
+        "rss_after_field_averaged_mb",
+        "peak_rss_after_field_averaged_mb",
         "rss_after_coverage_mb",
         "peak_rss_after_coverage_mb",
         "rss_after_dust_mb",
@@ -746,28 +750,28 @@ class _TraversalDiagnosticsWriter:
         "local_asterism_rows",
         "context_pair_rows",
         "winner_payload_rows",
-        "point_prediction_batches",
-        "point_prediction_rows",
-        "point_prediction_batch_rows_peak",
-        "point_prediction_backend_rows",
-        "point_prediction_backend_batch_rows_peak",
-        "point_prediction_backend_bucket_counts",
-        "point_prediction_backend_bucket_rows",
-        "point_feature_mib_peak",
-        "point_mps_current_mib_peak",
-        "point_mps_driver_mib_peak",
-        "point_mps_recommended_mib",
-        "field_mean_prediction_batches",
-        "field_mean_prediction_rows",
-        "field_mean_prediction_batch_rows_peak",
-        "field_mean_prediction_backend_rows",
-        "field_mean_prediction_backend_batch_rows_peak",
-        "field_mean_prediction_backend_bucket_counts",
-        "field_mean_prediction_backend_bucket_rows",
-        "field_mean_feature_mib_peak",
-        "field_mean_mps_current_mib_peak",
-        "field_mean_mps_driver_mib_peak",
-        "field_mean_mps_recommended_mib",
+        "on_axis_prediction_batches",
+        "on_axis_prediction_rows",
+        "on_axis_prediction_batch_rows_peak",
+        "on_axis_prediction_backend_rows",
+        "on_axis_prediction_backend_batch_rows_peak",
+        "on_axis_prediction_backend_bucket_counts",
+        "on_axis_prediction_backend_bucket_rows",
+        "on_axis_feature_mib_peak",
+        "on_axis_mps_current_mib_peak",
+        "on_axis_mps_driver_mib_peak",
+        "on_axis_mps_recommended_mib",
+        "field_averaged_prediction_batches",
+        "field_averaged_prediction_rows",
+        "field_averaged_prediction_batch_rows_peak",
+        "field_averaged_prediction_backend_rows",
+        "field_averaged_prediction_backend_batch_rows_peak",
+        "field_averaged_prediction_backend_bucket_counts",
+        "field_averaged_prediction_backend_bucket_rows",
+        "field_averaged_feature_mib_peak",
+        "field_averaged_mps_current_mib_peak",
+        "field_averaged_mps_driver_mib_peak",
+        "field_averaged_mps_recommended_mib",
         "artifact_inner_structured_mib",
         "artifact_asterism_structured_mib",
         "error_message",
@@ -867,13 +871,13 @@ class _TraversalDiagnosticsWriter:
                 "peak_rss_after_filtering_mb": f"{sample.peak_rss_after_filtering_mb:.3f}",
                 "rss_after_context_mb": f"{sample.rss_after_context_mb:.3f}",
                 "peak_rss_after_context_mb": f"{sample.peak_rss_after_context_mb:.3f}",
-                "rss_after_point_prediction_mb": f"{sample.rss_after_point_prediction_mb:.3f}",
-                "peak_rss_after_point_prediction_mb": (
-                    f"{sample.peak_rss_after_point_prediction_mb:.3f}"
+                "rss_after_on_axis_prediction_mb": f"{sample.rss_after_on_axis_prediction_mb:.3f}",
+                "peak_rss_after_on_axis_prediction_mb": (
+                    f"{sample.peak_rss_after_on_axis_prediction_mb:.3f}"
                 ),
-                "rss_after_field_mean_mb": f"{sample.rss_after_field_mean_mb:.3f}",
-                "peak_rss_after_field_mean_mb": (
-                    f"{sample.peak_rss_after_field_mean_mb:.3f}"
+                "rss_after_field_averaged_mb": f"{sample.rss_after_field_averaged_mb:.3f}",
+                "peak_rss_after_field_averaged_mb": (
+                    f"{sample.peak_rss_after_field_averaged_mb:.3f}"
                 ),
                 "rss_after_coverage_mb": f"{sample.rss_after_coverage_mb:.3f}",
                 "peak_rss_after_coverage_mb": f"{sample.peak_rss_after_coverage_mb:.3f}",
@@ -899,59 +903,59 @@ class _TraversalDiagnosticsWriter:
                 "local_asterism_rows": sample.local_asterism_rows,
                 "context_pair_rows": sample.context_pair_rows,
                 "winner_payload_rows": sample.winner_payload_rows,
-                "point_prediction_batches": sample.point_prediction_batches,
-                "point_prediction_rows": sample.point_prediction_rows,
-                "point_prediction_batch_rows_peak": (
-                    sample.point_prediction_batch_rows_peak
+                "on_axis_prediction_batches": sample.on_axis_prediction_batches,
+                "on_axis_prediction_rows": sample.on_axis_prediction_rows,
+                "on_axis_prediction_batch_rows_peak": (
+                    sample.on_axis_prediction_batch_rows_peak
                 ),
-                "point_prediction_backend_rows": sample.point_prediction_backend_rows,
-                "point_prediction_backend_batch_rows_peak": (
-                    sample.point_prediction_backend_batch_rows_peak
+                "on_axis_prediction_backend_rows": sample.on_axis_prediction_backend_rows,
+                "on_axis_prediction_backend_batch_rows_peak": (
+                    sample.on_axis_prediction_backend_batch_rows_peak
                 ),
-                "point_prediction_backend_bucket_counts": (
-                    sample.point_prediction_backend_bucket_counts
+                "on_axis_prediction_backend_bucket_counts": (
+                    sample.on_axis_prediction_backend_bucket_counts
                 ),
-                "point_prediction_backend_bucket_rows": (
-                    sample.point_prediction_backend_bucket_rows
+                "on_axis_prediction_backend_bucket_rows": (
+                    sample.on_axis_prediction_backend_bucket_rows
                 ),
-                "point_feature_mib_peak": f"{sample.point_feature_mib_peak:.3f}",
-                "point_mps_current_mib_peak": (
-                    f"{sample.point_mps_current_mib_peak:.3f}"
+                "on_axis_feature_mib_peak": f"{sample.on_axis_feature_mib_peak:.3f}",
+                "on_axis_mps_current_mib_peak": (
+                    f"{sample.on_axis_mps_current_mib_peak:.3f}"
                 ),
-                "point_mps_driver_mib_peak": (
-                    f"{sample.point_mps_driver_mib_peak:.3f}"
+                "on_axis_mps_driver_mib_peak": (
+                    f"{sample.on_axis_mps_driver_mib_peak:.3f}"
                 ),
-                "point_mps_recommended_mib": (
-                    f"{sample.point_mps_recommended_mib:.3f}"
+                "on_axis_mps_recommended_mib": (
+                    f"{sample.on_axis_mps_recommended_mib:.3f}"
                 ),
-                "field_mean_prediction_batches": sample.field_mean_prediction_batches,
-                "field_mean_prediction_rows": sample.field_mean_prediction_rows,
-                "field_mean_prediction_batch_rows_peak": (
-                    sample.field_mean_prediction_batch_rows_peak
+                "field_averaged_prediction_batches": sample.field_averaged_prediction_batches,
+                "field_averaged_prediction_rows": sample.field_averaged_prediction_rows,
+                "field_averaged_prediction_batch_rows_peak": (
+                    sample.field_averaged_prediction_batch_rows_peak
                 ),
-                "field_mean_prediction_backend_rows": (
-                    sample.field_mean_prediction_backend_rows
+                "field_averaged_prediction_backend_rows": (
+                    sample.field_averaged_prediction_backend_rows
                 ),
-                "field_mean_prediction_backend_batch_rows_peak": (
-                    sample.field_mean_prediction_backend_batch_rows_peak
+                "field_averaged_prediction_backend_batch_rows_peak": (
+                    sample.field_averaged_prediction_backend_batch_rows_peak
                 ),
-                "field_mean_prediction_backend_bucket_counts": (
-                    sample.field_mean_prediction_backend_bucket_counts
+                "field_averaged_prediction_backend_bucket_counts": (
+                    sample.field_averaged_prediction_backend_bucket_counts
                 ),
-                "field_mean_prediction_backend_bucket_rows": (
-                    sample.field_mean_prediction_backend_bucket_rows
+                "field_averaged_prediction_backend_bucket_rows": (
+                    sample.field_averaged_prediction_backend_bucket_rows
                 ),
-                "field_mean_feature_mib_peak": (
-                    f"{sample.field_mean_feature_mib_peak:.3f}"
+                "field_averaged_feature_mib_peak": (
+                    f"{sample.field_averaged_feature_mib_peak:.3f}"
                 ),
-                "field_mean_mps_current_mib_peak": (
-                    f"{sample.field_mean_mps_current_mib_peak:.3f}"
+                "field_averaged_mps_current_mib_peak": (
+                    f"{sample.field_averaged_mps_current_mib_peak:.3f}"
                 ),
-                "field_mean_mps_driver_mib_peak": (
-                    f"{sample.field_mean_mps_driver_mib_peak:.3f}"
+                "field_averaged_mps_driver_mib_peak": (
+                    f"{sample.field_averaged_mps_driver_mib_peak:.3f}"
                 ),
-                "field_mean_mps_recommended_mib": (
-                    f"{sample.field_mean_mps_recommended_mib:.3f}"
+                "field_averaged_mps_recommended_mib": (
+                    f"{sample.field_averaged_mps_recommended_mib:.3f}"
                 ),
                 "artifact_inner_structured_mib": (
                     f"{sample.artifact_inner_structured_mib:.3f}"
@@ -1197,11 +1201,11 @@ def _build_outer_pixel_products(
         runtime = load_runtime_config(
             context.runtime_config_path,
             model_root=context.roots.model_root,
+            allow_legacy=False,
         )
         warm_model_cache(
             runtime,
-            prediction_device=execution_config.prediction_device,
-            averaged_prediction_device=execution_config.averaged_prediction_device,
+            device=execution_config.device,
         )
     if store is None:
         base_store = GaiaHealpixStore(
@@ -1642,13 +1646,7 @@ def _gpu_prediction_enabled(
     if not predict_backend.mps_is_available():
         return False
     execution_config = execution_config or TraversalExecutionConfig()
-    return any(
-        value == "gpu"
-        for value in (
-            execution_config.prediction_device,
-            execution_config.averaged_prediction_device,
-        )
-    )
+    return execution_config.device == "gpu"
 
 
 def _parent_gpu_driver_reserve_mb(
@@ -2130,10 +2128,10 @@ def _build_memory_sample(
         peak_rss_after_filtering_mb=memory_profile.peak_rss_after_filtering_mb,
         rss_after_context_mb=memory_profile.rss_after_context_mb,
         peak_rss_after_context_mb=memory_profile.peak_rss_after_context_mb,
-        rss_after_point_prediction_mb=memory_profile.rss_after_point_prediction_mb,
-        peak_rss_after_point_prediction_mb=memory_profile.peak_rss_after_point_prediction_mb,
-        rss_after_field_mean_mb=memory_profile.rss_after_field_mean_mb,
-        peak_rss_after_field_mean_mb=memory_profile.peak_rss_after_field_mean_mb,
+        rss_after_on_axis_prediction_mb=memory_profile.rss_after_on_axis_prediction_mb,
+        peak_rss_after_on_axis_prediction_mb=memory_profile.peak_rss_after_on_axis_prediction_mb,
+        rss_after_field_averaged_mb=memory_profile.rss_after_field_averaged_mb,
+        peak_rss_after_field_averaged_mb=memory_profile.peak_rss_after_field_averaged_mb,
         rss_after_coverage_mb=memory_profile.rss_after_coverage_mb,
         peak_rss_after_coverage_mb=memory_profile.peak_rss_after_coverage_mb,
         rss_after_dust_mb=memory_profile.rss_after_dust_mb,
@@ -2154,61 +2152,61 @@ def _build_memory_sample(
         local_asterism_rows=structure_stats.local_asterism_rows,
         context_pair_rows=structure_stats.context_pair_rows,
         winner_payload_rows=structure_stats.winner_payload_rows,
-        point_prediction_batches=structure_stats.point_prediction_batches,
-        point_prediction_rows=structure_stats.point_prediction_rows,
-        point_prediction_batch_rows_peak=(
-            structure_stats.point_prediction_batch_rows_peak
+        on_axis_prediction_batches=structure_stats.on_axis_prediction_batches,
+        on_axis_prediction_rows=structure_stats.on_axis_prediction_rows,
+        on_axis_prediction_batch_rows_peak=(
+            structure_stats.on_axis_prediction_batch_rows_peak
         ),
-        point_prediction_backend_rows=structure_stats.point_prediction_backend_rows,
-        point_prediction_backend_batch_rows_peak=(
-            structure_stats.point_prediction_backend_batch_rows_peak
+        on_axis_prediction_backend_rows=structure_stats.on_axis_prediction_backend_rows,
+        on_axis_prediction_backend_batch_rows_peak=(
+            structure_stats.on_axis_prediction_backend_batch_rows_peak
         ),
-        point_prediction_backend_bucket_counts=_format_bucket_stats(
-            structure_stats.point_prediction_backend_bucket_counts
+        on_axis_prediction_backend_bucket_counts=_format_bucket_stats(
+            structure_stats.on_axis_prediction_backend_bucket_counts
         ),
-        point_prediction_backend_bucket_rows=_format_bucket_stats(
-            structure_stats.point_prediction_backend_bucket_rows
+        on_axis_prediction_backend_bucket_rows=_format_bucket_stats(
+            structure_stats.on_axis_prediction_backend_bucket_rows
         ),
-        point_feature_mib_peak=(
-            structure_stats.point_feature_bytes_peak / (1024.0 * 1024.0)
+        on_axis_feature_mib_peak=(
+            structure_stats.on_axis_feature_bytes_peak / (1024.0 * 1024.0)
         ),
-        point_mps_current_mib_peak=(
-            structure_stats.point_mps_current_bytes_peak / (1024.0 * 1024.0)
+        on_axis_mps_current_mib_peak=(
+            structure_stats.on_axis_mps_current_bytes_peak / (1024.0 * 1024.0)
         ),
-        point_mps_driver_mib_peak=(
-            structure_stats.point_mps_driver_bytes_peak / (1024.0 * 1024.0)
+        on_axis_mps_driver_mib_peak=(
+            structure_stats.on_axis_mps_driver_bytes_peak / (1024.0 * 1024.0)
         ),
-        point_mps_recommended_mib=(
-            structure_stats.point_mps_recommended_bytes / (1024.0 * 1024.0)
+        on_axis_mps_recommended_mib=(
+            structure_stats.on_axis_mps_recommended_bytes / (1024.0 * 1024.0)
         ),
-        field_mean_prediction_batches=structure_stats.field_mean_prediction_batches,
-        field_mean_prediction_rows=structure_stats.field_mean_prediction_rows,
-        field_mean_prediction_batch_rows_peak=(
-            structure_stats.field_mean_prediction_batch_rows_peak
+        field_averaged_prediction_batches=structure_stats.field_averaged_prediction_batches,
+        field_averaged_prediction_rows=structure_stats.field_averaged_prediction_rows,
+        field_averaged_prediction_batch_rows_peak=(
+            structure_stats.field_averaged_prediction_batch_rows_peak
         ),
-        field_mean_prediction_backend_rows=(
-            structure_stats.field_mean_prediction_backend_rows
+        field_averaged_prediction_backend_rows=(
+            structure_stats.field_averaged_prediction_backend_rows
         ),
-        field_mean_prediction_backend_batch_rows_peak=(
-            structure_stats.field_mean_prediction_backend_batch_rows_peak
+        field_averaged_prediction_backend_batch_rows_peak=(
+            structure_stats.field_averaged_prediction_backend_batch_rows_peak
         ),
-        field_mean_prediction_backend_bucket_counts=_format_bucket_stats(
-            structure_stats.field_mean_prediction_backend_bucket_counts
+        field_averaged_prediction_backend_bucket_counts=_format_bucket_stats(
+            structure_stats.field_averaged_prediction_backend_bucket_counts
         ),
-        field_mean_prediction_backend_bucket_rows=_format_bucket_stats(
-            structure_stats.field_mean_prediction_backend_bucket_rows
+        field_averaged_prediction_backend_bucket_rows=_format_bucket_stats(
+            structure_stats.field_averaged_prediction_backend_bucket_rows
         ),
-        field_mean_feature_mib_peak=(
-            structure_stats.field_mean_feature_bytes_peak / (1024.0 * 1024.0)
+        field_averaged_feature_mib_peak=(
+            structure_stats.field_averaged_feature_bytes_peak / (1024.0 * 1024.0)
         ),
-        field_mean_mps_current_mib_peak=(
-            structure_stats.field_mean_mps_current_bytes_peak / (1024.0 * 1024.0)
+        field_averaged_mps_current_mib_peak=(
+            structure_stats.field_averaged_mps_current_bytes_peak / (1024.0 * 1024.0)
         ),
-        field_mean_mps_driver_mib_peak=(
-            structure_stats.field_mean_mps_driver_bytes_peak / (1024.0 * 1024.0)
+        field_averaged_mps_driver_mib_peak=(
+            structure_stats.field_averaged_mps_driver_bytes_peak / (1024.0 * 1024.0)
         ),
-        field_mean_mps_recommended_mib=(
-            structure_stats.field_mean_mps_recommended_bytes / (1024.0 * 1024.0)
+        field_averaged_mps_recommended_mib=(
+            structure_stats.field_averaged_mps_recommended_bytes / (1024.0 * 1024.0)
         ),
         artifact_inner_structured_mib=float(artifact_inner_structured_mib),
         artifact_asterism_structured_mib=float(artifact_asterism_structured_mib),
@@ -2262,6 +2260,7 @@ def _iter_long_lived_traversal_worker_messages(
     runtime = load_runtime_config(
         context.runtime_config_path,
         model_root=context.roots.model_root,
+        allow_legacy=False,
     )
     if detailed:
         yield _worker_memory_sample(
@@ -2271,8 +2270,7 @@ def _iter_long_lived_traversal_worker_messages(
         )
     warm_model_cache(
         runtime,
-        prediction_device=execution_config.prediction_device,
-        averaged_prediction_device=execution_config.averaged_prediction_device,
+        device=execution_config.device,
     )
     if detailed:
         yield _worker_memory_sample(
@@ -2539,6 +2537,7 @@ def _iter_dynamic_traversal_worker_messages(
     runtime = load_runtime_config(
         context.runtime_config_path,
         model_root=context.roots.model_root,
+        allow_legacy=False,
     )
     if detailed:
         yield _worker_memory_sample(
@@ -2548,8 +2547,7 @@ def _iter_dynamic_traversal_worker_messages(
         )
     warm_model_cache(
         runtime,
-        prediction_device=execution_config.prediction_device,
-        averaged_prediction_device=execution_config.averaged_prediction_device,
+        device=execution_config.device,
     )
     if detailed:
         yield _worker_memory_sample(
@@ -2956,8 +2954,8 @@ def _handle_regional_worker_message(
             + stage_stats.local_selection_seconds
             + stage_stats.inner_table_seconds
             + stage_stats.context_seconds
-            + stage_stats.point_prediction_seconds
-            + stage_stats.field_mean_prediction_seconds
+            + stage_stats.on_axis_prediction_seconds
+            + stage_stats.field_averaged_prediction_seconds
             + stage_stats.coverage_seconds
             + stage_stats.dust_seconds
             + stage_stats.persisted_asterisms_seconds
@@ -2986,41 +2984,41 @@ def _handle_regional_worker_message(
         artifact_asterism_structured_mib = stats.artifact_asterism_structured_bytes / (
             1024.0 * 1024.0
         )
-        point_feature_mib_peak = structure_stats.point_feature_bytes_peak / (
+        on_axis_feature_mib_peak = structure_stats.on_axis_feature_bytes_peak / (
             1024.0 * 1024.0
         )
-        point_mps_current_mib_peak = structure_stats.point_mps_current_bytes_peak / (
+        on_axis_mps_current_mib_peak = structure_stats.on_axis_mps_current_bytes_peak / (
             1024.0 * 1024.0
         )
-        point_mps_driver_mib_peak = structure_stats.point_mps_driver_bytes_peak / (
+        on_axis_mps_driver_mib_peak = structure_stats.on_axis_mps_driver_bytes_peak / (
             1024.0 * 1024.0
         )
-        point_mps_recommended_mib = structure_stats.point_mps_recommended_bytes / (
+        on_axis_mps_recommended_mib = structure_stats.on_axis_mps_recommended_bytes / (
             1024.0 * 1024.0
         )
-        field_mean_feature_mib_peak = structure_stats.field_mean_feature_bytes_peak / (
+        field_averaged_feature_mib_peak = structure_stats.field_averaged_feature_bytes_peak / (
             1024.0 * 1024.0
         )
-        field_mean_mps_current_mib_peak = (
-            structure_stats.field_mean_mps_current_bytes_peak / (1024.0 * 1024.0)
+        field_averaged_mps_current_mib_peak = (
+            structure_stats.field_averaged_mps_current_bytes_peak / (1024.0 * 1024.0)
         )
-        field_mean_mps_driver_mib_peak = (
-            structure_stats.field_mean_mps_driver_bytes_peak / (1024.0 * 1024.0)
+        field_averaged_mps_driver_mib_peak = (
+            structure_stats.field_averaged_mps_driver_bytes_peak / (1024.0 * 1024.0)
         )
-        field_mean_mps_recommended_mib = (
-            structure_stats.field_mean_mps_recommended_bytes / (1024.0 * 1024.0)
+        field_averaged_mps_recommended_mib = (
+            structure_stats.field_averaged_mps_recommended_bytes / (1024.0 * 1024.0)
         )
-        point_backend_bucket_counts = _format_bucket_stats(
-            structure_stats.point_prediction_backend_bucket_counts
+        on_axis_backend_bucket_counts = _format_bucket_stats(
+            structure_stats.on_axis_prediction_backend_bucket_counts
         )
-        point_backend_bucket_rows = _format_bucket_stats(
-            structure_stats.point_prediction_backend_bucket_rows
+        on_axis_backend_bucket_rows = _format_bucket_stats(
+            structure_stats.on_axis_prediction_backend_bucket_rows
         )
-        field_mean_backend_bucket_counts = _format_bucket_stats(
-            structure_stats.field_mean_prediction_backend_bucket_counts
+        field_averaged_backend_bucket_counts = _format_bucket_stats(
+            structure_stats.field_averaged_prediction_backend_bucket_counts
         )
-        field_mean_backend_bucket_rows = _format_bucket_stats(
-            structure_stats.field_mean_prediction_backend_bucket_rows
+        field_averaged_backend_bucket_rows = _format_bucket_stats(
+            structure_stats.field_averaged_prediction_backend_bucket_rows
         )
         append_build_log(
             build_path,
@@ -3044,24 +3042,24 @@ def _handle_regional_worker_message(
             f"stage_local_selection_s={stage_stats.local_selection_seconds:.3f} "
             f"stage_inner_table_s={stage_stats.inner_table_seconds:.3f} "
             f"stage_context_s={stage_stats.context_seconds:.3f} "
-            f"stage_point_prediction_s={stage_stats.point_prediction_seconds:.3f} "
-            f"stage_point_prediction_eligibility_s={stage_stats.point_prediction_eligibility_seconds:.3f} "
-            f"stage_point_prediction_eligibility_intersection_s={stage_stats.point_prediction_eligibility_intersection_seconds:.3f} "
-            f"stage_point_prediction_eligibility_extract_s={stage_stats.point_prediction_eligibility_extract_seconds:.3f} "
-            f"stage_point_prediction_buffer_s={stage_stats.point_prediction_buffer_seconds:.3f} "
-            f"stage_point_prediction_ngs_array_s={stage_stats.point_prediction_ngs_array_seconds:.3f} "
-            f"stage_point_prediction_model_s={stage_stats.point_prediction_model_seconds:.3f} "
-            f"stage_point_prediction_feature_s={stage_stats.point_prediction_feature_seconds:.3f} "
-            f"stage_point_prediction_backend_s={stage_stats.point_prediction_backend_seconds:.3f} "
-            f"stage_point_prediction_scatter_s={stage_stats.point_prediction_scatter_seconds:.3f} "
-            f"stage_point_prediction_scatter_filter_s={stage_stats.point_prediction_scatter_filter_seconds:.3f} "
-            f"stage_point_prediction_scatter_merge_s={stage_stats.point_prediction_scatter_merge_seconds:.3f} "
-            f"stage_point_prediction_scatter_sort_s={stage_stats.point_prediction_scatter_sort_seconds:.3f} "
-            f"stage_point_prediction_scatter_write_s={stage_stats.point_prediction_scatter_write_seconds:.3f} "
-            f"stage_point_prediction_cache_clear_s={stage_stats.point_prediction_cache_clear_seconds:.3f} "
-            f"stage_field_mean_prediction_s={stage_stats.field_mean_prediction_seconds:.3f} "
-            f"stage_field_mean_prediction_feature_s={stage_stats.field_mean_prediction_feature_seconds:.3f} "
-            f"stage_field_mean_prediction_backend_s={stage_stats.field_mean_prediction_backend_seconds:.3f} "
+            f"stage_on_axis_prediction_s={stage_stats.on_axis_prediction_seconds:.3f} "
+            f"stage_on_axis_prediction_eligibility_s={stage_stats.on_axis_prediction_eligibility_seconds:.3f} "
+            f"stage_on_axis_prediction_eligibility_intersection_s={stage_stats.on_axis_prediction_eligibility_intersection_seconds:.3f} "
+            f"stage_on_axis_prediction_eligibility_extract_s={stage_stats.on_axis_prediction_eligibility_extract_seconds:.3f} "
+            f"stage_on_axis_prediction_buffer_s={stage_stats.on_axis_prediction_buffer_seconds:.3f} "
+            f"stage_on_axis_prediction_ngs_array_s={stage_stats.on_axis_prediction_ngs_array_seconds:.3f} "
+            f"stage_on_axis_prediction_model_s={stage_stats.on_axis_prediction_model_seconds:.3f} "
+            f"stage_on_axis_prediction_feature_s={stage_stats.on_axis_prediction_feature_seconds:.3f} "
+            f"stage_on_axis_prediction_backend_s={stage_stats.on_axis_prediction_backend_seconds:.3f} "
+            f"stage_on_axis_prediction_scatter_s={stage_stats.on_axis_prediction_scatter_seconds:.3f} "
+            f"stage_on_axis_prediction_scatter_filter_s={stage_stats.on_axis_prediction_scatter_filter_seconds:.3f} "
+            f"stage_on_axis_prediction_scatter_merge_s={stage_stats.on_axis_prediction_scatter_merge_seconds:.3f} "
+            f"stage_on_axis_prediction_scatter_sort_s={stage_stats.on_axis_prediction_scatter_sort_seconds:.3f} "
+            f"stage_on_axis_prediction_scatter_write_s={stage_stats.on_axis_prediction_scatter_write_seconds:.3f} "
+            f"stage_on_axis_prediction_cache_clear_s={stage_stats.on_axis_prediction_cache_clear_seconds:.3f} "
+            f"stage_field_averaged_prediction_s={stage_stats.field_averaged_prediction_seconds:.3f} "
+            f"stage_field_averaged_prediction_feature_s={stage_stats.field_averaged_prediction_feature_seconds:.3f} "
+            f"stage_field_averaged_prediction_backend_s={stage_stats.field_averaged_prediction_backend_seconds:.3f} "
             f"stage_coverage_s={stage_stats.coverage_seconds:.3f} "
             f"stage_dust_s={stage_stats.dust_seconds:.3f} "
             f"stage_persisted_asterisms_s={stage_stats.persisted_asterisms_seconds:.3f} "
@@ -3095,30 +3093,30 @@ def _handle_regional_worker_message(
             f"context_pair_rows={structure_stats.context_pair_rows} "
             f"winner_rows={structure_stats.winner_rows} "
             f"winner_payload_rows={structure_stats.winner_payload_rows} "
-            f"point_prediction_batches={structure_stats.point_prediction_batches} "
-            f"point_prediction_rows={structure_stats.point_prediction_rows} "
-            f"recovered_point_prediction_rows={structure_stats.recovered_point_prediction_rows} "
+            f"on_axis_prediction_batches={structure_stats.on_axis_prediction_batches} "
+            f"on_axis_prediction_rows={structure_stats.on_axis_prediction_rows} "
+            f"recovered_on_axis_prediction_rows={structure_stats.recovered_on_axis_prediction_rows} "
             f"recovered_winner_pixels={structure_stats.recovered_winner_pixels} "
-            f"point_prediction_batch_rows_peak={structure_stats.point_prediction_batch_rows_peak} "
-            f"point_prediction_backend_rows={structure_stats.point_prediction_backend_rows} "
-            f"point_prediction_backend_batch_rows_peak={structure_stats.point_prediction_backend_batch_rows_peak} "
-            f"point_prediction_backend_bucket_counts={point_backend_bucket_counts or '-'} "
-            f"point_prediction_backend_bucket_rows={point_backend_bucket_rows or '-'} "
-            f"point_feature_mib_peak={point_feature_mib_peak:.3f} "
-            f"point_mps_current_mib_peak={point_mps_current_mib_peak:.3f} "
-            f"point_mps_driver_mib_peak={point_mps_driver_mib_peak:.3f} "
-            f"point_mps_recommended_mib={point_mps_recommended_mib:.3f} "
-            f"field_mean_prediction_batches={structure_stats.field_mean_prediction_batches} "
-            f"field_mean_prediction_rows={structure_stats.field_mean_prediction_rows} "
-            f"field_mean_prediction_batch_rows_peak={structure_stats.field_mean_prediction_batch_rows_peak} "
-            f"field_mean_prediction_backend_rows={structure_stats.field_mean_prediction_backend_rows} "
-            f"field_mean_prediction_backend_batch_rows_peak={structure_stats.field_mean_prediction_backend_batch_rows_peak} "
-            f"field_mean_prediction_backend_bucket_counts={field_mean_backend_bucket_counts or '-'} "
-            f"field_mean_prediction_backend_bucket_rows={field_mean_backend_bucket_rows or '-'} "
-            f"field_mean_feature_mib_peak={field_mean_feature_mib_peak:.3f} "
-            f"field_mean_mps_current_mib_peak={field_mean_mps_current_mib_peak:.3f} "
-            f"field_mean_mps_driver_mib_peak={field_mean_mps_driver_mib_peak:.3f} "
-            f"field_mean_mps_recommended_mib={field_mean_mps_recommended_mib:.3f} "
+            f"on_axis_prediction_batch_rows_peak={structure_stats.on_axis_prediction_batch_rows_peak} "
+            f"on_axis_prediction_backend_rows={structure_stats.on_axis_prediction_backend_rows} "
+            f"on_axis_prediction_backend_batch_rows_peak={structure_stats.on_axis_prediction_backend_batch_rows_peak} "
+            f"on_axis_prediction_backend_bucket_counts={on_axis_backend_bucket_counts or '-'} "
+            f"on_axis_prediction_backend_bucket_rows={on_axis_backend_bucket_rows or '-'} "
+            f"on_axis_feature_mib_peak={on_axis_feature_mib_peak:.3f} "
+            f"on_axis_mps_current_mib_peak={on_axis_mps_current_mib_peak:.3f} "
+            f"on_axis_mps_driver_mib_peak={on_axis_mps_driver_mib_peak:.3f} "
+            f"on_axis_mps_recommended_mib={on_axis_mps_recommended_mib:.3f} "
+            f"field_averaged_prediction_batches={structure_stats.field_averaged_prediction_batches} "
+            f"field_averaged_prediction_rows={structure_stats.field_averaged_prediction_rows} "
+            f"field_averaged_prediction_batch_rows_peak={structure_stats.field_averaged_prediction_batch_rows_peak} "
+            f"field_averaged_prediction_backend_rows={structure_stats.field_averaged_prediction_backend_rows} "
+            f"field_averaged_prediction_backend_batch_rows_peak={structure_stats.field_averaged_prediction_backend_batch_rows_peak} "
+            f"field_averaged_prediction_backend_bucket_counts={field_averaged_backend_bucket_counts or '-'} "
+            f"field_averaged_prediction_backend_bucket_rows={field_averaged_backend_bucket_rows or '-'} "
+            f"field_averaged_feature_mib_peak={field_averaged_feature_mib_peak:.3f} "
+            f"field_averaged_mps_current_mib_peak={field_averaged_mps_current_mib_peak:.3f} "
+            f"field_averaged_mps_driver_mib_peak={field_averaged_mps_driver_mib_peak:.3f} "
+            f"field_averaged_mps_recommended_mib={field_averaged_mps_recommended_mib:.3f} "
             f"search_star_rows_peak={structure_stats.search_star_rows_peak} "
             f"ngs_rows_peak={structure_stats.ngs_rows_peak} "
             f"close_pair_rows_peak={structure_stats.close_pair_rows_peak} "
@@ -4240,6 +4238,7 @@ def run_build(
         raise BuildError(f"workers must be at least 1, got {workers}")
     if not build_path.is_dir():
         raise BuildError(f"Build path does not exist: {build_path}")
+    require_current_build_layout(build_path, operation="run")
 
     current_phase = load_current_phase(build_path)
     if current_phase not in (
@@ -4291,7 +4290,7 @@ def run_build_outer_pixels(
     outer_pixels: int | Iterable[int],
     *,
     force: bool = False,
-    execution_config: TraversalExecutionConfig | None = None,
+    aosky_yaml: Path | None = None,
 ) -> Path:
     """Run Traversal for selected outer pixels without running aggregation.
 
@@ -4306,8 +4305,9 @@ def run_build_outer_pixels(
         build_path: Initialized build root whose current phase is `traversal`.
         outer_pixels: One outer-pixel id or an iterable of outer-pixel ids.
         force: Re-run selected pixels even when they are already marked done.
-        execution_config: Optional runtime-only Traversal settings for the
-            selected-pixel run.
+        aosky_yaml: Optional ``ao-sky.yaml`` path supplying runtime-only
+            settings, including the shared prediction device. Normal discovery
+            applies when omitted.
 
     Returns:
         The input build path.
@@ -4319,6 +4319,7 @@ def run_build_outer_pixels(
 
     if not build_path.is_dir():
         raise BuildError(f"Build path does not exist: {build_path}")
+    require_current_build_layout(build_path, operation="run selected pixels for")
     current_phase = load_current_phase(build_path)
     if current_phase != BUILD_PHASE_TRAVERSAL:
         raise BuildError(f"Expected traversal phase, got {current_phase!r}")
@@ -4327,6 +4328,13 @@ def run_build_outer_pixels(
     state = load_state(build_path)
     _validate_selected_outer_pixels(selected, state)
     definition = load_persisted_build_definition(build_path)
+    execution_config = resolve_traversal_execution_config(
+        outer_level=definition.outer_level,
+        workers=1,
+        scheduler="static",
+        low_latitude_workers=1,
+        aosky_yaml=aosky_yaml,
+    )
     build_artifact_root(build_path, definition).mkdir(parents=True, exist_ok=True)
     context = TraversalTaskContext(
         build_path=build_path,
@@ -4447,6 +4455,7 @@ def show_build(build_path: Path) -> str:
     inspection = inspect_build(build_path)
     lines = [
         f"build: {inspection.build_path}",
+        f"layout version: {inspection.layout_version}",
         f"status: {inspection.build_status}",
         f"stage: {inspection.current_stage}",
         f"lineage: {inspection.lineage_name} v{inspection.lineage_version}",

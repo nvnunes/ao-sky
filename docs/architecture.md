@@ -77,7 +77,8 @@ The deliberate public Python package is `ao_sky`.
 - Prefer typed request/config objects where they improve clarity.
 - Keep `astropy.table.Table` as the initial scientific interchange type unless
   a stronger abstraction becomes necessary.
-- Keep legacy-compatibility code outside the canonical package core.
+- Keep schema-version compatibility isolated in one private build-contract
+  module rather than distributing legacy branches across consumers.
 
 ## Canonical Subpackages
 
@@ -108,7 +109,8 @@ The canonical package is split by ownership:
   - native traversal runtime records
   - temporary AO-model loading and caching
   - temporary `girmos-aosims` prediction adapter
-  - native point and field-mean prediction helpers
+  - generic position-dependent-model loading and array prediction
+  - private transitional access to the legacy field-averaged model family
 - `ao_sky.build`
   - merged build-config loading
   - build metadata/state contracts
@@ -172,6 +174,13 @@ The architecture uses distinct data layers with explicit ownership.
 - Asterism-side neighbour stitching is an in-memory search-preparation step,
   not part of canonical Gaia storage.
 - Persisted schema rules and path/version rules live in narrow contract modules.
+- New builds and artifacts use layout version 3 and canonical on-axis and
+  field-averaged result names. Completed layout-version-2 builds remain
+  readable through one private normalization boundary that returns only
+  canonical in-memory names.
+- Layout-version-2 builds and artifacts are read-only. Inspection, plotting,
+  lookup, export, validation, and in-memory aggregation are supported; build
+  execution and persisted mutation require layout version 3.
 - Path layout, schema ownership, and derived-field rules are treated as
   user-facing contracts.
 
@@ -195,6 +204,9 @@ The architecture uses distinct data layers with explicit ownership.
   - a `models/` snapshot directory created at `init`
   - a `surveys/` snapshot directory created at `init` for builds with survey
     overlays
+- New `build.h5`, `outer.h5`, and `maps-hpx<level>.h5` artifacts declare
+  layout version 3. The standalone outer and map artifacts carry a root
+  `layout_version` attribute.
 - Build versions are named `v<N>` under the lineage workspace.
 - `build.h5` stores:
   - the original merged build-config YAML
