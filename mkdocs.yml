@@ -39,3 +39,5 @@ nav:
       - Asterisms API: reference/asterisms/api.md
       - Predict API: reference/predict/api.md
       - Build API: reference/build/api.md
+      - Artifacts API: reference/artifacts/api.md
+      - Plotting API: reference/plotting/api.md
