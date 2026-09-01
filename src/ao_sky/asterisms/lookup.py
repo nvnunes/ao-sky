@@ -55,6 +55,26 @@ class AsterismLookupFilters:
     Magnitude filters apply to all real member slots. Empty member slots with
     source id ``-1`` are ignored. Inner-pixel metric filters apply to lookup
     output means over pixels where the returned asterism is the retained winner.
+
+    Attributes:
+        min_num_stars: Inclusive lower bound on real member-star count.
+        max_num_stars: Inclusive upper bound on real member-star count.
+        min_member_mag: Inclusive lower bound applied to every real member
+            magnitude.
+        max_member_mag: Inclusive upper bound applied to every real member
+            magnitude.
+        min_inner_pixel_count: Inclusive lower bound on retained-winner support
+            pixels.
+        max_inner_pixel_count: Inclusive upper bound on retained-winner support
+            pixels.
+        min_on_axis_winner_ee: Inclusive lower bound on mean on-axis winner EE.
+        max_on_axis_winner_ee: Inclusive upper bound on mean on-axis winner EE.
+        min_field_averaged_winner_ee: Inclusive lower bound on mean
+            field-averaged winner EE.
+        max_field_averaged_winner_ee: Inclusive upper bound on mean
+            field-averaged winner EE.
+        min_gaia_A0: Inclusive lower bound on mean Gaia A0 extinction.
+        max_gaia_A0: Inclusive upper bound on mean Gaia A0 extinction.
     """
 
     min_num_stars: int | None = None

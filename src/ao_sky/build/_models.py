@@ -52,7 +52,57 @@ class BuildPaths:
 
 @dataclass(frozen=True, slots=True)
 class BuildInspection:
-    """Read-only inspection summary for one persisted build root."""
+    """Read-only inspection summary for one persisted build root.
+
+    Attributes
+    ----------
+    build_path
+        Inspected build root.
+    layout_version
+        Persisted build layout version.
+    build_status
+        Overall build status.
+    current_stage
+        Active or most recently completed build stage.
+    stage_counts
+        Per-stage state counts, or ``None`` when unavailable.
+    lineage_name
+        Build lineage name.
+    lineage_version
+        Build lineage version.
+    gaia_release
+        Gaia data release used by the build.
+    outer_level
+        Outer HEALPix level.
+    inner_level
+        Inner HEALPix level.
+    max_data_level
+        Highest dense-map HEALPix level.
+    runtime_config_path
+        Build-local runtime configuration path.
+    runtime_config_source_path
+        Original runtime configuration source path.
+    gaia_root
+        Persisted Gaia data root.
+    dust_root
+        Persisted dust-data root.
+    model_root
+        Persisted model root.
+    model_manifest_path
+        Expected build-local model manifest path.
+    model_manifest_exists
+        Whether the model manifest exists.
+    survey_manifest_path
+        Expected build-local survey manifest path.
+    survey_manifest_exists
+        Whether the survey manifest exists.
+    survey_overlay_names
+        Configured survey overlay names.
+    map_artifacts
+        Dense-map artifact summaries keyed by HEALPix level.
+    problems
+        Validation problems found during inspection.
+    """
 
     build_path: Path
     layout_version: int

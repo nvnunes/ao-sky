@@ -11,7 +11,18 @@ import numpy as np
 
 @dataclass(frozen=True, slots=True)
 class AOSystemRuntime:
-    """AO-system policy and model metadata needed by native traversal."""
+    """AO-system constraints used to construct prediction inputs.
+
+    Attributes:
+        band: Guide-star magnitude column used by Traversal.
+        fov: Full angular diameter of the circular field of regard.
+        lgs: Laser-guide-star records with zenith-distance and azimuth values.
+        min_wfs: Minimum number of natural guide stars in a candidate.
+        max_wfs: Maximum number of natural guide stars in a candidate.
+        min_mag: Bright guide-star magnitude limit, inclusive.
+        max_mag: Faint guide-star magnitude limit, inclusive.
+        min_sep: Minimum angular separation between guide stars.
+    """
 
     band: str
     fov: u.Quantity
@@ -25,7 +36,31 @@ class AOSystemRuntime:
 
 @dataclass(frozen=True, slots=True)
 class PredictRuntime:
-    """Native runtime contract passed into the real Traversal path."""
+    """Validated prediction and Traversal policy for one build.
+
+    Attributes:
+        ao_system: AO-system constraints used for candidate construction.
+        outer_level: HEALPix level of one restartable outer-pixel task.
+        inner_level: HEALPix level of evaluated science-point centers.
+        epoch: Decimal year used for Gaia proper-motion propagation.
+        max_bright_star_mag: Magnitude below which a star can mask nearby
+            science points, or `None` to disable bright-star masking.
+        max_bright_star_exclusion: Angular masking radius around bright stars.
+        winner_ee_epsilon: Relative EE tolerance used by winner regularization.
+        winner_top_k: Maximum candidate labels retained per inner pixel.
+        prediction_wavelength: Wavelength at which model outputs are evaluated.
+        models: Production position-dependent model names keyed by `<N>star`.
+        legacy_field_averaged_models: Transitional field-averaged model names
+            keyed by `<N>star`.
+        seeing_reference_wavelength: Wavelength of the seeing fallback values.
+        seeing_reference_sr: Reference seeing-limited Strehl ratio.
+        seeing_reference_ee: Reference seeing-limited ensquared energy.
+        seeing_reference_fwhm: Reference seeing-limited FWHM in milliarcseconds.
+        on_axis_ee_threshold: EE threshold used for on-axis coverage.
+        field_averaged_ee_threshold: EE threshold used for field-averaged
+            coverage.
+        model_root: Directory containing the configured model snapshots.
+    """
 
     ao_system: AOSystemRuntime
     outer_level: int
@@ -68,7 +103,13 @@ class PredictionBatch:
 
 @dataclass(frozen=True, slots=True)
 class SeeingBaselinePerformance:
-    """Seeing-limited fallback metrics at the prediction wavelength."""
+    """Seeing-limited fallback metrics at the prediction wavelength.
+
+    Attributes:
+        sr: Dimensionless Strehl ratio, or `None` when unavailable.
+        ee: Dimensionless ensquared energy, or `None` when unavailable.
+        fwhm: FWHM in milliarcseconds, or `None` when unavailable.
+    """
 
     sr: float | None
     ee: float | None

@@ -23,7 +23,37 @@ _FEATURE_BUFFER_CACHE: dict[int, np.ndarray] = {}
 
 @dataclass(slots=True)
 class PredictionArrayTelemetry:
-    """Mutable timing and feature-memory counters for vectorized prediction."""
+    """Mutable timing and memory counters for vectorized prediction.
+
+    Attributes
+    ----------
+    feature_seconds
+        Total time spent constructing feature arrays.
+    backend_seconds
+        Total time spent in model inference.
+    batches
+        Number of feature batches recorded.
+    rows
+        Number of logical prediction rows recorded.
+    batch_rows_peak
+        Largest logical feature batch.
+    backend_rows
+        Number of physical rows passed to model backends.
+    backend_batch_rows_peak
+        Largest physical backend batch.
+    feature_bytes_peak
+        Largest feature-array allocation in bytes.
+    mps_current_bytes_peak
+        Peak current MPS allocation observed in bytes.
+    mps_driver_bytes_peak
+        Peak MPS driver allocation observed in bytes.
+    mps_recommended_bytes
+        Largest recommended MPS working-set size observed in bytes.
+    backend_bucket_counts
+        Number of batches recorded for each physical backend row count.
+    backend_bucket_rows
+        Logical rows represented by each physical backend row count.
+    """
 
     feature_seconds: float = 0.0
     backend_seconds: float = 0.0
@@ -47,6 +77,8 @@ class PredictionArrayTelemetry:
         row_count: int | None = None,
         record_bucket: bool = False,
     ) -> None:
+        """Record one feature batch and its optional backend bucket."""
+
         logical_rows = int(x.shape[0] if row_count is None else row_count)
         backend_rows = int(x.shape[0])
         self.feature_seconds += float(elapsed_seconds)
@@ -65,9 +97,13 @@ class PredictionArrayTelemetry:
             )
 
     def record_backend_batch(self, elapsed_seconds: float) -> None:
+        """Add one model-inference duration."""
+
         self.backend_seconds += float(elapsed_seconds)
 
-    def record_mps_snapshot(self, model) -> None:
+    def record_mps_snapshot(self, model: object) -> None:
+        """Record an MPS memory snapshot when ``model`` uses MPS."""
+
         try:
             device_type = backend.get_model_device_type(model)
         except (AttributeError, KeyError, TypeError, PredictError):
