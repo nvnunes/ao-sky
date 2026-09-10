@@ -18,11 +18,6 @@
 - `docs/validation.md` is the validation research log. Its companion folder is `docs/validation/`. Common aliases: `validation`, `validation.md`.
 - Use `$research-logging` for capture, entry updates, summary checks, concept maintenance, or source-document conversion in these logs.
 
-## Shared Validation
-- Use `$agent-surface-review` for shared agent-surface review.
-- Use `$documentation-surface-review` for documentation-surface review with the `public-python` profile.
-- Use `$code-quality-review` for source-code quality review.
-
 ## Skill Requirements
 - For Python code, use `$python-code-writing`.
 - For project docs such as `docs/architecture.md`, `docs/testing.md`, `docs/development.md`, and similar long-lived project documents, use `$project-docs-writing`.

@@ -8,18 +8,6 @@ It describes a mix of implemented and intended architecture. Transitional
 migration context and sequencing are maintained in the peer GIRMOS project,
 outside this package's public documentation surface.
 
-## Shared Validation And Skills
-
-This project uses runtime-discovered `astro-agents` skills for shared review and authoring support:
-
-- `$agent-surface-review`
-- `$documentation-surface-review` with the `public-python` profile
-- `$code-quality-review`
-- `$python-code-writing`
-
-Repo-local package boundaries, persisted contracts, artifact rules, and
-exceptions in this document remain the source of truth.
-
 ## Package Identity
 
 `ao-sky` is a public Python package for Gaia-backed AO-sky mapping, all-sky
